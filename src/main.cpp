@@ -55,16 +55,17 @@ class $modify(BotPlayLayer, PlayLayer) {
     }
 
     // Сохранение чекпоинта практики
-    void createCheckpoint() {
-        PlayLayer::createCheckpoint();
+    CheckpointObject* createCheckpoint() {
+        auto cp = PlayLayer::createCheckpoint();
         if (s_mode != BotMode::Disabled) {
             s_checkpoints.push_back({ s_time, s_actions.size() });
         }
+        return cp;
     }
 
-    // Удаление чекпоинта практики
-    void removeLastCheckpoint() {
-        PlayLayer::removeLastCheckpoint();
+    // Удаление чекпоинта практики (исправлено имя функции!)
+    void removeCheckpoint(bool p0) {
+        PlayLayer::removeCheckpoint(p0);
         if (!s_checkpoints.empty()) {
             s_checkpoints.pop_back();
         }
@@ -94,7 +95,6 @@ class $modify(BotPlayLayer, PlayLayer) {
     void resetLevel() {
         PlayLayer::resetLevel();
 
-        // Если это не практика или чекпоинтов нет — полный сброс на начало
         if (!m_isPracticeMode || s_checkpoints.empty()) {
             s_time = 0.0;
             s_actionIndex = 0;
