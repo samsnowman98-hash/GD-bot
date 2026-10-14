@@ -1,100 +1,209 @@
-/**
- * Include the Geode headers.
- */
 #include <Geode/Geode.hpp>
+#include <Geode/modify/PlayLayer.hpp>
+#include <Geode/modify/PauseLayer.hpp>
+#include <Geode/modify/GJBaseGameLayer.hpp>
+#include <Geode/binding/CheckpointObject.hpp>
 
-/**
- * Brings cocos2d and all Geode namespaces to the current scope.
- */
 using namespace geode::prelude;
 
-/**
- * `$modify` lets you extend and modify GD's classes.
- * To hook a function in Geode, simply $modify the class
- * and write a new function definition with the signature of
- * the function you want to hook.
- *
- * Here we use the overloaded `$modify` macro to set our own class name,
- * so that we can use it for button callbacks.
- *
- * Notice the header being included, you *must* include the header for
- * the class you are modifying, or you will get a compile error.
- *
- * Another way you could do this is like this:
- *
- * struct MyMenuLayer : Modify<MyMenuLayer, MenuLayer> {};
- */
-#include <Geode/modify/MenuLayer.hpp>
-class $modify(MyMenuLayer, MenuLayer) {
-	/**
-	 * Typically classes in GD are initialized using the `init` function, (though not always!),
-	 * so here we use it to add our own button to the bottom menu.
-	 *
-	 * Note that for all hooks, your signature has to *match exactly*,
-	 * `void init()` would not place a hook!
-	*/
-	bool init() {
-		/**
-		 * We call the original init function so that the
-		 * original class is properly initialized.
-		 */
-		if (!MenuLayer::init()) {
-			return false;
-		}
+enum class BotMode {
+    Disabled,
+    Record,
+    Play
+};
 
-		/**
-		 * You can use methods from the `geode::log` namespace to log messages to the console,
-		 * being useful for debugging and such. See this page for more info about logging:
-		 * https://docs.geode-sdk.org/tutorials/logging
-		*/
-		log::debug("Hello from my MenuLayer::init hook! This layer has {} children.", this->getChildrenCount());
+struct BotAction {
+    double time;
+    bool push;
+    int button;
+    bool player1;
+};
 
-		/**
-		 * See this page for more info about buttons
-		 * https://docs.geode-sdk.org/tutorials/buttons
-		*/
-		auto myButton = CCMenuItemSpriteExtra::create(
-			CCSprite::createWithSpriteFrameName("GJ_likeBtn_001.png"),
-			this,
-			/**
-			 * Here we use the name we set earlier for our modify class.
-			*/
-			menu_selector(MyMenuLayer::onMyButton)
-		);
+struct CheckpointSnapshot {
+    double time;
+    size_t actionCount;
+};
 
-		/**
-		 * Here we access the `bottom-menu` node by its ID, and add our button to it.
-		 * Node IDs are a Geode feature, see this page for more info about it:
-		 * https://docs.geode-sdk.org/tutorials/nodetree
-		*/
-		auto menu = this->getChildByID("bottom-menu");
-		menu->addChild(myButton);
+// Переменные состояния бота
+static BotMode s_mode = BotMode::Disabled;
+static double s_time = 0.0;
+static size_t s_actionIndex = 0;
+static bool s_isReplaying = false;
 
-		/**
-		 * The `_spr` string literal operator just prefixes the string with
-		 * your mod id followed by a slash. This is good practice for setting your own node ids.
-		*/
-		myButton->setID("my-button"_spr);
+static std::vector<BotAction> s_actions;
+static std::vector<CheckpointSnapshot> s_checkpoints;
 
-		/**
-		 * We update the layout of the menu to ensure that our button is properly placed.
-		 * This is yet another Geode feature, see this page for more info about it:
-		 * https://docs.geode-sdk.org/tutorials/layouts
-		*/
-		menu->updateLayout();
+// 1. ХУК НА ОБНОВЛЕНИЕ КАДРОВ И ФИЗИКИ
+class $modify(BotPlayLayer, PlayLayer) {
+    void update(float dt) {
+        if (s_mode != BotMode::Disabled) {
+            s_time += static_cast<double>(dt);
 
-		/**
-		 * We return `true` to indicate that the class was properly initialized.
-		 */
-		return true;
-	}
+            // Если включен бот — отдаем клики перед расчетом кадра
+            if (s_mode == BotMode::Play) {
+                while (s_actionIndex < s_actions.size() && s_time >= s_actions[s_actionIndex].time) {
+                    auto const& act = s_actions[s_actionIndex];
+                    s_isReplaying = true;
+                    this->handleButton(act.push, act.button, act.player1);
+                    s_isReplaying = false;
+                    s_actionIndex++;
+                }
+            }
+        }
 
-	/**
-	 * This is the callback function for the button we created earlier.
-	 * The signature for button callbacks must always be the same,
-	 * return type `void` and taking a `CCObject*`.
-	*/
-	void onMyButton(CCObject*) {
-		FLAlertLayer::create("Geode", "Hello from my custom mod!", "OK")->show();
-	}
+        PlayLayer::update(dt);
+    }
+
+    // Сохранение чекпоинта практики
+    void createCheckpoint() {
+        PlayLayer::createCheckpoint();
+        if (s_mode != BotMode::Disabled) {
+            s_checkpoints.push_back({ s_time, s_actions.size() });
+        }
+    }
+
+    // Удаление чекпоинта практики
+    void removeLastCheckpoint() {
+        PlayLayer::removeLastCheckpoint();
+        if (!s_checkpoints.empty()) {
+            s_checkpoints.pop_back();
+        }
+    }
+
+    // Респавн на чекпоинте при смерти
+    void loadFromCheckpoint(CheckpointObject* cp) {
+        PlayLayer::loadFromCheckpoint(cp);
+        if (!s_checkpoints.empty()) {
+            auto snap = s_checkpoints.back();
+            s_time = snap.time;
+
+            if (s_mode == BotMode::Record) {
+                if (snap.actionCount <= s_actions.size()) {
+                    s_actions.resize(snap.actionCount); // Удаляем неудачные клики после смерти
+                }
+            } else if (s_mode == BotMode::Play) {
+                s_actionIndex = snap.actionCount; // Перематываем бота к чекпоинту
+            }
+        }
+        // Отжимаем кнопки, чтобы куб не зажимал прыжок бесконечно
+        this->handleButton(false, 1, true);
+        this->handleButton(false, 1, false);
+    }
+
+    // Рестарт уровня
+    void resetLevel() {
+        PlayLayer::resetLevel();
+
+        // Если это не практика или чекпоинтов нет — полный сброс на начало
+        if (!m_isPracticeMode || s_checkpoints.empty()) {
+            s_time = 0.0;
+            s_actionIndex = 0;
+            s_checkpoints.clear();
+
+            if (s_mode == BotMode::Record) {
+                s_actions.clear();
+            }
+        }
+    }
+
+    // Выход из уровня
+    void onQuit() {
+        PlayLayer::onQuit();
+        s_checkpoints.clear();
+        s_time = 0.0;
+        s_actionIndex = 0;
+    }
+};
+
+// 2. ХУК НА НАЖАТИЯ КНОПОК
+class $modify(BotBaseGameLayer, GJBaseGameLayer) {
+    void handleButton(bool push, int button, bool player1) {
+        // Пропускаем клики самого бота без повторной записи
+        if (s_isReplaying) {
+            GJBaseGameLayer::handleButton(push, button, player1);
+            return;
+        }
+
+        // Если бот играет сам — игнорируем пальцы игрока
+        if (s_mode == BotMode::Play) {
+            return;
+        }
+
+        // Если идет запись — запоминаем время и тип нажатия
+        if (s_mode == BotMode::Record) {
+            s_actions.push_back({ s_time, push, button, player1 });
+        }
+
+        GJBaseGameLayer::handleButton(push, button, player1);
+    }
+};
+
+// 3. УПРАВЛЕНИЕ В МЕНЮ ПАУЗЫ
+class $modify(BotPauseLayer, PauseLayer) {
+    void customSetup() {
+        PauseLayer::customSetup();
+
+        auto winSize = CCDirector::sharedDirector()->getWinSize();
+
+        auto menu = CCMenu::create();
+        menu->setPosition({ winSize.width / 2.f, 35.f });
+        menu->setID("bot-control-menu"_spr);
+
+        const char* modeTitle = "Bot: OFF";
+        if (s_mode == BotMode::Record) modeTitle = "Bot: REC";
+        else if (s_mode == BotMode::Play) modeTitle = "Bot: PLAY";
+
+        auto modeSpr = ButtonSprite::create(modeTitle);
+        modeSpr->setScale(0.7f);
+        auto modeBtn = CCMenuItemSpriteExtra::create(
+            modeSpr, this, menu_selector(BotPauseLayer::onToggleMode)
+        );
+
+        auto clearSpr = ButtonSprite::create("Clear");
+        clearSpr->setScale(0.7f);
+        auto clearBtn = CCMenuItemSpriteExtra::create(
+            clearSpr, this, menu_selector(BotPauseLayer::onClearMacro)
+        );
+
+        menu->addChild(modeBtn);
+        menu->addChild(clearBtn);
+
+        auto layout = RowLayout::create();
+        layout->setGap(12.f);
+        menu->setLayout(layout);
+        menu->updateLayout();
+
+        this->addChild(menu);
+    }
+
+    void onToggleMode(CCObject* sender) {
+        const char* modeTitle = "Bot: OFF";
+
+        if (s_mode == BotMode::Disabled) {
+            s_mode = BotMode::Record;
+            modeTitle = "Bot: REC";
+            Notification::create("Bot: RECORDING", NotificationIcon::Info)->show();
+        } else if (s_mode == BotMode::Record) {
+            s_mode = BotMode::Play;
+            modeTitle = "Bot: PLAY";
+            Notification::create("Bot: PLAYING", NotificationIcon::Success)->show();
+        } else {
+            s_mode = BotMode::Disabled;
+            Notification::create("Bot: OFF", NotificationIcon::Warning)->show();
+        }
+
+        if (auto btn = typeinfo_cast<CCMenuItemSpriteExtra*>(sender)) {
+            auto spr = ButtonSprite::create(modeTitle);
+            spr->setScale(0.7f);
+            btn->setNormalImage(spr);
+        }
+    }
+
+    void onClearMacro(CCObject*) {
+        s_actions.clear();
+        s_checkpoints.clear();
+        s_time = 0.0;
+        s_actionIndex = 0;
+        Notification::create("Macro Cleared!", NotificationIcon::Success)->show();
+    }
 };
