@@ -286,9 +286,15 @@ namespace bot {
             return;
         }
 
-        if (pl->m_playerDied || modifiedDelta <= 0.0) {
+        if (pl->m_playerDied) {
             skipUpdate = true;
             firstFrame = true;
+            return;
+        }
+        // Кадр без физических шагов (бывает при замедлении): ничего не сбрасываем,
+        // клики накопятся и разложатся по шагам в следующем кадре со шагами.
+        if (modifiedDelta <= 0.0) {
+            skipUpdate = true;
             return;
         }
 
@@ -300,17 +306,32 @@ namespace bot {
     }
 
     // Начало кадра: время кадра и сброс при паузе/выходе из уровня
+    // Скорость игры при записи (настройка "record-speed", 0.01..1.0)
+    inline double recSpeed = 1.0;
+    inline float appliedScale = 1.0f;
+
+    inline void setTimeScale(float s) {
+        if (std::fabs(s - appliedScale) < 1e-6f) return;
+        appliedScale = s;
+        CCDirector::get()->getScheduler()->setTimeScale(s);
+    }
+
     inline void onFrameStart() {
         currentFrameTime = getCurrentTimestamp();
-        if (g.mode == Mode::Off) return;
 
         PlayLayer* pl = PlayLayer::get();
         CCNode* par = nullptr;
-        if (!pl
+        bool idle = !pl
             || !(par = pl->getParent())
             || par->getChildByType<PauseLayer>(0)
-            || pl->getChildByType<EndLevelLayer>(0))
-        {
+            || pl->getChildByType<EndLevelLayer>(0);
+
+        // замедляем только пока идёт запись и игра реально идёт (не пауза/выход)
+        setTimeScale((g.mode == Mode::Record && !idle) ? static_cast<float>(recSpeed) : 1.0f);
+
+        if (g.mode == Mode::Off) return;
+
+        if (idle) {
             firstFrame = true;
             skipUpdate = true;
             inputVector.clear();
@@ -715,3 +736,10 @@ class $modify(BotPauseLayer, PauseLayer) {
         this->updateBotLabel();
     }
 };
+
+$on_mod(Loaded) {
+    bot::recSpeed = std::clamp(Mod::get()->getSettingValue<double>("record-speed"), 0.01, 1.0);
+    listenForSettingChanges<double>("record-speed", +[](double v) {
+        bot::recSpeed = std::clamp(v, 0.01, 1.0);
+    });
+}
