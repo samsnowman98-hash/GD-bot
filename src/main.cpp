@@ -1,356 +1,337 @@
+// Simple frame-perfect macro bot for Geometry Dash 2.2081 / Geode 5.x (Android)
+//
+// Идея:
+//  * Время = номер физического шага (processCommands), а не секунды -> не зависит от FPS.
+//  * Запись: хук handleButton пишет {frame, button, down, p1}.
+//  * Воспроизведение: в начале processCommands подаём действия этого кадра, реальный ввод блокируется.
+//  * Практик-режим: каждому чекпоинту запоминаем кадр; при откате обрезаем макрос / перематываем индекс.
+//  * Макрос сохраняется в файл (отдельный на каждый уровень) и грузится при входе в уровень.
+
 #include <Geode/Geode.hpp>
+#include <Geode/modify/GJBaseGameLayer.hpp>
 #include <Geode/modify/PlayLayer.hpp>
 #include <Geode/modify/PauseLayer.hpp>
-#include <Geode/modify/GJBaseGameLayer.hpp>
-#include <Geode/binding/CheckpointObject.hpp>
-#include <Geode/binding/ButtonSprite.hpp>
-#include <Geode/binding/CCMenuItemSpriteExtra.hpp>
 
-#include <vector>
-#include <unordered_map>
-#include <unordered_set>
 #include <algorithm>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
+#include <string>
+#include <unordered_map>
+#include <vector>
 
 using namespace geode::prelude;
 
-enum class BotMode {
-    Disabled,
-    Record,
-    Play
-};
+namespace bot {
 
-struct BotAction {
-    double time;
-    bool push;
-    int button;
-    bool player1;
-};
+    enum class Mode { Off, Record, Play };
 
-struct PressedKey {
-    int button;
-    bool player1;
-};
-
-struct CheckpointSnapshot {
-    double time;
-    size_t actionCount;
-    std::vector<PressedKey> pressed;
-};
-
-static BotMode s_mode = BotMode::Disabled;
-static double s_time = 0.0;
-static size_t s_actionIndex = 0;
-static std::vector<BotAction> s_actions;
-static std::unordered_map<CheckpointObject*, CheckpointSnapshot> s_snapshots;
-static std::vector<CheckpointObject*> s_checkpointStack;
-static std::unordered_set<uint64_t> s_pressed;
-static int s_scriptDepth = 0;
-static int s_loadDepth = 0;
-static bool s_pendingRestart = false;
-static bool s_pendingRelease = false;
-static bool s_blockRealInput = false;
-static bool s_stateChanged = false;
-static CCNode* s_pauseNode = nullptr;
-
-static void refreshBotUI();
-
-static uint64_t makeButtonKey(int button, bool player1) {
-    return (static_cast<uint64_t>(static_cast<uint32_t>(button)) << 1) | (player1 ? 0ULL : 1ULL);
-}
-
-static PressedKey decodeButtonKey(uint64_t key) {
-    return { static_cast<int>(static_cast<uint32_t>(key >> 1)), (key & 1ULL) == 0ULL };
-}
-
-static std::vector<PressedKey> getCurrentPressedKeys() {
-    std::vector<PressedKey> out;
-    out.reserve(s_pressed.size());
-    for (auto key : s_pressed) {
-        out.push_back(decodeButtonKey(key));
-    }
-    return out;
-}
-
-static void clearCheckpointState() {
-    s_snapshots.clear();
-    s_checkpointStack.clear();
-}
-
-static void truncateCheckpointsAfter(CheckpointObject* cp) {
-    if (!cp) return;
-    auto it = std::find(s_checkpointStack.begin(), s_checkpointStack.end(), cp);
-    if (it == s_checkpointStack.end()) return;
-    for (auto x = it + 1; x != s_checkpointStack.end(); ++x) {
-        s_snapshots.erase(*x);
-    }
-    s_checkpointStack.erase(it + 1, s_checkpointStack.end());
-}
-
-static void refreshBotUI() {
-    if (!s_pauseNode) return;
-    auto menuNode = s_pauseNode->getChildByID("bot-control-menu");
-    auto menu = typeinfo_cast<CCMenu*>(menuNode);
-    if (!menu) return;
-
-    auto setButton = [&](char const* id, char const* text, bool active) {
-        auto itemNode = menu->getChildByID(id);
-        auto item = typeinfo_cast<CCMenuItemSpriteExtra*>(itemNode);
-        if (!item) return;
-        auto spr = ButtonSprite::create(text);
-        if (spr) {
-            spr->setScale(0.7f);
-            item->setNormalImage(spr);
-        }
-        item->setOpacity(active ? 255 : 150);
+    struct Action {
+        uint32_t frame;
+        uint8_t button;
+        bool down;
+        bool p1;
     };
 
-    setButton("bot-off-btn", "OFF", s_mode == BotMode::Disabled);
-    setButton("bot-rec-btn", "REC", s_mode == BotMode::Record);
-    setButton("bot-play-btn", "PLAY", s_mode == BotMode::Play);
-    setButton("bot-clear-btn", "CLEAR", false);
-}
+    struct State {
+        Mode mode = Mode::Off;
+        uint32_t frame = 0;          // номер следующего физического шага
+        size_t index = 0;            // следующее действие для воспроизведения
+        int inject = 0;              // >0 пока мы сами вызываем handleButton
+        bool cpLoaded = false;       // resetLevel загрузил чекпоинт
+        int levelID = 0;
+        std::vector<Action> macro;
+        std::unordered_map<CheckpointObject*, uint32_t> checkpoints;
+    };
 
-static void setBotMode(BotMode next, bool restart, bool clearMacro) {
-    if (clearMacro) s_actions.clear();
-    s_mode = next;
-    s_time = 0.0;
-    s_actionIndex = 0;
-    clearCheckpointState();
-    if (restart) {
-        s_pendingRestart = true;
-        s_pendingRelease = false;
-        s_blockRealInput = true;
-    } else {
-        s_pendingRestart = false;
-        s_pendingRelease = true;
-        s_blockRealInput = false;
+    inline State g;
+
+    inline bool isPlayLayer(GJBaseGameLayer* l) {
+        auto pl = PlayLayer::get();
+        return pl && static_cast<GJBaseGameLayer*>(pl) == l;
     }
-    s_stateChanged = true;
-    refreshBotUI();
-}
 
-class $modify(BotBaseGameLayer, GJBaseGameLayer) {
-public:
-    void handleButton(bool push, int button, bool player1) {
-        uint64_t key = makeButtonKey(button, player1);
-        if (s_scriptDepth > 0) {
-            if (push) s_pressed.insert(key);
-            else s_pressed.erase(key);
-            GJBaseGameLayer::handleButton(push, button, player1);
+    inline char const* modeName() {
+        switch (g.mode) {
+            case Mode::Record: return "REC";
+            case Mode::Play: return "PLAY";
+            default: return "OFF";
+        }
+    }
+
+    inline std::string statusText() {
+        return fmt::format("Bot: {} | actions: {}", modeName(), g.macro.size());
+    }
+
+    inline std::filesystem::path macroPath() {
+        return Mod::get()->getSaveDir() / fmt::format("level_{}.macro", g.levelID);
+    }
+
+    constexpr uint32_t kMagic = 0x42544F31; // "1OTB"
+
+    inline void saveMacro() {
+        std::ofstream f(macroPath(), std::ios::binary | std::ios::trunc);
+        if (!f) {
+            log::error("Cannot open macro file for writing");
             return;
         }
-        if (s_blockRealInput) return;
-        if (s_mode == BotMode::Play) return;
-        if (s_mode == BotMode::Record) {
-            s_actions.push_back({ s_time, push, button, player1 });
+        uint32_t magic = kMagic;
+        uint32_t count = static_cast<uint32_t>(g.macro.size());
+        f.write(reinterpret_cast<char const*>(&magic), sizeof(magic));
+        f.write(reinterpret_cast<char const*>(&count), sizeof(count));
+        for (auto const& a : g.macro) {
+            uint8_t flags = static_cast<uint8_t>((a.down ? 1 : 0) | (a.p1 ? 2 : 0));
+            f.write(reinterpret_cast<char const*>(&a.frame), sizeof(a.frame));
+            f.write(reinterpret_cast<char const*>(&flags), sizeof(flags));
+            f.write(reinterpret_cast<char const*>(&a.button), sizeof(a.button));
         }
-        if (push) s_pressed.insert(key);
-        else s_pressed.erase(key);
-        GJBaseGameLayer::handleButton(push, button, player1);
+    }
+
+    inline void loadMacro() {
+        g.macro.clear();
+        std::ifstream f(macroPath(), std::ios::binary);
+        if (!f) return;
+        uint32_t magic = 0, count = 0;
+        f.read(reinterpret_cast<char*>(&magic), sizeof(magic));
+        f.read(reinterpret_cast<char*>(&count), sizeof(count));
+        if (!f || magic != kMagic || count > 5'000'000) return;
+        std::vector<Action> tmp;
+        tmp.reserve(count);
+        for (uint32_t i = 0; i < count; ++i) {
+            Action a{};
+            uint8_t flags = 0;
+            f.read(reinterpret_cast<char*>(&a.frame), sizeof(a.frame));
+            f.read(reinterpret_cast<char*>(&flags), sizeof(flags));
+            f.read(reinterpret_cast<char*>(&a.button), sizeof(a.button));
+            if (!f) return; // битый файл - не грузим
+            a.down = flags & 1;
+            a.p1 = flags & 2;
+            tmp.push_back(a);
+        }
+        g.macro = std::move(tmp);
+    }
+
+    inline void injectButton(GJBaseGameLayer* l, bool down, int button, bool p1) {
+        ++g.inject;
+        l->handleButton(down, button, p1);
+        --g.inject;
+    }
+
+    // Перематывает воспроизведение на g.frame и восстанавливает зажатые кнопки
+    inline void syncPlayback(GJBaseGameLayer* l) {
+        auto it = std::lower_bound(
+            g.macro.begin(), g.macro.end(), g.frame,
+            [](Action const& a, uint32_t f) { return a.frame < f; }
+        );
+        g.index = static_cast<size_t>(it - g.macro.begin());
+
+        bool held[4][2] = {};
+        for (size_t i = 0; i < g.index; ++i) {
+            auto const& a = g.macro[i];
+            if (a.button < 4) held[a.button][a.p1 ? 0 : 1] = a.down;
+        }
+        for (int b = 1; b <= 3; ++b) {
+            injectButton(l, held[b][0], b, true);
+            injectButton(l, held[b][1], b, false);
+        }
+    }
+
+    inline void notify(char const* text, NotificationIcon icon = NotificationIcon::Info) {
+        Notification::create(text, icon, 1.f)->show();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Ввод и счётчик кадров
+// ---------------------------------------------------------------------------
+class $modify(BotBaseGameLayer, GJBaseGameLayer) {
+    void handleButton(bool down, int button, bool isPlayer1) {
+        if (bot::g.inject > 0 || bot::g.mode == bot::Mode::Off || !bot::isPlayLayer(this)) {
+            GJBaseGameLayer::handleButton(down, button, isPlayer1);
+            return;
+        }
+        if (bot::g.mode == bot::Mode::Play) return; // реальный ввод во время воспроизведения игнорируем
+
+        // Record
+        bot::g.macro.push_back({
+            bot::g.frame, static_cast<uint8_t>(button), down, isPlayer1
+        });
+        GJBaseGameLayer::handleButton(down, button, isPlayer1);
+    }
+
+    void processCommands(float dt) {
+        if (!bot::isPlayLayer(this)) {
+            GJBaseGameLayer::processCommands(dt);
+            return;
+        }
+
+        if (bot::g.mode == bot::Mode::Play) {
+            auto& g = bot::g;
+            while (g.index < g.macro.size() && g.macro[g.index].frame <= g.frame) {
+                auto const& a = g.macro[g.index];
+                bot::injectButton(this, a.down, a.button, a.p1);
+                ++g.index;
+            }
+        }
+
+        GJBaseGameLayer::processCommands(dt);
+        ++bot::g.frame;
     }
 };
 
+// ---------------------------------------------------------------------------
+// Уровень, чекпоинты, рестарты
+// ---------------------------------------------------------------------------
 class $modify(BotPlayLayer, PlayLayer) {
-public:
-    void releaseAllButtons() {
-        auto pressed = getCurrentPressedKeys();
-        ++s_scriptDepth;
-        for (auto const& p : pressed) {
-            this->handleButton(false, p.button, p.player1);
-        }
-        --s_scriptDepth;
-        s_pressed.clear();
+    bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
+        bot::g = bot::State{};
+        if (level) bot::g.levelID = level->m_levelID.value();
+        if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
+        bot::loadMacro();
+        return true;
     }
 
-    void applyButtons(std::vector<PressedKey> const& pressed) {
-        ++s_scriptDepth;
-        for (auto const& p : pressed) {
-            this->handleButton(true, p.button, p.player1);
-        }
-        --s_scriptDepth;
-    }
+    void resetLevel() {
+        bot::g.cpLoaded = false;
+        PlayLayer::resetLevel();
+        if (bot::g.cpLoaded) return; // откат на чекпоинт обработан в loadFromCheckpoint
 
-    void update(float dt) {
-        if (s_pendingRestart) {
-            s_pendingRestart = false;
-            s_pendingRelease = false;
-            this->releaseAllButtons();
-            this->resetLevel();
-            s_blockRealInput = false;
-            s_stateChanged = false;
-        }
-        if (s_pendingRelease) {
-            s_pendingRelease = false;
-            this->releaseAllButtons();
-            s_stateChanged = false;
-        }
-        if (s_mode == BotMode::Play && s_actions.empty()) {
-            setBotMode(BotMode::Disabled, false, false);
-        }
-        if (s_mode != BotMode::Disabled) {
-            s_time += static_cast<double>(dt);
-            if (s_mode == BotMode::Play) {
-                while (s_actionIndex < s_actions.size() && s_time >= s_actions[s_actionIndex].time) {
-                    BotAction act = s_actions[s_actionIndex];
-                    s_stateChanged = false;
-                    ++s_scriptDepth;
-                    this->handleButton(act.push, act.button, act.player1);
-                    --s_scriptDepth;
-                    if (s_stateChanged) break;
-                    ++s_actionIndex;
-                }
-                if (!s_actions.empty() && s_actionIndex >= s_actions.size() && s_time >= s_actions.back().time + 0.25) {
-                    setBotMode(BotMode::Disabled, false, false);
-                }
-            }
-        }
-        PlayLayer::update(dt);
+        bot::g.frame = 0;
+        bot::g.index = 0;
+        bot::g.checkpoints.clear();
+        if (bot::g.mode == bot::Mode::Record) bot::g.macro.clear();
     }
 
     CheckpointObject* createCheckpoint() {
         auto cp = PlayLayer::createCheckpoint();
-        if (cp && s_mode != BotMode::Disabled && !s_blockRealInput) {
-            CheckpointSnapshot snap;
-            snap.time = s_time;
-            snap.actionCount = (s_mode == BotMode::Play) ? s_actionIndex : s_actions.size();
-            snap.pressed = getCurrentPressedKeys();
-            if (s_snapshots.find(cp) == s_snapshots.end()) {
-                s_checkpointStack.push_back(cp);
-            }
-            s_snapshots[cp] = snap;
-        }
+        if (cp) bot::g.checkpoints[cp] = bot::g.frame;
         return cp;
     }
 
-    void removeCheckpoint(bool p0) {
-        PlayLayer::removeCheckpoint(p0);
-        if (s_loadDepth > 0) return;
-        if (!s_checkpointStack.empty()) {
-            auto cp = s_checkpointStack.back();
-            s_checkpointStack.pop_back();
-            s_snapshots.erase(cp);
-        }
-    }
-
     void loadFromCheckpoint(CheckpointObject* cp) {
-        ++s_loadDepth;
         PlayLayer::loadFromCheckpoint(cp);
-        --s_loadDepth;
-        truncateCheckpointsAfter(cp);
-        if (!cp) {
-            this->releaseAllButtons();
-            s_time = 0.0;
-            s_actionIndex = 0;
-            clearCheckpointState();
-            s_stateChanged = true;
-            return;
-        }
-        auto it = s_snapshots.find(cp);
-        if (it == s_snapshots.end()) {
-            this->releaseAllButtons();
-            setBotMode(BotMode::Disabled, false, false);
-            s_stateChanged = true;
-            return;
-        }
-        auto snap = it->second;
-        s_time = snap.time;
-        if (s_mode == BotMode::Record) {
-            if (snap.actionCount <= s_actions.size()) {
-                s_actions.resize(snap.actionCount);
+        bot::g.cpLoaded = true;
+
+        auto it = bot::g.checkpoints.find(cp);
+        if (it == bot::g.checkpoints.end()) {
+            // неизвестный чекпоинт - синхронизироваться нельзя, безопаснее выключить бота
+            bot::g.frame = 0;
+            bot::g.index = 0;
+            if (bot::g.mode != bot::Mode::Off) {
+                bot::g.mode = bot::Mode::Off;
+                bot::notify("Bot: unknown checkpoint, OFF", NotificationIcon::Warning);
             }
-            s_actionIndex = 0;
-        } else if (s_mode == BotMode::Play) {
-            s_actionIndex = std::min(snap.actionCount, s_actions.size());
-        } else {
-            s_actionIndex = 0;
+            return;
         }
-        this->releaseAllButtons();
-        this->applyButtons(snap.pressed);
-        s_stateChanged = true;
+
+        bot::g.frame = it->second;
+
+        if (bot::g.mode == bot::Mode::Record) {
+            auto& m = bot::g.macro;
+            m.erase(
+                std::remove_if(m.begin(), m.end(), [](bot::Action const& a) {
+                    return a.frame >= bot::g.frame;
+                }),
+                m.end()
+            );
+        }
+        else if (bot::g.mode == bot::Mode::Play) {
+            bot::syncPlayback(this);
+        }
     }
 
-    void resetLevel() {
-        PlayLayer::resetLevel();
-        if (s_loadDepth > 0) return;
-        s_time = 0.0;
-        s_actionIndex = 0;
-        clearCheckpointState();
-        s_pressed.clear();
-        if (s_mode == BotMode::Record) {
-            s_actions.clear();
+    void levelComplete() {
+        if (bot::g.mode == bot::Mode::Record) {
+            if (!bot::g.macro.empty()) {
+                bot::saveMacro();
+                bot::notify("Macro saved!", NotificationIcon::Success);
+            }
+            bot::g.mode = bot::Mode::Off;
         }
-        s_stateChanged = true;
+        PlayLayer::levelComplete();
     }
 };
 
+// ---------------------------------------------------------------------------
+// Кнопки в меню паузы
+// ---------------------------------------------------------------------------
 class $modify(BotPauseLayer, PauseLayer) {
-public:
     void customSetup() {
         PauseLayer::customSetup();
-        s_pauseNode = this;
+        if (!PlayLayer::get()) return;
 
-        auto winSize = CCDirector::sharedDirector()->getWinSize();
+        auto win = CCDirector::get()->getWinSize();
 
         auto menu = CCMenu::create();
-        menu->setPosition(ccp(winSize.width / 2.f, 35.f));
-        menu->setID("bot-control-menu");
+        menu->setID("bot-menu");
+        menu->setPosition({ 0.f, 0.f });
 
-        float gap = 90.f;
-        float startX = -gap * 1.5f;
+        auto label = CCLabelBMFont::create(bot::statusText().c_str(), "chatFont.fnt");
+        label->setID("bot-status");
+        label->setScale(0.6f);
+        label->setAnchorPoint({ 0.f, 0.5f });
+        label->setPosition({ 10.f, win.height / 2.f + 75.f });
+        this->addChild(label);
 
-        struct BtnDef {
-            char const* text;
-            char const* id;
-            SEL_MenuHandler sel;
-        };
+        float x = 45.f;
+        float y = win.height / 2.f + 45.f;
 
-        BtnDef defs[] = {
-            {"OFF",   "bot-off-btn",   menu_selector(BotPauseLayer::onOffButton)},
-            {"REC",   "bot-rec-btn",   menu_selector(BotPauseLayer::onRecButton)},
-            {"PLAY",  "bot-play-btn",  menu_selector(BotPauseLayer::onPlayButton)},
-            {"CLEAR", "bot-clear-btn", menu_selector(BotPauseLayer::onClearButton)}
-        };
-
-        for (int i = 0; i < 4; ++i) {
-            auto spr = ButtonSprite::create(defs[i].text);
-            if (!spr) continue;
-            spr->setScale(0.7f);
-
-            auto item = CCMenuItemSpriteExtra::create(spr, this, defs[i].sel);
-            if (!item) continue;
-
-            item->setID(defs[i].id);
-            item->setPosition(ccp(startX + gap * i, 0.f));
+        auto add = [&](char const* text, char const* id, SEL_MenuHandler cb) {
+            auto spr = ButtonSprite::create(text);
+            spr->setScale(0.6f);
+            auto item = CCMenuItemSpriteExtra::create(spr, this, cb);
+            item->setID(id);
+            item->setPosition({ x, y });
             menu->addChild(item);
-        }
+            y -= 30.f;
+        };
+
+        add("REC",   "bot-rec",   menu_selector(BotPauseLayer::onBotRec));
+        add("PLAY",  "bot-play",  menu_selector(BotPauseLayer::onBotPlay));
+        add("STOP",  "bot-stop",  menu_selector(BotPauseLayer::onBotStop));
+        add("CLEAR", "bot-clear", menu_selector(BotPauseLayer::onBotClear));
 
         this->addChild(menu);
-        refreshBotUI();
     }
 
-    void onOffButton(CCObject*) {
-        setBotMode(BotMode::Disabled, false, false);
-        Notification::create("Bot: OFF", NotificationIcon::Warning)->show();
+    void updateBotLabel() {
+        if (auto l = typeinfo_cast<CCLabelBMFont*>(this->getChildByID("bot-status"))) {
+            l->setString(bot::statusText().c_str());
+        }
     }
 
-    void onRecButton(CCObject*) {
-        setBotMode(BotMode::Record, true, true);
-        Notification::create("Bot: RECORDING", NotificationIcon::Info)->show();
+    void onBotRec(CCObject*) {
+        bot::g.macro.clear();
+        bot::g.mode = bot::Mode::Record;
+        bot::notify("Recording...", NotificationIcon::Info);
+        this->onRestart(nullptr); // рестарт с начала и выход из паузы
     }
 
-    void onPlayButton(CCObject*) {
-        if (s_actions.empty()) {
-            Notification::create("No macro!", NotificationIcon::Warning)->show();
+    void onBotPlay(CCObject*) {
+        if (bot::g.macro.empty()) {
+            bot::notify("No macro!", NotificationIcon::Warning);
             return;
         }
-        setBotMode(BotMode::Play, true, false);
-        Notification::create("Bot: PLAYING", NotificationIcon::Success)->show();
+        bot::g.mode = bot::Mode::Play;
+        bot::notify("Playing...", NotificationIcon::Success);
+        this->onRestart(nullptr);
     }
 
-    void onClearButton(CCObject*) {
-        s_actions.clear();
-        setBotMode(BotMode::Disabled, false, false);
-        Notification::create("Macro cleared!", NotificationIcon::Success)->show();
+    void onBotStop(CCObject*) {
+        if (bot::g.mode == bot::Mode::Record && !bot::g.macro.empty()) {
+            bot::saveMacro();
+            bot::notify("Macro saved!", NotificationIcon::Success);
+        }
+        bot::g.mode = bot::Mode::Off;
+        this->updateBotLabel();
+    }
+
+    void onBotClear(CCObject*) {
+        bot::g.macro.clear();
+        bot::g.mode = bot::Mode::Off;
+        std::error_code ec;
+        std::filesystem::remove(bot::macroPath(), ec);
+        bot::notify("Macro cleared", NotificationIcon::Success);
+        this->updateBotLabel();
     }
 };
