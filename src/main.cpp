@@ -159,9 +159,12 @@ class $modify(BotBaseGameLayer, GJBaseGameLayer) {
         GJBaseGameLayer::handleButton(down, button, isPlayer1);
     }
 
-    void processCommands(float dt) {
+    // В GD 2.2081 сигнатура: processCommands(float dt, bool isHalfTick, bool isLastTick)
+    // Считаем КАЖДЫЙ вызов: запись и воспроизведение используют один и тот же счётчик,
+    // поэтому они всегда совпадают друг с другом.
+    void processCommands(float dt, bool isHalfTick, bool isLastTick) {
         if (!bot::isPlayLayer(this)) {
-            GJBaseGameLayer::processCommands(dt);
+            GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
             return;
         }
 
@@ -174,7 +177,7 @@ class $modify(BotBaseGameLayer, GJBaseGameLayer) {
             }
         }
 
-        GJBaseGameLayer::processCommands(dt);
+        GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
         ++bot::g.frame;
     }
 };
