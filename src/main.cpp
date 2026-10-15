@@ -1,13 +1,5 @@
-// Sub-step (time-based) macro bot for Geometry Dash 2.2081 / Geode 5.x (Android)
-//
-// Возможности:
-//  * Встроенный суб-тиковый движок CBF (Click Between Frames) с нарезкой 240 TPS на доли миллисекунды.
-//  * Коррекция таймингов замедления (Speedhack Desync Fix).
-//  * Исправлена коллизия волны и склонов при делении шагов (substepDelta).
-//  * Фиксация Random Seed для 100% детерминизма физики и триггеров.
-//  * Защита от коллизии макросов локальных уровней (хеширование при levelID == 0).
-//  * Система сохранения/загрузки макросов по слотам (1-9) в формате .gdbot.
-//  * Удобное управление скоростью и слотами прямо из меню паузы.
+// Sub-step (time-based) macro bot for Geometry Dash 2.2081 / Geode 5.x
+// Cross-platform: Android (ARM64) & Windows (x64)
 
 #include <Geode/Geode.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
@@ -17,6 +9,7 @@
 #include <Geode/modify/CCScheduler.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <deque>
@@ -25,7 +18,6 @@
 #include <functional>
 #include <limits>
 #include <string>
-#include <time.h>
 #include <unordered_map>
 #include <vector>
 
@@ -40,8 +32,8 @@ namespace bot {
     enum class Mode { Off, Record, Play };
 
     struct Action {
-        uint32_t step;   // номер шага (240 TPS)
-        double frac;     // точная доля шага 0.0 .. 1.0 (точность < 1 мс)
+        uint32_t step;   // номер физического шага (240 TPS)
+        double frac;     // точная доля шага 0.0 .. 1.0 (< 1 мс)
         uint8_t button;
         bool down;
         bool p1;
@@ -92,10 +84,10 @@ namespace bot {
     inline double recSpeed = 1.0;
     inline float appliedScale = 1.0f;
 
+    // Кроссплатформенное высокоточное время (Android + Windows)
     inline double getCurrentTimestamp() {
-        struct timespec now;
-        clock_gettime(CLOCK_MONOTONIC, &now);
-        return static_cast<double>(now.tv_sec) + static_cast<double>(now.tv_nsec) / 1'000'000'000.0;
+        using namespace std::chrono;
+        return duration_cast<duration<double>>(steady_clock::now().time_since_epoch()).count();
     }
 
     inline bool isPlayLayer(GJBaseGameLayer* l) {
@@ -114,11 +106,10 @@ namespace bot {
         midStep = false;
     }
 
-    // Включаем Click Between Steps, чтобы движок GD на Android собирал точные тайминги касаний
     inline void applyClickFlags(PlayLayer* pl) {
         if (!pl) return;
         if (g.mode != Mode::Off) {
-            pl->m_clickBetweenSteps = true; // ОБЯЗАТЕЛЬНО TRUE для сбора очереди касаний!
+            pl->m_clickBetweenSteps = true; // Обязательно true для сбора под-шагов
             pl->m_clickOnSteps = false;
         } else {
             auto gm = GameManager::get();
@@ -369,10 +360,11 @@ namespace bot {
     }
 
     inline void resetCollisionLog(PlayerObject* p) {
-        p->m_collisionLogTop->removeAllObjects();
-        p->m_collisionLogBottom->removeAllObjects();
-        p->m_collisionLogLeft->removeAllObjects();
-        p->m_collisionLogRight->removeAllObjects();
+        if (!p) return;
+        if (p->m_collisionLogTop) p->m_collisionLogTop->removeAllObjects();
+        if (p->m_collisionLogBottom) p->m_collisionLogBottom->removeAllObjects();
+        if (p->m_collisionLogLeft) p->m_collisionLogLeft->removeAllObjects();
+        if (p->m_collisionLogRight) p->m_collisionLogRight->removeAllObjects();
         p->m_lastCollisionLeft = -1;
         p->m_lastCollisionRight = -1;
         p->m_lastCollisionBottom = -1;
@@ -405,7 +397,6 @@ class $modify(BotBaseGameLayer, GJBaseGameLayer) {
             return;
         }
 
-        // Запись действия
         bot::Action a{};
         if (g.applying > 0) {
             a.step = g.applyStep;
@@ -505,13 +496,15 @@ class $modify(BotPlayerObject, PlayerObject) {
         bool p1StartedOnGround = this->m_isOnGround;
         bool p2StartedOnGround = p2 ? p2->m_isOnGround : false;
 
+        bool p1Rings = this->m_touchingRings && (this->m_touchingRings->count() > 0);
         bool p1NotBuffering = p1StartedOnGround
-            || this->m_touchingRings->count()
+            || p1Rings
             || this->m_isDashing
             || (this->m_isDart || this->m_isBird || this->m_isShip || this->m_isSwing);
 
+        bool p2Rings = p2 && p2->m_touchingRings && (p2->m_touchingRings->count() > 0);
         bool p2NotBuffering = p2 && (p2StartedOnGround
-            || p2->m_touchingRings->count()
+            || p2Rings
             || p2->m_isDashing
             || (p2->m_isDart || p2->m_isBird || p2->m_isShip || p2->m_isSwing));
 
@@ -590,7 +583,8 @@ class $modify(BotPlayLayer, PlayLayer) {
             bot::g.levelID = level->m_levelID.value();
             if (bot::g.levelID == 0) {
                 std::hash<std::string> hasher;
-                std::string basis = level->m_levelName + std::to_string(level->m_levelString.size());
+                // Безопасное форматирование без конфликта типов строк
+                std::string basis = fmt::format("{}_{}", level->m_levelName.c_str(), level->m_levelString.size());
                 bot::g.levelHash = static_cast<uint64_t>(hasher(basis));
             }
         }
@@ -600,7 +594,7 @@ class $modify(BotPlayLayer, PlayLayer) {
     }
 
     void resetLevel() {
-        std::srand(1337); // Детерминизм генератора случайных чисел
+        std::srand(1337);
         bot::g.cpLoaded = false;
         PlayLayer::resetLevel();
         bot::resetEngine();
@@ -665,7 +659,7 @@ class $modify(BotPlayLayer, PlayLayer) {
 };
 
 // ---------------------------------------------------------------------------
-// МЕНЮ ПАУЗЫ (Двухколоночный интерфейс)
+// МЕНЮ ПАУЗЫ
 // ---------------------------------------------------------------------------
 class $modify(BotPauseLayer, PauseLayer) {
     void customSetup() {
@@ -678,7 +672,6 @@ class $modify(BotPauseLayer, PauseLayer) {
         menu->setID("bot-menu");
         menu->setPosition({ 0.f, 0.f });
 
-        // Информационная плашка сверху
         auto label = CCLabelBMFont::create(bot::statusText().c_str(), "chatFont.fnt");
         label->setID("bot-status");
         label->setScale(0.55f);
@@ -686,17 +679,16 @@ class $modify(BotPauseLayer, PauseLayer) {
         label->setPosition({ 10.f, win.height / 2.f + 85.f });
         this->addChild(label);
 
-        // Вспомогательная функция создания компактных кнопок
         auto makeBtn = [this](char const* text, float scale, SEL_MenuHandler cb) {
             auto spr = ButtonSprite::create(text);
             spr->setScale(scale);
             return CCMenuItemSpriteExtra::create(spr, this, cb);
         };
 
-        // --- ЛЕВАЯ КОЛОНКА (Основные режимы) ---
         float col1X = 42.f;
         float startY = win.height / 2.f + 55.f;
 
+        // Колонка 1: Режимы
         auto btnRec = makeBtn("REC", 0.55f, menu_selector(BotPauseLayer::onBotRec));
         btnRec->setPosition({ col1X, startY });
         menu->addChild(btnRec);
@@ -713,10 +705,9 @@ class $modify(BotPauseLayer, PauseLayer) {
         btnClear->setPosition({ col1X, startY - 78.f });
         menu->addChild(btnClear);
 
-        // --- ПРАВАЯ КОЛОНКА (Скорость и Слоты) ---
+        // Колонка 2: Скорость и Слоты
         float col2X = 118.f;
 
-        // Скорость [-0.1] [+0.1]
         auto btnSpdDown = makeBtn("-0.1", 0.45f, menu_selector(BotPauseLayer::onSpeedDown));
         btnSpdDown->setPosition({ col2X - 22.f, startY });
         menu->addChild(btnSpdDown);
@@ -725,7 +716,6 @@ class $modify(BotPauseLayer, PauseLayer) {
         btnSpdUp->setPosition({ col2X + 22.f, startY });
         menu->addChild(btnSpdUp);
 
-        // Переключение слотов [S -] [S +]
         auto btnSlotDec = makeBtn("S -", 0.45f, menu_selector(BotPauseLayer::onSlotDec));
         btnSlotDec->setPosition({ col2X - 22.f, startY - 26.f });
         menu->addChild(btnSlotDec);
@@ -734,7 +724,6 @@ class $modify(BotPauseLayer, PauseLayer) {
         btnSlotInc->setPosition({ col2X + 22.f, startY - 26.f });
         menu->addChild(btnSlotInc);
 
-        // Сохранить / Загрузить слот
         auto btnSaveSlot = makeBtn("SAVE SLOT", 0.45f, menu_selector(BotPauseLayer::onSaveSlot));
         btnSaveSlot->setPosition({ col2X, startY - 52.f });
         menu->addChild(btnSaveSlot);
