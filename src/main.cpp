@@ -1,4 +1,13 @@
 // Sub-step (time-based) macro bot for Geometry Dash 2.2081 / Geode 5.x (Android)
+//
+// Возможности:
+//  * Встроенный суб-тиковый движок CBF (Click Between Frames) с нарезкой 240 TPS на доли миллисекунды.
+//  * Коррекция таймингов замедления (Speedhack Desync Fix).
+//  * Исправлена коллизия волны и склонов при делении шагов (substepDelta).
+//  * Фиксация Random Seed для 100% детерминизма физики и триггеров.
+//  * Защита от коллизии макросов локальных уровней (хеширование при levelID == 0).
+//  * Система сохранения/загрузки макросов по слотам (1-9) в формате .gdbot.
+//  * Удобное управление скоростью и слотами прямо из меню паузы.
 
 #include <Geode/Geode.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
@@ -13,6 +22,7 @@
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <string>
 #include <time.h>
@@ -23,13 +33,15 @@ using namespace geode::prelude;
 
 namespace bot {
 
-    constexpr double SMALLEST = 0.000001; // Улучшенная микро-точность для подшагов
+    constexpr double SMALLEST = 0.000001;
+    constexpr char const* kMacroExt = ".gdbot";
+    constexpr uint32_t kMagic = 0x32544F42; // "BOT2"
 
     enum class Mode { Off, Record, Play };
 
     struct Action {
-        uint32_t step;   // номер физического шага (240 TPS)
-        double frac;     // доля шага 0.0 .. 1.0 (точность < 1мс)
+        uint32_t step;   // номер шага (240 TPS)
+        double frac;     // точная доля шага 0.0 .. 1.0 (точность < 1 мс)
         uint8_t button;
         bool down;
         bool p1;
@@ -53,12 +65,15 @@ namespace bot {
         double applyFrac = 0.0;
         bool cpLoaded = false;
         int levelID = 0;
+        uint64_t levelHash = 0;
         std::vector<Action> macro;
         std::unordered_map<CheckpointObject*, uint32_t> checkpoints;
     };
 
     inline State g;
+    inline int currentSlot = 1;
 
+    // ---- Состояние движка нарезки шагов ----
     inline std::deque<Sub> stepQueue;
     inline std::vector<PlayerButtonCommand> inputVector;
     inline double lastFrameTime = 0.0;
@@ -73,6 +88,7 @@ namespace bot {
     inline CCPoint p2Pos = { 0.f, 0.f };
     inline float rotationDelta = 0.f;
 
+    // ---- Скорость записи ----
     inline double recSpeed = 1.0;
     inline float appliedScale = 1.0f;
 
@@ -98,10 +114,11 @@ namespace bot {
         midStep = false;
     }
 
+    // Включаем Click Between Steps, чтобы движок GD на Android собирал точные тайминги касаний
     inline void applyClickFlags(PlayLayer* pl) {
         if (!pl) return;
         if (g.mode != Mode::Off) {
-            pl->m_clickBetweenSteps = false;
+            pl->m_clickBetweenSteps = true; // ОБЯЗАТЕЛЬНО TRUE для сбора очереди касаний!
             pl->m_clickOnSteps = false;
         } else {
             auto gm = GameManager::get();
@@ -113,49 +130,56 @@ namespace bot {
     inline char const* modeName() {
         switch (g.mode) {
             case Mode::Record: return "REC";
-            case Mode::Play: return "PLAY";
-            default: return "OFF";
+            case Mode::Play:   return "PLAY";
+            default:           return "OFF";
         }
     }
 
     inline std::string statusText() {
-        return fmt::format("Bot: {} | acts: {} | Spd: {:.2f}x", modeName(), g.macro.size(), recSpeed);
+        return fmt::format("Bot: {} | acts: {} | Spd: {:.2f}x | Slot: {}",
+            modeName(), g.macro.size(), recSpeed, currentSlot);
     }
 
     inline void notify(char const* text, NotificationIcon icon = NotificationIcon::Info) {
         Notification::create(text, icon, 1.f)->show();
     }
 
+    // ---- Файловая система (.gdbot) ----
     inline std::filesystem::path macroPath() {
-        return Mod::get()->getSaveDir() / fmt::format("level_{}.macro", g.levelID);
+        if (g.levelID != 0) {
+            return Mod::get()->getSaveDir() / fmt::format("level_{}{}", g.levelID, kMacroExt);
+        }
+        return Mod::get()->getSaveDir() / fmt::format("local_{}{}", g.levelHash, kMacroExt);
     }
 
-    constexpr uint32_t kMagic = 0x32544F42; // "BOT2"
+    inline std::filesystem::path slotPath(int slot) {
+        return Mod::get()->getSaveDir() / fmt::format("slot_{}{}", slot, kMacroExt);
+    }
 
-    inline void saveMacro() {
-        std::ofstream f(macroPath(), std::ios::binary | std::ios::trunc);
-        if (!f) return;
+    inline bool writeMacroToFile(std::filesystem::path const& path, std::vector<Action> const& macro) {
+        std::ofstream f(path, std::ios::binary | std::ios::trunc);
+        if (!f) return false;
         uint32_t magic = kMagic;
-        uint32_t count = static_cast<uint32_t>(g.macro.size());
+        uint32_t count = static_cast<uint32_t>(macro.size());
         f.write(reinterpret_cast<char const*>(&magic), sizeof(magic));
         f.write(reinterpret_cast<char const*>(&count), sizeof(count));
-        for (auto const& a : g.macro) {
+        for (auto const& a : macro) {
             uint8_t flags = static_cast<uint8_t>((a.down ? 1 : 0) | (a.p1 ? 2 : 0));
             f.write(reinterpret_cast<char const*>(&a.step), sizeof(a.step));
             f.write(reinterpret_cast<char const*>(&a.frac), sizeof(a.frac));
             f.write(reinterpret_cast<char const*>(&flags), sizeof(flags));
             f.write(reinterpret_cast<char const*>(&a.button), sizeof(a.button));
         }
+        return true;
     }
 
-    inline void loadMacro() {
-        g.macro.clear();
-        std::ifstream f(macroPath(), std::ios::binary);
-        if (!f) return;
+    inline bool readMacroFromFile(std::filesystem::path const& path, std::vector<Action>& out) {
+        std::ifstream f(path, std::ios::binary);
+        if (!f) return false;
         uint32_t magic = 0, count = 0;
         f.read(reinterpret_cast<char*>(&magic), sizeof(magic));
         f.read(reinterpret_cast<char*>(&count), sizeof(count));
-        if (!f || magic != kMagic || count > 5'000'000) return;
+        if (!f || magic != kMagic || count > 5'000'000) return false;
         std::vector<Action> tmp;
         tmp.reserve(count);
         for (uint32_t i = 0; i < count; ++i) {
@@ -165,14 +189,53 @@ namespace bot {
             f.read(reinterpret_cast<char*>(&a.frac), sizeof(a.frac));
             f.read(reinterpret_cast<char*>(&flags), sizeof(flags));
             f.read(reinterpret_cast<char*>(&a.button), sizeof(a.button));
-            if (!f) return;
+            if (!f) return false;
             a.down = flags & 1;
             a.p1 = flags & 2;
             tmp.push_back(a);
         }
-        g.macro = std::move(tmp);
+        out = std::move(tmp);
+        return true;
     }
 
+    inline void saveMacro() {
+        if (!writeMacroToFile(macroPath(), g.macro)) {
+            log::error("Cannot open macro file for writing");
+        }
+    }
+
+    inline void loadMacro() {
+        g.macro.clear();
+        std::vector<Action> tmp;
+        if (readMacroFromFile(macroPath(), tmp)) {
+            g.macro = std::move(tmp);
+        }
+    }
+
+    inline void saveMacroToSlot(int slot) {
+        if (g.macro.empty()) {
+            notify("Nothing to save!", NotificationIcon::Warning);
+            return;
+        }
+        if (writeMacroToFile(slotPath(slot), g.macro)) {
+            notify(fmt::format("Saved to slot {}!", slot).c_str(), NotificationIcon::Success);
+        } else {
+            notify("Save failed!", NotificationIcon::Error);
+        }
+    }
+
+    inline void loadMacroFromSlot(int slot) {
+        std::vector<Action> tmp;
+        if (readMacroFromFile(slotPath(slot), tmp)) {
+            g.macro = std::move(tmp);
+            g.index = 0;
+            notify(fmt::format("Loaded slot {} ({} acts)", slot, g.macro.size()).c_str(), NotificationIcon::Success);
+        } else {
+            notify(fmt::format("Slot {} is empty!", slot).c_str(), NotificationIcon::Warning);
+        }
+    }
+
+    // ---- Применение клика ----
     inline void applyInput(PlayLayer* pl, Sub const& s, uint32_t step, double frac) {
         ++g.applying;
         g.applyStep = step;
@@ -201,9 +264,8 @@ namespace bot {
         --g.applying;
     }
 
-    // ИСПРАВЛЕНИЕ: дельта калибруется с учётом recSpeed для абсолютной точности клика
+    // ---- Нарезка шагов с защитой от рассинхрона времени ----
     inline void buildStepQueue(PlayLayer* pl, int stepCount) {
-        stepQueue.clear();
         skipUpdate = false;
 
         if (firstFrame) {
@@ -214,7 +276,6 @@ namespace bot {
             return;
         }
 
-        // Корректируем реальное системное время под фактор замедления
         double timeScaleFactor = (g.mode == Mode::Record) ? recSpeed : 1.0;
         double deltaTime = (currentFrameTime - lastFrameTime) * timeScaleFactor;
 
@@ -260,14 +321,18 @@ namespace bot {
     }
 
     inline void onFrame(PlayLayer* pl, double modifiedDelta) {
-        stepQueue.clear();
         if (g.mode == Mode::Play) {
             pl->m_queuedButtons.clear();
             return;
         }
-        if (pl->m_playerDied || modifiedDelta <= 0.0) {
+        if (pl->m_playerDied) {
             skipUpdate = true;
             firstFrame = true;
+            stepQueue.clear();
+            return;
+        }
+        if (modifiedDelta <= 0.0) {
+            skipUpdate = true;
             return;
         }
 
@@ -315,6 +380,10 @@ namespace bot {
     }
 }
 
+// ---------------------------------------------------------------------------
+// ХУКИ
+// ---------------------------------------------------------------------------
+
 class $modify(BotScheduler, CCScheduler) {
     void update(float dt) {
         bot::onFrameStart();
@@ -336,6 +405,7 @@ class $modify(BotBaseGameLayer, GJBaseGameLayer) {
             return;
         }
 
+        // Запись действия
         bot::Action a{};
         if (g.applying > 0) {
             a.step = g.applyStep;
@@ -435,7 +505,6 @@ class $modify(BotPlayerObject, PlayerObject) {
         bool p1StartedOnGround = this->m_isOnGround;
         bool p2StartedOnGround = p2 ? p2->m_isOnGround : false;
 
-        // Расширенные проверки буферизации
         bool p1NotBuffering = p1StartedOnGround
             || this->m_touchingRings->count()
             || this->m_isDashing
@@ -471,7 +540,6 @@ class $modify(BotPlayerObject, PlayerObject) {
                 PlayerObject::update(substepDelta);
                 if (!s.endStep) {
                     if (firstLoop && ((this->m_yVelocity < 0) ^ this->m_isUpsideDown)) this->m_isOnGround = p1StartedOnGround;
-                    // ИСПРАВЛЕНИЕ: передаем substepDelta, чтобы не ломать физику волны и склонов
                     pl->checkCollisions(this, substepDelta, true);
                     PlayerObject::updateRotation(substepDelta);
                     bot::resetCollisionLog(this);
@@ -518,16 +586,21 @@ class $modify(BotPlayLayer, PlayLayer) {
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
         bot::g = bot::State{};
         bot::resetEngine();
-        if (level) bot::g.levelID = level->m_levelID.value();
+        if (level) {
+            bot::g.levelID = level->m_levelID.value();
+            if (bot::g.levelID == 0) {
+                std::hash<std::string> hasher;
+                std::string basis = level->m_levelName + std::to_string(level->m_levelString.size());
+                bot::g.levelHash = static_cast<uint64_t>(hasher(basis));
+            }
+        }
         if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
         bot::loadMacro();
         return true;
     }
 
     void resetLevel() {
-        // ИСПРАВЛЕНИЕ: фиксируем Random Seed для одинакового поведения физики и триггеров
-        std::srand(1337);
-
+        std::srand(1337); // Детерминизм генератора случайных чисел
         bot::g.cpLoaded = false;
         PlayLayer::resetLevel();
         bot::resetEngine();
@@ -591,6 +664,9 @@ class $modify(BotPlayLayer, PlayLayer) {
     }
 };
 
+// ---------------------------------------------------------------------------
+// МЕНЮ ПАУЗЫ (Двухколоночный интерфейс)
+// ---------------------------------------------------------------------------
 class $modify(BotPauseLayer, PauseLayer) {
     void customSetup() {
         PauseLayer::customSetup();
@@ -602,6 +678,7 @@ class $modify(BotPauseLayer, PauseLayer) {
         menu->setID("bot-menu");
         menu->setPosition({ 0.f, 0.f });
 
+        // Информационная плашка сверху
         auto label = CCLabelBMFont::create(bot::statusText().c_str(), "chatFont.fnt");
         label->setID("bot-status");
         label->setScale(0.55f);
@@ -609,35 +686,62 @@ class $modify(BotPauseLayer, PauseLayer) {
         label->setPosition({ 10.f, win.height / 2.f + 85.f });
         this->addChild(label);
 
-        float x = 45.f;
-        float y = win.height / 2.f + 55.f;
-
-        auto add = [&](char const* text, char const* id, SEL_MenuHandler cb) {
+        // Вспомогательная функция создания компактных кнопок
+        auto makeBtn = [this](char const* text, float scale, SEL_MenuHandler cb) {
             auto spr = ButtonSprite::create(text);
-            spr->setScale(0.55f);
-            auto item = CCMenuItemSpriteExtra::create(spr, this, cb);
-            item->setID(id);
-            item->setPosition({ x, y });
-            menu->addChild(item);
-            y -= 26.f;
+            spr->setScale(scale);
+            return CCMenuItemSpriteExtra::create(spr, this, cb);
         };
 
-        add("REC",   "bot-rec",   menu_selector(BotPauseLayer::onBotRec));
-        add("PLAY",  "bot-play",  menu_selector(BotPauseLayer::onBotPlay));
-        add("STOP",  "bot-stop",  menu_selector(BotPauseLayer::onBotStop));
-        add("CLEAR", "bot-clear", menu_selector(BotPauseLayer::onBotClear));
+        // --- ЛЕВАЯ КОЛОНКА (Основные режимы) ---
+        float col1X = 42.f;
+        float startY = win.height / 2.f + 55.f;
 
-        // Дополнительные кнопки изменения скорости прямо в игре
-        auto addSpd = [&](char const* text, float offset, SEL_MenuHandler cb) {
-            auto spr = ButtonSprite::create(text);
-            spr->setScale(0.45f);
-            auto item = CCMenuItemSpriteExtra::create(spr, this, cb);
-            item->setPosition({ x + offset, y });
-            menu->addChild(item);
-        };
+        auto btnRec = makeBtn("REC", 0.55f, menu_selector(BotPauseLayer::onBotRec));
+        btnRec->setPosition({ col1X, startY });
+        menu->addChild(btnRec);
 
-        addSpd("-0.1", -20.f, menu_selector(BotPauseLayer::onSpeedDown));
-        addSpd("+0.1", 20.f, menu_selector(BotPauseLayer::onSpeedUp));
+        auto btnPlay = makeBtn("PLAY", 0.55f, menu_selector(BotPauseLayer::onBotPlay));
+        btnPlay->setPosition({ col1X, startY - 26.f });
+        menu->addChild(btnPlay);
+
+        auto btnStop = makeBtn("STOP", 0.55f, menu_selector(BotPauseLayer::onBotStop));
+        btnStop->setPosition({ col1X, startY - 52.f });
+        menu->addChild(btnStop);
+
+        auto btnClear = makeBtn("CLEAR", 0.55f, menu_selector(BotPauseLayer::onBotClear));
+        btnClear->setPosition({ col1X, startY - 78.f });
+        menu->addChild(btnClear);
+
+        // --- ПРАВАЯ КОЛОНКА (Скорость и Слоты) ---
+        float col2X = 118.f;
+
+        // Скорость [-0.1] [+0.1]
+        auto btnSpdDown = makeBtn("-0.1", 0.45f, menu_selector(BotPauseLayer::onSpeedDown));
+        btnSpdDown->setPosition({ col2X - 22.f, startY });
+        menu->addChild(btnSpdDown);
+
+        auto btnSpdUp = makeBtn("+0.1", 0.45f, menu_selector(BotPauseLayer::onSpeedUp));
+        btnSpdUp->setPosition({ col2X + 22.f, startY });
+        menu->addChild(btnSpdUp);
+
+        // Переключение слотов [S -] [S +]
+        auto btnSlotDec = makeBtn("S -", 0.45f, menu_selector(BotPauseLayer::onSlotDec));
+        btnSlotDec->setPosition({ col2X - 22.f, startY - 26.f });
+        menu->addChild(btnSlotDec);
+
+        auto btnSlotInc = makeBtn("S +", 0.45f, menu_selector(BotPauseLayer::onSlotInc));
+        btnSlotInc->setPosition({ col2X + 22.f, startY - 26.f });
+        menu->addChild(btnSlotInc);
+
+        // Сохранить / Загрузить слот
+        auto btnSaveSlot = makeBtn("SAVE SLOT", 0.45f, menu_selector(BotPauseLayer::onSaveSlot));
+        btnSaveSlot->setPosition({ col2X, startY - 52.f });
+        menu->addChild(btnSaveSlot);
+
+        auto btnLoadSlot = makeBtn("LOAD SLOT", 0.45f, menu_selector(BotPauseLayer::onLoadSlot));
+        btnLoadSlot->setPosition({ col2X, startY - 78.f });
+        menu->addChild(btnLoadSlot);
 
         this->addChild(menu);
     }
@@ -649,12 +753,31 @@ class $modify(BotPauseLayer, PauseLayer) {
     }
 
     void onSpeedDown(CCObject*) {
-        bot::recSpeed = std::clamp(bot::recSpeed - 0.1, 0.1, 1.0);
+        bot::recSpeed = std::clamp(bot::recSpeed - 0.1, 0.05, 1.0);
         this->updateBotLabel();
     }
 
     void onSpeedUp(CCObject*) {
-        bot::recSpeed = std::clamp(bot::recSpeed + 0.1, 0.1, 1.0);
+        bot::recSpeed = std::clamp(bot::recSpeed + 0.1, 0.05, 1.0);
+        this->updateBotLabel();
+    }
+
+    void onSlotDec(CCObject*) {
+        bot::currentSlot = std::max(1, bot::currentSlot - 1);
+        this->updateBotLabel();
+    }
+
+    void onSlotInc(CCObject*) {
+        bot::currentSlot = std::min(9, bot::currentSlot + 1);
+        this->updateBotLabel();
+    }
+
+    void onSaveSlot(CCObject*) {
+        bot::saveMacroToSlot(bot::currentSlot);
+    }
+
+    void onLoadSlot(CCObject*) {
+        bot::loadMacroFromSlot(bot::currentSlot);
         this->updateBotLabel();
     }
 
