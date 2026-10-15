@@ -11,13 +11,9 @@
 	"version": "v1.0.0",
 	"developer": "User",
 	"description": "Macro practice bot for Geometry Dash 2.2081",
-	"dependencies": [
-		{
-			"id": "geode.node-ids",
-			"version": ">=1.23.3",
-			"importance": "required"
-		}
-	],
+	"dependencies": {
+		"geode.node-ids": ">=1.23.3"
+	},
 	"settings": {
 		"record-speed": {
 			"type": "float",
