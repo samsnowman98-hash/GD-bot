@@ -5,7 +5,6 @@
 #include <Geode/binding/CheckpointObject.hpp>
 #include <Geode/binding/ButtonSprite.hpp>
 #include <Geode/binding/CCMenuItemSpriteExtra.hpp>
-#include <Geode/layout/RowLayout.hpp>
 
 #include <vector>
 #include <unordered_map>
@@ -290,30 +289,42 @@ public:
     void customSetup() {
         PauseLayer::customSetup();
         s_pauseNode = this;
+
         auto winSize = CCDirector::sharedDirector()->getWinSize();
+
         auto menu = CCMenu::create();
-        menu->setPosition({ winSize.width / 2.f, 35.f });
+        menu->setPosition(ccp(winSize.width / 2.f, 35.f));
         menu->setID("bot-control-menu");
 
-        auto addButton = [&](char const* text, char const* idName, SEL_MenuHandler selector) {
-            auto spr = ButtonSprite::create(text);
-            if (!spr) return;
-            spr->setScale(0.7f);
-            auto item = CCMenuItemSpriteExtra::create(spr, this, selector);
-            if (!item) return;
-            item->setID(idName);
-            menu->addChild(item);
+        float gap = 90.f;
+        float startX = -gap * 1.5f;
+
+        struct BtnDef {
+            char const* text;
+            char const* id;
+            SEL_MenuHandler sel;
         };
 
-        addButton("OFF", "bot-off-btn", menu_selector(BotPauseLayer::onOffButton));
-        addButton("REC", "bot-rec-btn", menu_selector(BotPauseLayer::onRecButton));
-        addButton("PLAY", "bot-play-btn", menu_selector(BotPauseLayer::onPlayButton));
-        addButton("CLEAR", "bot-clear-btn", menu_selector(BotPauseLayer::onClearButton));
+        BtnDef defs[] = {
+            {"OFF",   "bot-off-btn",   menu_selector(BotPauseLayer::onOffButton)},
+            {"REC",   "bot-rec-btn",   menu_selector(BotPauseLayer::onRecButton)},
+            {"PLAY",  "bot-play-btn",  menu_selector(BotPauseLayer::onPlayButton)},
+            {"CLEAR", "bot-clear-btn", menu_selector(BotPauseLayer::onClearButton)}
+        };
 
-        auto layout = RowLayout::create();
-        layout->setGap(10.f);
-        menu->setLayout(layout);
-        menu->updateLayout();
+        for (int i = 0; i < 4; ++i) {
+            auto spr = ButtonSprite::create(defs[i].text);
+            if (!spr) continue;
+            spr->setScale(0.7f);
+
+            auto item = CCMenuItemSpriteExtra::create(spr, this, defs[i].sel);
+            if (!item) continue;
+
+            item->setID(defs[i].id);
+            item->setPosition(ccp(startX + gap * i, 0.f));
+            menu->addChild(item);
+        }
+
         this->addChild(menu);
         refreshBotUI();
     }
