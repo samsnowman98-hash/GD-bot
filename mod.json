@@ -10,6 +10,17 @@
 	"name": "My GD Bot",
 	"version": "v1.0.0",
 	"developer": "User",
+	"settings": {
+    "record-speed": {
+        "type": "float",
+        "name": "Скорость при записи",
+        "description": "Замедление игры только во время REC (1.0 = обычная). При PLAY игра идёт в обычной скорости.",
+        "default": 1.0,
+        "min": 0.01,
+        "max": 1.0,
+        "control": { "input": true, "slider": true }
+    }
+}
 	"description": "Macro practice bot for Geometry Dash 2.2081",
 	"dependencies": {
 		"geode.node-ids": ">=v1.23.3"
