@@ -48,7 +48,7 @@ namespace bot {
         bool isHeld(int btn) const {
             if (btn == 1) return jump;
             if (btn == 2) return left;
-            if (btn == 3) right;
+            if (btn == 3) return right;
             return false;
         }
 
@@ -71,6 +71,7 @@ namespace bot {
     inline ButtonState p2State;
     inline bool isSubStepping = false;
     inline bool dualUpdatedInP1 = false;
+    inline bool suppressRecording = false;
 
     inline constexpr uint32_t MAGIC = 0x32544F42;
     inline constexpr double SMALLEST = 1e-5;
@@ -166,6 +167,31 @@ namespace bot {
             target->releaseButton(btn);
         }
     }
+
+    inline void recordAction(bool isPlayer1, PlayerButton button, bool down) {
+        if (mode != Mode::Record) return;
+        if (suppressRecording) return;
+
+        auto& state = isPlayer1 ? p1State : p2State;
+        int btnId = static_cast<int>(button);
+        if (state.isHeld(btnId) == down) {
+            return;
+        }
+        state.setHeld(btnId, down);
+
+        auto now = std::chrono::steady_clock::now();
+        double elapsed = std::chrono::duration<double>(now - stepStartTime).count();
+        double stepDuration = (1.0 / 240.0) / (recSpeed > SMALLEST ? recSpeed : 1.0);
+        double frac = std::clamp(elapsed / stepDuration, 0.0, 0.999);
+
+        Action act;
+        act.step = currentStep;
+        act.frac = frac;
+        act.down = down;
+        act.p1 = isPlayer1;
+        act.btn = static_cast<uint8_t>(btnId);
+        currentMacro.push_back(act);
+    }
 }
 
 struct BotPlayLayer : Modify<BotPlayLayer, PlayLayer> {
@@ -179,6 +205,7 @@ struct BotPlayLayer : Modify<BotPlayLayer, PlayLayer> {
         bot::p2State = bot::ButtonState();
         bot::isSubStepping = false;
         bot::dualUpdatedInP1 = false;
+        bot::suppressRecording = false;
         bot::recSpeed = Mod::get()->getSettingValue<double>("record-speed");
         if (bot::recSpeed < 0.01) bot::recSpeed = 1.0;
         bot::resetTimingBaseline();
@@ -197,12 +224,11 @@ struct BotPlayLayer : Modify<BotPlayLayer, PlayLayer> {
 
         bot::currentStep = 0;
         bot::macroIndex = 0;
-        bot::p1State = bot::ButtonState();
-        bot::p2State = bot::ButtonState();
         bot::isSubStepping = false;
         bot::dualUpdatedInP1 = false;
         bot::resetTimingBaseline();
 
+        bot::suppressRecording = true;
         if (this->m_player1) {
             this->m_player1->releaseButton(PlayerButton::Jump);
             this->m_player1->releaseButton(PlayerButton::Left);
@@ -213,6 +239,10 @@ struct BotPlayLayer : Modify<BotPlayLayer, PlayLayer> {
             this->m_player2->releaseButton(PlayerButton::Left);
             this->m_player2->releaseButton(PlayerButton::Right);
         }
+        bot::suppressRecording = false;
+
+        bot::p1State = bot::ButtonState();
+        bot::p2State = bot::ButtonState();
 
         if (bot::mode == bot::Mode::Record) {
             bot::currentMacro.clear();
@@ -226,29 +256,6 @@ struct BotPlayLayer : Modify<BotPlayLayer, PlayLayer> {
         if (bot::mode == bot::Mode::Play) {
             return;
         }
-
-        if (bot::mode == bot::Mode::Record) {
-            auto& state = isPlayer1 ? bot::p1State : bot::p2State;
-            if (isDown == state.isHeld(button)) {
-                PlayLayer::handleButton(isDown, button, isPlayer1);
-                return;
-            }
-            state.setHeld(button, isDown);
-
-            auto now = std::chrono::steady_clock::now();
-            double elapsed = std::chrono::duration<double>(now - bot::stepStartTime).count();
-            double stepDuration = (1.0 / 240.0) / (bot::recSpeed > bot::SMALLEST ? bot::recSpeed : 1.0);
-            double frac = std::clamp(elapsed / stepDuration, 0.0, 0.999);
-
-            bot::Action act;
-            act.step = bot::currentStep;
-            act.frac = frac;
-            act.down = isDown;
-            act.p1 = isPlayer1;
-            act.btn = static_cast<uint8_t>(button);
-            bot::currentMacro.push_back(act);
-        }
-
         PlayLayer::handleButton(isDown, button, isPlayer1);
     }
 
@@ -299,6 +306,8 @@ struct BotPlayLayer : Modify<BotPlayLayer, PlayLayer> {
             bot::syncPlayback();
         }
 
+        bot::suppressRecording = true;
+
         if (this->m_player1) {
             this->m_player1->setPosition(data.p1Pos);
             this->m_player1->m_yVelocity = data.p1YVel;
@@ -319,6 +328,8 @@ struct BotPlayLayer : Modify<BotPlayLayer, PlayLayer> {
             this->m_player2->releaseButton(PlayerButton::Right);
         }
 
+        bot::suppressRecording = false;
+
         bot::p1State = bot::ButtonState();
         bot::p2State = bot::ButtonState();
         bot::isSubStepping = false;
@@ -328,6 +339,28 @@ struct BotPlayLayer : Modify<BotPlayLayer, PlayLayer> {
 };
 
 struct BotPlayerObject : Modify<BotPlayerObject, PlayerObject> {
+    void pushButton(PlayerButton button) {
+        PlayerObject::pushButton(button);
+
+        auto pl = PlayLayer::get();
+        if (!pl) return;
+        if (this != pl->m_player1 && this != pl->m_player2) return;
+
+        bool isPlayer1 = (this == pl->m_player1);
+        bot::recordAction(isPlayer1, button, true);
+    }
+
+    void releaseButton(PlayerButton button) {
+        PlayerObject::releaseButton(button);
+
+        auto pl = PlayLayer::get();
+        if (!pl) return;
+        if (this != pl->m_player1 && this != pl->m_player2) return;
+
+        bool isPlayer1 = (this == pl->m_player1);
+        bot::recordAction(isPlayer1, button, false);
+    }
+
     void update(float dt) {
         auto pl = PlayLayer::get();
         if (!pl || pl->m_isPaused || bot::isSubStepping) {
