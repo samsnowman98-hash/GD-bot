@@ -1,5 +1,5 @@
 // CBF-style TAS bot for Geometry Dash 2.2081 / Geode 5.x (Android & Windows)
-// Pixel-Perfect Acheron Precision + Dynamic Speed Normalization + Auto 1x Reset
+// Pixel-Perfect Acheron Precision + Mathematical Checkpoint Sync + Visual Extrapolation
 
 #include <Geode/Geode.hpp>
 #include <Geode/modify/PlayLayer.hpp>
@@ -51,10 +51,24 @@ namespace bot {
         bool endStep = true;
     };
 
+    // Полный слепок состояния игрока для идеального респавна на кораблике
     struct CheckpointData {
         uint32_t step = 0;
         size_t macroSize = 0;
         bool held[4][2] = {};
+        CCPoint p1Pos = { 0.f, 0.f };
+        CCPoint p2Pos = { 0.f, 0.f };
+        CCPoint p1LastPos = { 0.f, 0.f };
+        CCPoint p2LastPos = { 0.f, 0.f };
+        double p1YVel = 0.0;
+        double p2YVel = 0.0;
+        float p1Rot = 0.f;
+        float p2Rot = 0.f;
+        bool p1Holding = false;
+        bool p2Holding = false;
+        bool p1UpsideDown = false;
+        bool p2UpsideDown = false;
+        double physicsAccumulator = 0.0;
     };
 
     // ---- состояние ----
@@ -77,6 +91,7 @@ namespace bot {
     inline std::vector<PlayerButtonCommand> inputVector;
     inline double lastFrameTime = 0.0;
     inline double currentFrameTime = 0.0;
+    inline double lastStepRealTime = 0.0;
     inline double physicsAccumulator = 0.0;
     inline bool zeroFrame = false;
     inline bool inputThisStep = false;
@@ -108,12 +123,14 @@ namespace bot {
         stepQueue.clear();
         inputVector.clear();
         lastFrameTime = currentFrameTime;
+        lastStepRealTime = currentFrameTime;
         physicsAccumulator = 0.0;
         inputThisStep = false;
         p2HandledThisStep = false;
         p1Split = false;
         p2Split = false;
         midStep = false;
+        rotationDelta = 0.f;
     }
 
     inline void applyClickFlags() {
@@ -280,11 +297,9 @@ namespace bot {
         --silent;
     }
 
+    // Теоретически точное распределение кликов по физической шкале 240 TPS
     inline void buildStepQueue(int stepCount) {
-        double deltaTime = currentFrameTime - lastFrameTime;
-        if (deltaTime <= 0.0) deltaTime = 1e-6;
-
-        double stepDeltaTime = deltaTime / stepCount;
+        double stepDeltaTime = (1.0 / 240.0) / std::max(0.0001, recSpeed);
         size_t inputIdx = 0;
 
         for (int i = 0; i < stepCount; ++i) {
@@ -318,7 +333,7 @@ namespace bot {
             stepQueue.push_back(e);
         }
 
-        lastFrameTime = currentFrameTime;
+        lastFrameTime += stepCount * stepDeltaTime;
         inputVector.erase(inputVector.begin(), inputVector.begin() + inputIdx);
     }
 
@@ -376,7 +391,6 @@ namespace bot {
         if (mode == Mode::Off) return;
 
         if (idle) {
-            // При паузе синхронизируем якорь времени, НЕ сбрасывая physicsAccumulator!
             lastFrameTime = currentFrameTime;
             inputVector.clear();
         }
@@ -402,7 +416,7 @@ namespace bot {
 }
 
 // ---------------------------------------------------------------------------
-// Scheduler: детерминированный шаг кадра под герцовку экрана
+// Scheduler: детерминированный шаг кадров под экран устройства
 // ---------------------------------------------------------------------------
 class $modify(BotScheduler, CCScheduler) {
     void update(float dt) {
@@ -473,7 +487,7 @@ class $modify(BotBaseGameLayer, GJBaseGameLayer) {
 };
 
 // ---------------------------------------------------------------------------
-// Нарезка шага с зеркальной физикой Record / Play и вращением корабля
+// Нарезка шага: идеальная физика корабля, вращение и коллизии
 // ---------------------------------------------------------------------------
 class $modify(BotPlayerObject, PlayerObject) {
     void update(float stepDelta) {
@@ -504,6 +518,7 @@ class $modify(BotPlayerObject, PlayerObject) {
             return;
         }
 
+        bot::lastStepRealTime = bot::getCurrentTimestamp();
         uint32_t const cur = step;
         std::vector<Sub> subs;
 
@@ -566,7 +581,7 @@ class $modify(BotPlayerObject, PlayerObject) {
         bool p1StartedOnGround = this->m_isOnGround;
         bool p2StartedOnGround = p2 && p2->m_isOnGround;
 
-        // Зеркальное условие сплита для Record и Play (исключает рассинхрон)
+        // Зеркальные условия разделения шага для 100% исключения десинка
         bool p1NotBuffering = p1StartedOnGround
             || this->m_touchingRings->count()
             || this->m_isDashing
@@ -622,7 +637,7 @@ class $modify(BotPlayerObject, PlayerObject) {
                     }
                     if (!this->m_isOnSlope || this->m_isDart) pl->checkCollisions(this, 0.0f, true);
                     else pl->checkCollisions(this, substepDelta, true);
-                    PlayerObject::updateRotation(substepDelta); // Поворот хитбокса корабля на каждом подшаге
+                    PlayerObject::updateRotation(substepDelta);
                     bot::resetCollisionLog(this);
                 }
             }
@@ -676,9 +691,47 @@ class $modify(BotPlayerObject, PlayerObject) {
 };
 
 // ---------------------------------------------------------------------------
-// Уровень, чекпоинты (Бесшовное склеивание макроса)
+// Экстраполяция кадров (Плавная картинка на замедлении без влияния на физику)
 // ---------------------------------------------------------------------------
 class $modify(BotPlayLayer, PlayLayer) {
+    void visit() {
+        // Визуальная экстраполяция активна только на замедлении
+        if (bot::mode == bot::Mode::Record && bot::recSpeed < 0.95 && !bot::zeroFrame && this->m_player1 && !this->m_playerDied) {
+            double now = bot::getCurrentTimestamp();
+            double expectedStepReal = (1.0 / 240.0) / std::max(0.0001, bot::recSpeed);
+            double elapsed = now - bot::lastStepRealTime;
+            float alpha = std::clamp(static_cast<float>(elapsed / expectedStepReal), 0.0f, 1.0f);
+
+            auto p1 = this->m_player1;
+            cocos2d::CCPoint origPos1 = p1->getPosition();
+            cocos2d::CCPoint offset1 = {
+                static_cast<float>(p1->m_xVelocity * (1.0 / 240.0) * alpha),
+                static_cast<float>(p1->m_yVelocity * (1.0 / 240.0) * alpha)
+            };
+            p1->setPosition(origPos1 + offset1);
+
+            cocos2d::CCPoint origPos2 = {0.f, 0.f};
+            auto p2 = this->m_player2;
+            if (p2) {
+                origPos2 = p2->getPosition();
+                cocos2d::CCPoint offset2 = {
+                    static_cast<float>(p2->m_xVelocity * (1.0 / 240.0) * alpha),
+                    static_cast<float>(p2->m_yVelocity * (1.0 / 240.0) * alpha)
+                };
+                p2->setPosition(origPos2 + offset2);
+            }
+
+            PlayLayer::visit(); // Отрисовываем мягкий сглаженный кадр
+
+            // МГНОВЕННО восстанавливаем реальные координаты физики!
+            p1->setPosition(origPos1);
+            if (p2) p2->setPosition(origPos2);
+            return;
+        }
+
+        PlayLayer::visit();
+    }
+
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
         bot::mode = bot::Mode::Off;
         bot::step = 0;
@@ -711,7 +764,7 @@ class $modify(BotPlayLayer, PlayLayer) {
 
     CheckpointObject* createCheckpoint() {
         auto cp = PlayLayer::createCheckpoint();
-        if (cp) {
+        if (cp && this->m_player1) {
             bot::CheckpointData data;
             data.step = bot::step;
             data.macroSize = bot::macro.size();
@@ -719,6 +772,24 @@ class $modify(BotPlayLayer, PlayLayer) {
                 data.held[b][0] = bot::currentHeld[b][0];
                 data.held[b][1] = bot::currentHeld[b][1];
             }
+            auto p1 = this->m_player1;
+            data.p1Pos = p1->getPosition();
+            data.p1LastPos = p1->m_lastPosition;
+            data.p1YVel = p1->m_yVelocity;
+            data.p1Rot = p1->getRotation();
+            data.p1Holding = p1->m_isHolding;
+            data.p1UpsideDown = p1->m_isUpsideDown;
+
+            if (this->m_player2) {
+                auto p2 = this->m_player2;
+                data.p2Pos = p2->getPosition();
+                data.p2LastPos = p2->m_lastPosition;
+                data.p2YVel = p2->m_yVelocity;
+                data.p2Rot = p2->getRotation();
+                data.p2Holding = p2->m_isHolding;
+                data.p2UpsideDown = p2->m_isUpsideDown;
+            }
+            data.physicsAccumulator = bot::physicsAccumulator;
             bot::checkpoints[cp] = data;
         }
         return cp;
@@ -743,6 +814,7 @@ class $modify(BotPlayLayer, PlayLayer) {
         auto const& data = it->second;
         bot::step = data.step;
 
+        // 1. ИДЕАЛЬНОЕ СКЛЕИВАНИЕ МАКРОСА
         if (bot::mode == bot::Mode::Record) {
             if (data.macroSize <= bot::macro.size()) {
                 bot::macro.erase(bot::macro.begin() + data.macroSize, bot::macro.end());
@@ -758,6 +830,30 @@ class $modify(BotPlayLayer, PlayLayer) {
             bot::syncPlayback(this);
         }
 
+        // 2. ВОССТАНОВЛЕНИЕ ФИЗИЧЕСКОГО СОСТОЯНИЯ КОРАБЛЯ
+        if (this->m_player1) {
+            this->m_player1->setPosition(data.p1Pos);
+            this->m_player1->m_lastPosition = data.p1LastPos;
+            this->m_player1->m_yVelocity = data.p1YVel;
+            this->m_player1->setRotation(data.p1Rot);
+            this->m_player1->m_isHolding = data.p1Holding;
+            this->m_player1->m_isUpsideDown = data.p1UpsideDown;
+            bot::p1Pos = data.p1Pos;
+            bot::resetCollisionLog(this->m_player1);
+        }
+        if (this->m_player2) {
+            this->m_player2->setPosition(data.p2Pos);
+            this->m_player2->m_lastPosition = data.p2LastPos;
+            this->m_player2->m_yVelocity = data.p2YVel;
+            this->m_player2->setRotation(data.p2Rot);
+            this->m_player2->m_isHolding = data.p2Holding;
+            this->m_player2->m_isUpsideDown = data.p2UpsideDown;
+            bot::p2Pos = data.p2Pos;
+            bot::resetCollisionLog(this->m_player2);
+        }
+        bot::rotationDelta = 0.0f;
+
+        // 3. ВОССТАНОВЛЕНИЕ ТУРБИНЫ/ЗАЖАТИЯ ВВОДА
         ++bot::silent;
         for (int b = 1; b <= 3; ++b) {
             bot::currentHeld[b][0] = data.held[b][0];
@@ -767,7 +863,10 @@ class $modify(BotPlayLayer, PlayLayer) {
         }
         --bot::silent;
 
+        // 4. СИНХРОНИЗАЦИЯ ТАЙМЕРА И АККУМУЛЯТОРА
         bot::lastFrameTime = bot::getCurrentTimestamp();
+        bot::lastStepRealTime = bot::lastFrameTime;
+        bot::physicsAccumulator = data.physicsAccumulator;
         bot::inputVector.clear();
         this->m_queuedButtons.clear();
 
@@ -776,7 +875,7 @@ class $modify(BotPlayLayer, PlayLayer) {
 };
 
 // ---------------------------------------------------------------------------
-// Меню паузы с автосбросом скорости на 1х
+// Меню паузы
 // ---------------------------------------------------------------------------
 class $modify(BotPauseLayer, PauseLayer) {
     struct Fields {
@@ -936,7 +1035,7 @@ class $modify(BotPauseLayer, PauseLayer) {
                 Notification::create("No macro!", NotificationIcon::Warning)->show();
                 return;
             }
-            // Пожелание 1: Воспроизведение ВСЕГДА на обычной скорости 1x
+            // Сброс на 1х скорость при воспроизведении
             bot::recSpeed = 1.0;
             bot::setTimeScale(1.0f);
             if (m_fields->m_speedInput) m_fields->m_speedInput->setString("1.00");
@@ -990,7 +1089,7 @@ class $modify(BotPauseLayer, PauseLayer) {
                 tmStruct.tm_hour, tmStruct.tm_min, tmStruct.tm_sec
             );
             if (bot::saveMacro(bot::getMacroDir() / filename, bot::macro)) {
-                // Пожелание 1: После сохранения скорость ВСЕГДА сбрасывается на 1.0x
+                // Автосброс скорости на 1х после сохранения
                 bot::recSpeed = 1.0;
                 bot::setTimeScale(1.0f);
                 if (m_fields->m_speedInput) m_fields->m_speedInput->setString("1.00");
