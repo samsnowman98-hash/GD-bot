@@ -1,9 +1,8 @@
-// CBF-style TAS bot for Geometry Dash 2.2081 / Geode 5.x (Android)
+// CBF-style TAS bot for Geometry Dash 2.2081 / Geode 5.x (Android & Windows)
 //
 // Макрос хранится как {step, frac}: номер физического шага + доля шага (double).
-// Запись берёт реальное время нажатия (m_queuedButtons[i].m_timestamp), раскладывает его по шагам кадра
-// и режет шаг на части. Воспроизведение режет шаги точно так же.
-// Замедление учитывается автоматически: шаги не зависят от FPS и скорости игры.
+// Запись берёт реальное время нажатия (m_queuedButtons[i].m_timestamp), раскладывает его по шагам
+// физического аккумулятора игры и режет шаг на части. Воспроизведение режет шаги точно так же.
 //
 // ВАЖНО: мод Click Between Frames должен быть ВЫКЛЮЧЕН (оба мода делают одно и то же и мешают друг другу).
 
@@ -27,7 +26,6 @@
 #include <fstream>
 #include <limits>
 #include <string>
-#include <time.h>
 #include <unordered_map>
 #include <vector>
 
@@ -35,8 +33,8 @@ using namespace geode::prelude;
 
 namespace bot {
 
-    constexpr double SMALLEST = std::numeric_limits<float>::min();
-    constexpr double MIN_PART = 1e-5; // минимальная часть шага (доля): короче только защита от денормалей float
+    constexpr double SMALLEST = 1e-9;
+    constexpr double MIN_PART = 1e-5; // минимальная доля шага: короче только защита от денормалей float
     constexpr uint32_t kMagic = 0x32544F42; // "BOT2"
 
     enum class Mode { Off, Record, Play };
@@ -76,11 +74,12 @@ namespace bot {
     // ---- движок нарезки ----
     inline std::deque<Sub> stepQueue;
     inline std::vector<PlayerButtonCommand> inputVector;
-    inline double lastFrameTime = 0.0;
+    inline double lastStepTime = 0.0;
     inline double currentFrameTime = 0.0;
-    inline bool skipUpdate = true;
-    inline bool zeroFrame = false;   // кадр без физических шагов (замедление / очень высокий FPS)
+    inline double physicsAccumulator = 0.0;
+    inline bool zeroFrame = false;
     inline bool inputThisStep = false;
+    inline bool p2HandledThisStep = false;
     inline bool p1Split = false;
     inline bool p2Split = false;
     inline bool midStep = false;
@@ -89,9 +88,14 @@ namespace bot {
     inline float rotationDelta = 0.f;
 
     inline double getCurrentTimestamp() {
+#ifdef GEODE_IS_WINDOWS
+        using namespace std::chrono;
+        return duration<double>(steady_clock::now().time_since_epoch()).count();
+#else
         struct timespec now;
         clock_gettime(CLOCK_MONOTONIC, &now);
         return static_cast<double>(now.tv_sec) + static_cast<double>(now.tv_nsec) / 1'000'000'000.0;
+#endif
     }
 
     inline bool isPlayLayer(GJBaseGameLayer* l) {
@@ -102,16 +106,15 @@ namespace bot {
     inline void resetEngine() {
         stepQueue.clear();
         inputVector.clear();
-        // Якорь времени: следующий кадр сразу режется по времени кликов (без потерянного кадра после респавна)
-        lastFrameTime = currentFrameTime;
-        skipUpdate = true;
+        lastStepTime = currentFrameTime;
+        physicsAccumulator = 0.0;
         inputThisStep = false;
+        p2HandledThisStep = false;
         p1Split = false;
         p2Split = false;
         midStep = false;
     }
 
-    // REC/PLAY: наши клики вместо родных Click Between/On Steps; OFF: возвращаем настройки игрока
     inline void applyClickFlags() {
         auto pl = PlayLayer::get();
         if (!pl) return;
@@ -207,7 +210,6 @@ namespace bot {
         return true;
     }
 
-    // Статистика макроса: сколько нажатий/отпусканий и самый короткий клик (в долях физического шага)
     struct Stats {
         size_t pushes = 0;
         size_t releases = 0;
@@ -257,7 +259,6 @@ namespace bot {
         --silent;
     }
 
-    // Перемотка воспроизведения на текущий шаг + восстановление зажатых кнопок
     inline void syncPlayback(PlayLayer* pl) {
         auto it = std::lower_bound(
             macro.begin(), macro.end(), step,
@@ -278,46 +279,25 @@ namespace bot {
         --silent;
     }
 
-    /*
-    Раскладывает реальные клики кадра по физическим шагам кадра.
-    Для шага: [часть до клика][клик][часть до след. клика]...[остаток шага]
-    Время шага = реальное время кадра / число шагов, поэтому замедление учитывается само.
-    */
-    inline void buildStepQueue(PlayLayer* pl, int stepCount) {
-        stepQueue.clear();
-        skipUpdate = false;
-
-        double deltaTime = currentFrameTime - lastFrameTime;
-        if (!(deltaTime > 0.0) || stepCount < 1) {
-            skipUpdate = true;
-            lastFrameTime = currentFrameTime;
-            return;
-        }
-
-        for (auto cmd : pl->m_queuedButtons) {
-            double ts = cmd.m_timestamp;
-            // защита: время пришло в миллисекундах -> секунды
-            if (ts > currentFrameTime + 5.0) ts /= 1000.0;
-            // некорректное время (ноль, слишком старое или из будущего): считаем, что клик пришёл в этом кадре
-            if (!(ts > lastFrameTime - 5.0) || ts > currentFrameTime + 1.0) ts = currentFrameTime;
-            // порядок кликов не должен нарушаться
-            if (!inputVector.empty() && ts < inputVector.back().m_timestamp) ts = inputVector.back().m_timestamp;
-            cmd.m_timestamp = ts;
-            inputVector.push_back(cmd);
-        }
-        pl->m_queuedButtons.clear();
+    inline void buildStepQueue(int stepCount) {
+        double deltaTime = currentFrameTime - lastStepTime;
+        if (deltaTime <= 0.0) deltaTime = 1e-6;
 
         double stepDelta = deltaTime / stepCount;
         size_t inputIdx = 0;
 
         for (int i = 0; i < stepCount; ++i) {
             double elapsed = 0.0;
+            double stepStart = lastStepTime + stepDelta * i;
+            double stepEnd = stepStart + stepDelta;
+
             while (inputIdx < inputVector.size()) {
                 auto const& in = inputVector[inputIdx];
-                double rel = in.m_timestamp - lastFrameTime;
-                if (rel < stepDelta * (i + 1)) {
-                    double t = std::clamp(std::fmod(rel, stepDelta) / stepDelta, 0.0, 1.0);
+                if (in.m_timestamp < stepEnd || i == stepCount - 1) {
+                    double rel = in.m_timestamp - stepStart;
+                    double t = std::clamp(rel / stepDelta, 0.0, 1.0);
                     if (rel < 0.0) t = 0.0;
+
                     Sub s;
                     s.has = true;
                     s.button = static_cast<int>(in.m_button);
@@ -337,36 +317,49 @@ namespace bot {
             stepQueue.push_back(e);
         }
 
-        lastFrameTime = currentFrameTime;
+        lastStepTime = currentFrameTime;
         inputVector.erase(inputVector.begin(), inputVector.begin() + inputIdx);
     }
 
-    // Раз в кадр из getModifiedDelta
     inline void onFrame(PlayLayer* pl, double modifiedDelta) {
-        stepQueue.clear();
+        // Забираем накопившиеся нажатия устройства
+        for (auto cmd : pl->m_queuedButtons) {
+            double ts = cmd.m_timestamp;
+            if (ts > currentFrameTime + 5.0) ts /= 1000.0;
+            if (!(ts > lastStepTime - 10.0) || ts > currentFrameTime + 1.0) ts = currentFrameTime;
+            if (!inputVector.empty() && ts < inputVector.back().m_timestamp) ts = inputVector.back().m_timestamp;
+            cmd.m_timestamp = ts;
+            inputVector.push_back(cmd);
+        }
+        pl->m_queuedButtons.clear();
 
         if (mode == Mode::Play) {
-            pl->m_queuedButtons.clear(); // реальный ввод при воспроизведении игнорируем
+            inputVector.clear();
             return;
         }
 
         if (pl->m_playerDied) {
-            skipUpdate = true;
-            lastFrameTime = currentFrameTime;
-            return;
-        }
-        // Кадр без физических шагов (при замедлении): клики остаются в очереди игры
-        // и разложатся по шагам в следующем кадре со шагами.
-        if (modifiedDelta <= 0.0) {
-            skipUpdate = true;
+            lastStepTime = currentFrameTime;
+            inputVector.clear();
             return;
         }
 
+        if (modifiedDelta <= 0.0) return;
+
         float timewarp = pl->m_gameState.m_timeWarp;
-        int stepCount = static_cast<int>(std::round(
-            std::max(1.0, ((modifiedDelta * 60.0) / std::min(1.0f, timewarp)) * 4.0)
-        ));
-        buildStepQueue(pl, stepCount);
+        if (timewarp <= 0.0001f) timewarp = 1.0f;
+        double const physicsStepDuration = (1.0 / 240.0) * std::min(1.0f, timewarp);
+
+        // Точный физический аккумулятор тиков 240Hz
+        physicsAccumulator += modifiedDelta;
+        int stepCount = static_cast<int>(physicsAccumulator / physicsStepDuration);
+
+        // Если за кадр не накопилось времени даже на 1 физический шаг (при 0.01x скорости),
+        // НЕ чистим очередь и НЕ создаем фиктивные шаги: ждем наступления физического тика.
+        if (stepCount <= 0) return;
+
+        physicsAccumulator -= static_cast<double>(stepCount) * physicsStepDuration;
+        buildStepQueue(stepCount);
     }
 
     inline void onFrameStart() {
@@ -379,16 +372,14 @@ namespace bot {
             || par->getChildByType<PauseLayer>(0)
             || pl->getChildByType<EndLevelLayer>(0);
 
-        // замедляем только во время записи, когда игра реально идёт
         setTimeScale((mode == Mode::Record && !idle) ? static_cast<float>(recSpeed) : 1.0f);
 
         if (mode == Mode::Off) return;
 
         if (idle) {
-            // пауза/конец уровня: держим якорь на текущем кадре, после возврата в игру первый кадр уже режется
-            lastFrameTime = currentFrameTime;
-            skipUpdate = true;
+            lastStepTime = currentFrameTime;
             inputVector.clear();
+            physicsAccumulator = 0.0;
         }
     }
 
@@ -415,7 +406,7 @@ class $modify(BotScheduler, CCScheduler) {
 };
 
 // ---------------------------------------------------------------------------
-// Ввод и очередь шагов
+// Ввод
 // ---------------------------------------------------------------------------
 class $modify(BotBaseGameLayer, GJBaseGameLayer) {
     void handleButton(bool down, int button, bool isPlayer1) {
@@ -427,23 +418,19 @@ class $modify(BotBaseGameLayer, GJBaseGameLayer) {
 
         if (mode == Mode::Play) {
             if (applying > 0) GJBaseGameLayer::handleButton(down, button, isPlayer1);
-            return; // чужой ввод блокируем
+            return;
         }
 
-        // Record: пишем каждый применённый клик
-        Action a;
+        // Запись только примененных CBF подшагов
         if (applying > 0) {
+            Action a;
             a.step = applyStep;
             a.frac = applyFrac;
+            a.button = static_cast<uint8_t>(button);
+            a.down = down;
+            a.p1 = isPlayer1;
+            macro.push_back(a);
         }
-        else {
-            a.step = step; // клик пришёл обычным путём (до физики этого шага)
-            a.frac = 0.0;
-        }
-        a.button = static_cast<uint8_t>(button);
-        a.down = down;
-        a.p1 = isPlayer1;
-        macro.push_back(a);
 
         GJBaseGameLayer::handleButton(down, button, isPlayer1);
     }
@@ -457,17 +444,12 @@ class $modify(BotBaseGameLayer, GJBaseGameLayer) {
         return md;
     }
 
-    // На замедлении игра прогоняет шаг нулевой длины в каждом кадре без реальных шагов и обрабатывает в нём
-    // очередь кликов. Прячем клики на время такого шага: они должны попасть в реальный шаг и разложиться по времени.
     void processCommands(float dt, bool isHalfTick, bool isLastTick) {
         if (bot::mode != bot::Mode::Off && bot::zeroFrame && bot::isPlayLayer(this)) {
             std::vector<PlayerButtonCommand> saved(this->m_queuedButtons.begin(), this->m_queuedButtons.end());
             this->m_queuedButtons.clear();
             GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
-            std::vector<PlayerButtonCommand> added(this->m_queuedButtons.begin(), this->m_queuedButtons.end());
-            this->m_queuedButtons.clear();
             for (auto const& c : saved) this->m_queuedButtons.push_back(c);
-            for (auto const& c : added) this->m_queuedButtons.push_back(c);
             return;
         }
         GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
@@ -475,7 +457,7 @@ class $modify(BotBaseGameLayer, GJBaseGameLayer) {
 };
 
 // ---------------------------------------------------------------------------
-// Нарезка шага (схема Click Between Frames)
+// Нарезка шага (CBF физика)
 // ---------------------------------------------------------------------------
 class $modify(BotPlayerObject, PlayerObject) {
     void update(float stepDelta) {
@@ -486,7 +468,6 @@ class $modify(BotPlayerObject, PlayerObject) {
             return;
         }
 
-        // шаг нулевой длины: это не физический шаг, не считаем его и не режем
         if (zeroFrame || stepDelta <= 1e-9f) {
             PlayerObject::update(stepDelta);
             return;
@@ -494,13 +475,17 @@ class $modify(BotPlayerObject, PlayerObject) {
 
         if (mode == Mode::Off) {
             PlayerObject::update(stepDelta);
-            if (this == pl->m_player1) ++step; // шаги считаем всегда: чекпоинты остаются валидными
+            if (this == pl->m_player1) ++step;
             return;
         }
 
-        // всю логику делаем в обновлении P1
+        // P2 обновляется внутри логики P1 (для синхронизации коллизий)
         if (this != pl->m_player1) {
-            if (!inputThisStep || this != pl->m_player2) PlayerObject::update(stepDelta);
+            if (this == pl->m_player2 && p2HandledThisStep) {
+                p2HandledThisStep = false;
+                return;
+            }
+            PlayerObject::update(stepDelta);
             return;
         }
 
@@ -555,6 +540,7 @@ class $modify(BotPlayerObject, PlayerObject) {
         if (subs.empty()) {
             p1Split = false;
             p2Split = false;
+            p2HandledThisStep = false;
             PlayerObject::update(stepDelta);
             ++step;
             return;
@@ -563,20 +549,20 @@ class $modify(BotPlayerObject, PlayerObject) {
         PlayerObject* p2 = pl->m_player2;
         bool isDual = pl->m_gameState.m_isDualMode;
         bool p1StartedOnGround = this->m_isOnGround;
-        bool p2StartedOnGround = p2->m_isOnGround;
+        bool p2StartedOnGround = p2 && p2->m_isOnGround;
 
         bool p1NotBuffering = p1StartedOnGround
             || this->m_touchingRings->count()
             || this->m_isDashing
             || (this->m_isDart || this->m_isBird || this->m_isShip || this->m_isSwing);
 
-        bool p2NotBuffering = p2StartedOnGround
+        bool p2NotBuffering = p2 && (p2StartedOnGround
             || p2->m_touchingRings->count()
             || p2->m_isDashing
-            || (p2->m_isDart || p2->m_isBird || p2->m_isShip || p2->m_isSwing);
+            || (p2->m_isDart || p2->m_isBird || p2->m_isShip || p2->m_isSwing));
 
         p1Pos = PlayerObject::getPosition();
-        p2Pos = p2->getPosition();
+        if (p2) p2Pos = p2->getPosition();
 
         p1Split = p1NotBuffering;
         p2Split = p2NotBuffering && isDual;
@@ -585,17 +571,16 @@ class $modify(BotPlayerObject, PlayerObject) {
         bool firstLoop = true;
         double acc = 0.0;
         double carry = 0.0;
+        float spentStepDelta = 0.0f;
         Sub pending;
 
         for (auto const& s : subs) {
-            // клик, стоящий между предыдущей и этой частью
             if (pending.has) {
                 double at = (p1Split || p2Split) ? acc : 0.0;
                 applyInput(pl, pending, cur, at);
             }
             pending = s;
 
-            // слишком короткую часть не считаем физикой (шум float), её время уходит в следующую часть
             double const part = s.deltaFactor + carry;
             if (!s.endStep && part < MIN_PART) {
                 carry = part;
@@ -603,7 +588,15 @@ class $modify(BotPlayerObject, PlayerObject) {
                 continue;
             }
             carry = 0.0;
-            float const substepDelta = static_cast<float>(stepDelta * part);
+
+            // Точный расчет остатка подшага без накопления ошибки float
+            float substepDelta;
+            if (s.endStep) {
+                substepDelta = std::max(0.0f, stepDelta - spentStepDelta);
+            } else {
+                substepDelta = static_cast<float>(stepDelta * part);
+                spentStepDelta += substepDelta;
+            }
             rotationDelta = substepDelta;
 
             if (p1Split) {
@@ -618,27 +611,29 @@ class $modify(BotPlayerObject, PlayerObject) {
             }
             else if (s.endStep) PlayerObject::update(stepDelta);
 
-            if (p2Split) {
-                p2->update(substepDelta);
-                if (!s.endStep) {
-                    if (firstLoop && ((p2->m_yVelocity < 0) ^ p2->m_isUpsideDown)) p2->m_isOnGround = p2StartedOnGround;
-                    if (!p2->m_isOnSlope || p2->m_isDart) pl->checkCollisions(p2, 0.0f, true);
-                    else pl->checkCollisions(p2, stepDelta, true);
-                    p2->updateRotation(substepDelta);
-                    resetCollisionLog(p2);
+            if (p2) {
+                if (p2Split) {
+                    p2->update(substepDelta);
+                    if (!s.endStep) {
+                        if (firstLoop && ((p2->m_yVelocity < 0) ^ p2->m_isUpsideDown)) p2->m_isOnGround = p2StartedOnGround;
+                        if (!p2->m_isOnSlope || p2->m_isDart) pl->checkCollisions(p2, 0.0f, true);
+                        else pl->checkCollisions(p2, stepDelta, true);
+                        p2->updateRotation(substepDelta);
+                        resetCollisionLog(p2);
+                    }
                 }
+                else if (s.endStep) p2->update(stepDelta);
             }
-            else if (s.endStep) p2->update(stepDelta);
 
             acc += s.deltaFactor;
             firstLoop = false;
         }
 
+        p2HandledThisStep = true;
         midStep = false;
         ++step;
     }
 
-    // вызывается в конце обычного шага; доделываем вращение, оставшееся после нарезки
     void updateRotation(float t) {
         auto pl = PlayLayer::get();
         if (bot::zeroFrame) {
@@ -666,7 +661,6 @@ class $modify(BotPlayerObject, PlayerObject) {
 // ---------------------------------------------------------------------------
 class $modify(BotPlayLayer, PlayLayer) {
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
-        // при входе в уровень бот выключен, макрос сохраняется (можно загрузить и нажать PLAY)
         bot::mode = bot::Mode::Off;
         bot::step = 0;
         bot::playIndex = 0;
@@ -684,7 +678,7 @@ class $modify(BotPlayLayer, PlayLayer) {
         bot::cpLoaded = false;
         PlayLayer::resetLevel();
         bot::resetEngine();
-        if (bot::cpLoaded) return; // откат на чекпоинт обработан в loadFromCheckpoint
+        if (bot::cpLoaded) return;
 
         bot::step = 0;
         bot::playIndex = 0;
@@ -706,7 +700,6 @@ class $modify(BotPlayLayer, PlayLayer) {
 
         auto it = bot::checkpoints.find(cp);
         if (it == bot::checkpoints.end()) {
-            // неизвестный чекпоинт: синхронизироваться нельзя, безопаснее выключить бота
             bot::step = 0;
             bot::playIndex = 0;
             if (bot::mode != bot::Mode::Off) {
@@ -881,7 +874,7 @@ class $modify(BotPauseLayer, PauseLayer) {
             bot::setMode(bot::Mode::Record);
             this->updateStatusUI();
             Notification::create("Recording started", NotificationIcon::Info)->show();
-            this->onRestart(nullptr); // рестарт с начала и выход из паузы (this дальше не используем)
+            this->onRestart(nullptr);
         });
         recBtn->setPosition(panelW * 0.5f, panelH - 58.0f);
         modeMenu->addChild(recBtn);
