@@ -69,19 +69,28 @@ namespace bot {
     inline Mode mode = Mode::Off;
     inline std::vector<Action> currentMacro;
     inline size_t macroIndex = 0;
+
+    // Единственный источник правды для времени уровня.
+    // Обновляется ИСКЛЮЧИТЕЛЬНО внутри BotPlayerObject::update (для m_player1).
     inline double levelTime = 0.0;
     inline double currentFrameTime = 0.0;
     inline float currentFrameDt = 1.0f / 60.0f;
     inline std::chrono::steady_clock::time_point frameRealStart;
+
     inline double recSpeed = 1.0;
     inline std::unordered_map<CheckpointObject*, CheckpointData> checkpoints;
     inline std::string currentMacroName = "autosave";
     inline ButtonState p1State;
     inline ButtonState p2State;
     inline bool isSubStepping = false;
+    inline bool dualUpdatedInP1 = false;
 
     inline constexpr uint32_t MAGIC = 0x33544F42;
     inline constexpr double SMALLEST = 1e-5;
+
+    inline void resetTimingBaseline() {
+        frameRealStart = std::chrono::steady_clock::now();
+    }
 
     inline std::filesystem::path getMacrosDir() {
         auto dir = Mod::get()->getSaveDir() / "macros";
@@ -133,6 +142,11 @@ namespace bot {
             act.p1 = (flags & 2) != 0;
             currentMacro.push_back(act);
         }
+
+        std::sort(currentMacro.begin(), currentMacro.end(), [](const Action& a, const Action& b) {
+            return a.time < b.time;
+        });
+
         macroIndex = 0;
         levelTime = 0.0;
         currentMacroName = name;
@@ -233,6 +247,8 @@ struct BotPlayLayer : Modify<BotPlayLayer, PlayLayer> {
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
         if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
 
+        this->m_clickBetweenSteps = true;
+
         bot::levelTime = 0.0;
         bot::currentFrameTime = 0.0;
         bot::macroIndex = 0;
@@ -240,10 +256,11 @@ struct BotPlayLayer : Modify<BotPlayLayer, PlayLayer> {
         bot::p1State.reset();
         bot::p2State.reset();
         bot::isSubStepping = false;
+        bot::dualUpdatedInP1 = false;
         bot::recSpeed = Mod::get()->getSettingValue<double>("record-speed");
         if (bot::recSpeed < 0.01) bot::recSpeed = 1.0;
         if (bot::recSpeed > 2.0) bot::recSpeed = 2.0;
-        bot::frameRealStart = std::chrono::steady_clock::now();
+        bot::resetTimingBaseline();
 
         if (bot::mode == bot::Mode::Record) {
             CCScheduler::get()->setTimeScale(static_cast<float>(bot::recSpeed));
@@ -253,22 +270,10 @@ struct BotPlayLayer : Modify<BotPlayLayer, PlayLayer> {
         return true;
     }
 
-    void update(float dt) {
-        if (!this->m_isPaused) {
-            bot::currentFrameTime = bot::levelTime;
-            bot::currentFrameDt = dt;
-            bot::frameRealStart = std::chrono::steady_clock::now();
-        }
-
-        PlayLayer::update(dt);
-
-        if (!this->m_isPaused) {
-            bot::levelTime += static_cast<double>(dt);
-        }
-    }
-
     void resetLevel() {
         PlayLayer::resetLevel();
+
+        this->m_clickBetweenSteps = true;
 
         bot::levelTime = 0.0;
         bot::currentFrameTime = 0.0;
@@ -276,7 +281,8 @@ struct BotPlayLayer : Modify<BotPlayLayer, PlayLayer> {
         bot::p1State.reset();
         bot::p2State.reset();
         bot::isSubStepping = false;
-        bot::frameRealStart = std::chrono::steady_clock::now();
+        bot::dualUpdatedInP1 = false;
+        bot::resetTimingBaseline();
 
         if (this->m_player1) {
             this->m_player1->releaseButton(PlayerButton::Jump);
@@ -367,25 +373,38 @@ struct BotPlayLayer : Modify<BotPlayLayer, PlayLayer> {
         bot::p1State.reset();
         bot::p2State.reset();
         bot::isSubStepping = false;
-        bot::frameRealStart = std::chrono::steady_clock::now();
+        bot::dualUpdatedInP1 = false;
+        bot::resetTimingBaseline();
     }
 };
 
 struct BotPlayerObject : Modify<BotPlayerObject, PlayerObject> {
     void update(float dt) {
         auto pl = PlayLayer::get();
-        if (!pl || pl->m_isPaused || bot::isSubStepping) {
+
+        if (!pl || this != pl->m_player1) {
+            if (pl && this == pl->m_player2 && bot::dualUpdatedInP1) {
+                bot::dualUpdatedInP1 = false;
+                return;
+            }
             PlayerObject::update(dt);
             return;
         }
 
-        if (this != pl->m_player1) {
+        if (pl->m_isPaused || bot::isSubStepping) {
             PlayerObject::update(dt);
             return;
         }
+
+        // Единственная точка истины для таймлинии уровня.
+        bot::currentFrameTime = bot::levelTime;
+        bot::currentFrameDt = dt;
+        bot::frameRealStart = std::chrono::steady_clock::now();
+
+        bool isDual = (pl->m_player2 != nullptr && pl->m_player2->isVisible());
+        bot::dualUpdatedInP1 = isDual;
 
         if (bot::mode == bot::Mode::Play) {
-            bool isDual = (pl->m_player2 != nullptr && pl->m_player2->isVisible());
             double frameStart = bot::currentFrameTime;
             double frameEnd = frameStart + static_cast<double>(dt);
             double currentFrac = 0.0;
@@ -424,10 +443,15 @@ struct BotPlayerObject : Modify<BotPlayerObject, PlayerObject> {
             }
 
             bot::isSubStepping = false;
+            bot::levelTime += static_cast<double>(dt);
             return;
         }
 
         PlayerObject::update(dt);
+        if (isDual) {
+            pl->m_player2->update(dt);
+        }
+        bot::levelTime += static_cast<double>(dt);
     }
 };
 
@@ -486,14 +510,13 @@ struct BotPauseLayer : Modify<BotPauseLayer, PauseLayer> {
             if (str.empty()) return;
             try {
                 double val = std::stod(str);
-                if (val >= 0.01 && val <= 2.0) {
-                    bot::recSpeed = val;
-                    Mod::get()->setSettingValue<double>("record-speed", bot::recSpeed);
-                    if (bot::mode == bot::Mode::Record) {
-                        CCScheduler::get()->setTimeScale(static_cast<float>(bot::recSpeed));
-                    }
-                    this->updateLabels();
+                val = std::clamp(val, 0.01, 2.0);
+                bot::recSpeed = val;
+                Mod::get()->setSettingValue<double>("record-speed", bot::recSpeed);
+                if (bot::mode == bot::Mode::Record) {
+                    CCScheduler::get()->setTimeScale(static_cast<float>(bot::recSpeed));
                 }
+                this->updateLabels();
             } catch (...) {}
         });
 
@@ -543,7 +566,7 @@ struct BotPauseLayer : Modify<BotPauseLayer, PauseLayer> {
         bot::macroIndex = 0;
         bot::p1State.reset();
         bot::p2State.reset();
-        bot::frameRealStart = std::chrono::steady_clock::now();
+        bot::resetTimingBaseline();
         CCScheduler::get()->setTimeScale(static_cast<float>(bot::recSpeed));
         updateLabels();
     }
