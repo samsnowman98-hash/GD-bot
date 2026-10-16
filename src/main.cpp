@@ -7,10 +7,15 @@
 #include <Geode/binding/PlayLayer.hpp>
 #include <Geode/binding/GJBaseGameLayer.hpp>
 #include <Geode/binding/PlayerObject.hpp>
+#include <Geode/binding/PlayerButtonCommand.hpp>
 #include <Geode/binding/GameManager.hpp>
 #include <Geode/binding/CheckpointObject.hpp>
 #include <Geode/binding/GJGameLevel.hpp>
 #include <Geode/ui/Notification.hpp>
+#include <Geode/ui/ScrollLayer.hpp>
+#include <Geode/loader/Mod.hpp>
+#include <Geode/loader/SettingEvent.hpp>
+
 #include <chrono>
 #include <deque>
 #include <vector>
@@ -19,6 +24,7 @@
 #include <algorithm>
 #include <cstring>
 #include <ctime>
+#include <filesystem>
 
 using namespace geode::prelude;
 
@@ -52,9 +58,13 @@ struct CheckpointData {
     CCPoint p1Pos;
     double p1YVel = 0.0;
     float p1Rot = 0.0f;
+    bool p1CanJump = true;
+    bool p1OnGround = true;
     CCPoint p2Pos;
     double p2YVel = 0.0;
     float p2Rot = 0.0f;
+    bool p2CanJump = true;
+    bool p2OnGround = true;
 };
 
 struct State {
@@ -75,7 +85,6 @@ struct State {
 inline State g;
 
 inline std::deque<Sub> stepQueue;
-inline std::vector<PlayerButtonCommand> inputVector;
 inline double lastFrameTime = 0.0;
 inline double currentFrameTime = 0.0;
 inline bool firstFrame = true;
@@ -97,8 +106,8 @@ inline double getCurrentTimestamp() {
 
 inline void resetTimingBaseline() {
     lastFrameTime = getCurrentTimestamp();
+    currentFrameTime = lastFrameTime;
     stepQueue.clear();
-    inputVector.clear();
     firstFrame = false;
     skipUpdate = false;
     inputThisStep = false;
@@ -109,7 +118,6 @@ inline void resetTimingBaseline() {
 
 inline void resetEngine() {
     stepQueue.clear();
-    inputVector.clear();
     lastFrameTime = getCurrentTimestamp();
     currentFrameTime = lastFrameTime;
     firstFrame = true;
@@ -148,11 +156,11 @@ inline void applyClickFlags(PlayLayer* pl) {
     }
 }
 
-inline std::string macroPath(const std::string& filename) {
-    return (Mod::get()->getSaveDir() / filename).string();
+inline std::filesystem::path macroPath(const std::string& filename) {
+    return Mod::get()->getSaveDir() / filename;
 }
 
-inline bool writeMacroToFile(const std::string& path, const std::vector<Action>& macro) {
+inline bool writeMacroToFile(const std::filesystem::path& path, const std::vector<Action>& macro) {
     std::ofstream f(path, std::ios::binary);
     if (!f.is_open()) return false;
     uint32_t magic = kMagic;
@@ -171,7 +179,7 @@ inline bool writeMacroToFile(const std::string& path, const std::vector<Action>&
     return true;
 }
 
-inline bool readMacroFromFile(const std::string& path, std::vector<Action>& macro) {
+inline bool readMacroFromFile(const std::filesystem::path& path, std::vector<Action>& macro) {
     std::ifstream f(path, std::ios::binary);
     if (!f.is_open()) return false;
     uint32_t magic = 0;
@@ -262,9 +270,9 @@ inline void buildStepQueue(PlayLayer* pl, uint32_t stepCount) {
 
         Sub s{};
         s.has = true;
-        s.button = cmd.m_button;
-        s.push = cmd.m_isPushed;
-        s.p1 = cmd.m_isPlayer1;
+        s.button = static_cast<int>(cmd.m_button);
+        s.push = cmd.m_isPush;
+        s.p1 = !cmd.m_isPlayer2;
         s.deltaFactor = delta;
         s.endStep = false;
         stepQueue.push_back(s);
@@ -285,7 +293,7 @@ inline void onFrame(PlayLayer* pl, float modifiedDelta) {
         return;
     }
 
-    if (pl->m_playerDied) {
+    if (pl->m_player1 && pl->m_player1->m_isDead) {
         stepQueue.clear();
         firstFrame = true;
         return;
@@ -310,23 +318,24 @@ inline void setTimeScale(double s) {
 }
 
 inline void onFrameStart() {
-    auto pl = PlayLayer::get();
-    bool idle = (!pl);
-    if (pl && pl->m_pauseLayer != nullptr) idle = true;
-
-    if (g.mode == Mode::Record && !idle) {
-        setTimeScale(recSpeed);
-    } else {
+    if (g.mode != Mode::Record) {
         setTimeScale(1.0);
+        return;
     }
+    auto pl = PlayLayer::get();
+    if (!pl || pl->m_isPaused || pl->m_levelEndAnimationStarted) {
+        setTimeScale(1.0);
+        return;
+    }
+    setTimeScale(recSpeed);
 }
 
 inline void resetCollisionLog(PlayerObject* p) {
     if (!p) return;
-    p->m_collisionLogTop.clear();
-    p->m_collisionLogBottom.clear();
-    p->m_collisionLogLeft.clear();
-    p->m_collisionLogRight.clear();
+    if (p->m_collisionLogTop) p->m_collisionLogTop->removeAllObjects();
+    if (p->m_collisionLogBottom) p->m_collisionLogBottom->removeAllObjects();
+    if (p->m_collisionLogLeft) p->m_collisionLogLeft->removeAllObjects();
+    if (p->m_collisionLogRight) p->m_collisionLogRight->removeAllObjects();
     p->m_lastCollisionLeft = false;
     p->m_lastCollisionRight = false;
     p->m_lastCollisionBottom = false;
@@ -416,39 +425,42 @@ class $modify(BotPlayerObject, PlayerObject) {
             }
         } else {
             while (!bot::stepQueue.empty()) {
-                bool front = !bot::stepQueue.empty() && !bot::stepQueue.front().endStep;
-                auto item = bot::stepQueue.front();
-                if (!front) {
+                if (bot::stepQueue.front().endStep) {
                     bot::stepQueue.pop_front();
                     break;
                 }
-                subs.push_back(item);
+                subs.push_back(bot::stepQueue.front());
                 bot::stepQueue.pop_front();
             }
         }
+
+        std::sort(subs.begin(), subs.end(), [](const bot::Sub& a, const bot::Sub& b) {
+            return a.deltaFactor < b.deltaFactor;
+        });
 
         double consumed = 0.0;
         bot::midStep = !subs.empty();
 
         for (auto& s : subs) {
-            double sub = s.deltaFactor * stepDelta;
-            if (sub < 0.0) sub = 0.0;
-            if (sub > stepDelta) sub = stepDelta;
+            double factor = std::clamp(s.deltaFactor, 0.0, 1.0);
+            double thisDelta = (factor * stepDelta) - consumed;
+            if (thisDelta < bot::SMALLEST) thisDelta = bot::SMALLEST;
+            consumed += thisDelta;
 
             if (isP1) bot::p1Split = true;
             if (isP2) bot::p2Split = true;
 
-            PlayerObject::update(static_cast<float>(sub));
-            consumed += sub;
+            PlayerObject::update(static_cast<float>(thisDelta));
+
+            if (pl->m_player1) pl->checkCollisions(pl->m_player1, 0.0f, true);
+            if (pl->m_player2 && pl->m_isDualMode) pl->checkCollisions(pl->m_player2, 0.0f, true);
+
+            bot::resetCollisionLog(this);
 
             if (isP1) bot::p1Pos = this->getPosition();
             if (isP2) bot::p2Pos = this->getPosition();
 
-            bot::applyInput(pl, s, bot::g.step, s.deltaFactor);
-
-            pl->checkCollisions(this, static_cast<float>(sub), isP1);
-            this->updateRotation(static_cast<float>(sub));
-            bot::resetCollisionLog(this);
+            bot::applyInput(pl, s, bot::g.step, factor);
         }
 
         double remaining = stepDelta - consumed;
@@ -459,7 +471,9 @@ class $modify(BotPlayerObject, PlayerObject) {
         if (isP1) bot::p1Split = false;
         if (isP2) bot::p2Split = false;
 
-        if (isP1) {
+        if (!pl->m_isDualMode && isP1) {
+            bot::g.step++;
+        } else if (pl->m_isDualMode && isP2) {
             bot::g.step++;
         }
     }
@@ -491,7 +505,7 @@ class $modify(BotPlayLayer, PlayLayer) {
         bool ret = PlayLayer::init(level, useReplay, dontCreateObjects);
         if (!ret) return false;
 
-        bot::g.levelID = level ? level->m_levelID : 0;
+        bot::g.levelID = level ? level->m_levelID.value() : 0;
         bot::g.levelName = level ? std::string(level->m_levelName.c_str()) : std::string("unknown");
         std::string hashSource = fmt::format("{}_{}", bot::g.levelName, level ? level->m_levelString.size() : 0);
         bot::g.levelHash = std::hash<std::string>{}(hashSource);
@@ -520,34 +534,35 @@ class $modify(BotPlayLayer, PlayLayer) {
         }
     }
 
-    void createCheckpoint() {
-        PlayLayer::createCheckpoint();
-
-        if (this->m_checkpoints.empty()) return;
-        auto cp = this->m_checkpoints.back();
-        if (!cp) return;
-
-        bot::CheckpointData data{};
-        data.step = bot::g.step;
-        if (this->m_player1) {
-            data.p1Pos = this->m_player1->getPosition();
-            data.p1YVel = this->m_player1->m_yVelocity;
-            data.p1Rot = this->m_player1->getRotation();
+    CheckpointObject* createCheckpoint() {
+        auto cp = PlayLayer::createCheckpoint();
+        if (cp) {
+            bot::CheckpointData data{};
+            data.step = bot::g.step;
+            if (this->m_player1) {
+                data.p1Pos = this->m_player1->getPosition();
+                data.p1YVel = this->m_player1->m_yVelocity;
+                data.p1Rot = this->m_player1->getRotation();
+                data.p1CanJump = this->m_player1->m_canJump;
+                data.p1OnGround = this->m_player1->m_isOnGround;
+            }
+            if (this->m_player2) {
+                data.p2Pos = this->m_player2->getPosition();
+                data.p2YVel = this->m_player2->m_yVelocity;
+                data.p2Rot = this->m_player2->getRotation();
+                data.p2CanJump = this->m_player2->m_canJump;
+                data.p2OnGround = this->m_player2->m_isOnGround;
+            }
+            bot::g.checkpoints[cp] = data;
         }
-        if (this->m_player2) {
-            data.p2Pos = this->m_player2->getPosition();
-            data.p2YVel = this->m_player2->m_yVelocity;
-            data.p2Rot = this->m_player2->getRotation();
-        }
-
-        bot::g.checkpoints[cp] = data;
+        return cp;
     }
 
     void loadFromCheckpoint(CheckpointObject* cp) {
         PlayLayer::loadFromCheckpoint(cp);
 
         bot::g.cpLoaded = true;
-        this->m_queuedButtons.clear();
+        this->m_playerDied = false;
 
         bot::resetTimingBaseline();
 
@@ -570,11 +585,15 @@ class $modify(BotPlayLayer, PlayLayer) {
             this->m_player1->setPosition(data.p1Pos);
             this->m_player1->m_yVelocity = data.p1YVel;
             this->m_player1->setRotation(data.p1Rot);
+            this->m_player1->m_canJump = data.p1CanJump;
+            this->m_player1->m_isOnGround = data.p1OnGround;
         }
         if (this->m_player2) {
             this->m_player2->setPosition(data.p2Pos);
             this->m_player2->m_yVelocity = data.p2YVel;
             this->m_player2->setRotation(data.p2Rot);
+            this->m_player2->m_canJump = data.p2CanJump;
+            this->m_player2->m_isOnGround = data.p2OnGround;
         }
 
         if (bot::g.mode == bot::Mode::Record) {
@@ -705,21 +724,19 @@ class $modify(BotPauseLayer, PauseLayer) {
         auto scroll = m_fields->m_scroll;
         if (!scroll) return;
 
-        if (m_fields->m_listMenu) {
-            m_fields->m_listMenu->removeFromParent();
-            m_fields->m_listMenu = nullptr;
-        }
+        auto content = scroll->m_contentLayer;
+        content->removeAllChildren();
 
         auto listMenu = CCMenu::create();
         listMenu->setPosition({ 0, 0 });
-        scroll->m_contentLayer->addChild(listMenu);
+        content->addChild(listMenu);
         m_fields->m_listMenu = listMenu;
 
         std::vector<std::filesystem::path> files;
         auto dir = Mod::get()->getSaveDir();
         if (std::filesystem::exists(dir)) {
             for (auto& entry : std::filesystem::directory_iterator(dir)) {
-                if (entry.path().extension() == bot::kMacroExt) {
+                if (entry.is_regular_file() && entry.path().extension() == bot::kMacroExt) {
                     files.push_back(entry.path());
                 }
             }
@@ -730,26 +747,30 @@ class $modify(BotPauseLayer, PauseLayer) {
             auto label = CCLabelBMFont::create("No saved macros yet", "chatFont.fnt");
             label->setScale(0.6f);
             label->setPosition({ 140, 75 });
-            listMenu->addChild(label);
-            scroll->m_contentLayer->setContentSize({ 280, 150 });
+            content->addChild(label);
+            content->setContentSize({ 280, 150 });
             return;
         }
 
-        float y = 150.0f - 15.0f;
-        for (auto& path : files) {
+        float totalHeight = std::max(150.0f, static_cast<float>(files.size()) * 30.0f);
+        content->setContentSize({ 280, totalHeight });
+
+        for (size_t i = 0; i < files.size(); i++) {
+            auto& path = files[i];
             std::string name = path.filename().string();
             std::string shown = name.size() > 18 ? (name.substr(0, 18) + "..") : name;
+            float y = totalHeight - static_cast<float>(i + 1) * 30.0f + 15.0f;
 
             auto label = CCLabelBMFont::create(shown.c_str(), "chatFont.fnt");
             label->setScale(0.5f);
             label->setAnchorPoint({ 0.0f, 0.5f });
             label->setPosition({ 10, y });
-            listMenu->addChild(label);
+            content->addChild(label);
 
             auto loadBtn = CCMenuItemSpriteExtra::create(
                 ButtonSprite::create("LOAD", "goldFont.fnt", "GJ_button_01.png", 0.5f),
                 this, menu_selector(BotPauseLayer::onLoadFile));
-            loadBtn->setPosition({ 220, y });
+            loadBtn->setPosition({ 210, y });
             auto pathStr = CCString::create(path.string());
             loadBtn->setUserObject(pathStr);
             listMenu->addChild(loadBtn);
@@ -757,16 +778,13 @@ class $modify(BotPauseLayer, PauseLayer) {
             auto delBtn = CCMenuItemSpriteExtra::create(
                 ButtonSprite::create("X", "goldFont.fnt", "GJ_button_06.png", 0.5f),
                 this, menu_selector(BotPauseLayer::onDeleteFile));
-            delBtn->setPosition({ 260, y });
+            delBtn->setPosition({ 255, y });
             auto pathStr2 = CCString::create(path.string());
             delBtn->setUserObject(pathStr2);
             listMenu->addChild(delBtn);
-
-            y -= 30.0f;
         }
 
-        float contentHeight = std::max(150.0f, 150.0f - y);
-        scroll->m_contentLayer->setContentSize({ 280, contentHeight });
+        scroll->moveToTop();
     }
 
     void onOpenMacroPanel(CCObject*) {
@@ -852,8 +870,7 @@ class $modify(BotPauseLayer, PauseLayer) {
         bot::g.index = 0;
         bot::applyClickFlags(PlayLayer::get());
         this->updateBotLabel();
-        this->onResume(nullptr);
-        PlayLayer::get()->resetLevel();
+        this->onRestart(nullptr);
     }
 
     void onBotPlay(CCObject*) {
@@ -866,8 +883,7 @@ class $modify(BotPauseLayer, PauseLayer) {
         bot::g.index = 0;
         bot::applyClickFlags(PlayLayer::get());
         this->updateBotLabel();
-        this->onResume(nullptr);
-        PlayLayer::get()->resetLevel();
+        this->onRestart(nullptr);
     }
 
     void onBotStop(CCObject*) {
