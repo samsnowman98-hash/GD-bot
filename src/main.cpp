@@ -2,6 +2,7 @@
 #include <Geode/modify/PlayLayer.hpp>
 #include <Geode/modify/PlayerObject.hpp>
 #include <Geode/modify/PauseLayer.hpp>
+#include <Geode/modify/GJBaseGameLayer.hpp>
 #include <Geode/binding/GJGameLevel.hpp>
 #include <Geode/binding/CheckpointObject.hpp>
 #include <chrono>
@@ -28,7 +29,7 @@ namespace bot {
     };
 
     struct CheckpointData {
-        uint32_t step = 0;
+        uint32_t frame = 0;
         size_t macroSize = 0;
         CCPoint p1Pos = CCPointZero;
         double p1YVel = 0.0;
@@ -62,23 +63,20 @@ namespace bot {
     inline Mode mode = Mode::Off;
     inline std::vector<Action> currentMacro;
     inline size_t macroIndex = 0;
-    inline uint32_t currentStep = 0;
+    inline uint32_t currentFrame = 0;
+    inline float currentFrameDt = 1.0f / 60.0f;
     inline double recSpeed = 1.0;
-    inline std::chrono::steady_clock::time_point stepStartTime;
+    inline std::chrono::steady_clock::time_point frameStartTime;
     inline std::unordered_map<CheckpointObject*, CheckpointData> checkpoints;
     inline std::string currentMacroName = "autosave";
     inline ButtonState p1State;
     inline ButtonState p2State;
     inline bool isSubStepping = false;
     inline bool dualUpdatedInP1 = false;
-    inline bool suppressRecording = false;
+    inline bool isSimulatingInput = false;
 
     inline constexpr uint32_t MAGIC = 0x32544F42;
     inline constexpr double SMALLEST = 1e-5;
-
-    inline void resetTimingBaseline() {
-        stepStartTime = std::chrono::steady_clock::now();
-    }
 
     inline std::filesystem::path getMacrosDir() {
         auto dir = Mod::get()->getSaveDir() / "macros";
@@ -133,7 +131,7 @@ namespace bot {
             currentMacro.push_back(act);
         }
         macroIndex = 0;
-        currentStep = 0;
+        currentFrame = 0;
         currentMacroName = name;
         return true;
     }
@@ -152,63 +150,81 @@ namespace bot {
 
     inline void syncPlayback() {
         macroIndex = 0;
-        while (macroIndex < currentMacro.size() && currentMacro[macroIndex].step < currentStep) {
+        while (macroIndex < currentMacro.size() && currentMacro[macroIndex].step < currentFrame) {
             macroIndex++;
         }
     }
 
-    inline void applyActionDirect(const Action& act, PlayLayer* pl) {
-        PlayerObject* target = act.p1 ? pl->m_player1 : pl->m_player2;
-        if (!target) return;
-        PlayerButton btn = static_cast<PlayerButton>(act.btn);
-        if (act.down) {
-            target->pushButton(btn);
-        } else {
-            target->releaseButton(btn);
-        }
-    }
-
-    inline void recordAction(bool isPlayer1, PlayerButton button, bool down) {
+    inline void recordAction(bool isPlayer1, int button, bool down) {
         if (mode != Mode::Record) return;
-        if (suppressRecording) return;
 
         auto& state = isPlayer1 ? p1State : p2State;
-        int btnId = static_cast<int>(button);
-        if (state.isHeld(btnId) == down) {
+        if (state.isHeld(button) == down) {
             return;
         }
-        state.setHeld(btnId, down);
+        state.setHeld(button, down);
 
         auto now = std::chrono::steady_clock::now();
-        double elapsed = std::chrono::duration<double>(now - stepStartTime).count();
-        double stepDuration = (1.0 / 240.0) / (recSpeed > SMALLEST ? recSpeed : 1.0);
-        double frac = std::clamp(elapsed / stepDuration, 0.0, 0.999);
+        double elapsed = std::chrono::duration<double>(now - frameStartTime).count();
+        double expectedDuration = static_cast<double>(currentFrameDt) / (recSpeed > SMALLEST ? recSpeed : 1.0);
+
+        double frac = 0.0;
+        if (expectedDuration > 1e-6) {
+            frac = elapsed / expectedDuration;
+        }
+        if (frac < 0.0 || frac >= 1.0) {
+            frac = 0.0;
+        }
 
         Action act;
-        act.step = currentStep;
+        act.step = currentFrame;
         act.frac = frac;
         act.down = down;
         act.p1 = isPlayer1;
-        act.btn = static_cast<uint8_t>(btnId);
+        act.btn = static_cast<uint8_t>(button);
         currentMacro.push_back(act);
     }
 }
 
+struct BotBaseGameLayer : Modify<BotBaseGameLayer, GJBaseGameLayer> {
+    void handleButton(bool push, int button, bool player1) {
+        auto pl = PlayLayer::get();
+        if (!pl || static_cast<GJBaseGameLayer*>(pl) != this) {
+            GJBaseGameLayer::handleButton(push, button, player1);
+            return;
+        }
+
+        if (bot::mode == bot::Mode::Play) {
+            if (!bot::isSimulatingInput) {
+                return;
+            }
+            GJBaseGameLayer::handleButton(push, button, player1);
+            return;
+        }
+
+        if (bot::mode == bot::Mode::Record && !pl->m_isPaused) {
+            bot::recordAction(player1, button, push);
+        }
+
+        GJBaseGameLayer::handleButton(push, button, player1);
+    }
+};
+
 struct BotPlayLayer : Modify<BotPlayLayer, PlayLayer> {
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
         if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
-        this->m_clickBetweenSteps = false;
-        bot::currentStep = 0;
+
+        bot::currentFrame = 0;
         bot::macroIndex = 0;
         bot::checkpoints.clear();
         bot::p1State = bot::ButtonState();
         bot::p2State = bot::ButtonState();
         bot::isSubStepping = false;
         bot::dualUpdatedInP1 = false;
-        bot::suppressRecording = false;
+        bot::isSimulatingInput = false;
         bot::recSpeed = Mod::get()->getSettingValue<double>("record-speed");
         if (bot::recSpeed < 0.01) bot::recSpeed = 1.0;
-        bot::resetTimingBaseline();
+        bot::frameStartTime = std::chrono::steady_clock::now();
 
         if (bot::mode == bot::Mode::Record) {
             CCScheduler::get()->setTimeScale(static_cast<float>(bot::recSpeed));
@@ -218,17 +234,31 @@ struct BotPlayLayer : Modify<BotPlayLayer, PlayLayer> {
         return true;
     }
 
+    void update(float dt) {
+        if (!this->m_isPaused) {
+            bot::frameStartTime = std::chrono::steady_clock::now();
+            bot::currentFrameDt = dt;
+        }
+
+        PlayLayer::update(dt);
+
+        if (!this->m_isPaused) {
+            bot::currentFrame++;
+        }
+    }
+
     void resetLevel() {
-        this->m_clickBetweenSteps = false;
         PlayLayer::resetLevel();
 
-        bot::currentStep = 0;
+        bot::currentFrame = 0;
         bot::macroIndex = 0;
+        bot::p1State = bot::ButtonState();
+        bot::p2State = bot::ButtonState();
         bot::isSubStepping = false;
         bot::dualUpdatedInP1 = false;
-        bot::resetTimingBaseline();
+        bot::isSimulatingInput = false;
+        bot::frameStartTime = std::chrono::steady_clock::now();
 
-        bot::suppressRecording = true;
         if (this->m_player1) {
             this->m_player1->releaseButton(PlayerButton::Jump);
             this->m_player1->releaseButton(PlayerButton::Left);
@@ -239,24 +269,12 @@ struct BotPlayLayer : Modify<BotPlayLayer, PlayLayer> {
             this->m_player2->releaseButton(PlayerButton::Left);
             this->m_player2->releaseButton(PlayerButton::Right);
         }
-        bot::suppressRecording = false;
-
-        bot::p1State = bot::ButtonState();
-        bot::p2State = bot::ButtonState();
 
         if (bot::mode == bot::Mode::Record) {
-            bot::currentMacro.clear();
             CCScheduler::get()->setTimeScale(static_cast<float>(bot::recSpeed));
         } else {
             CCScheduler::get()->setTimeScale(1.0f);
         }
-    }
-
-    void handleButton(bool isDown, int button, bool isPlayer1) {
-        if (bot::mode == bot::Mode::Play) {
-            return;
-        }
-        PlayLayer::handleButton(isDown, button, isPlayer1);
     }
 
     CheckpointObject* createCheckpoint() {
@@ -264,7 +282,7 @@ struct BotPlayLayer : Modify<BotPlayLayer, PlayLayer> {
         if (!cp) return cp;
 
         bot::CheckpointData data;
-        data.step = bot::currentStep;
+        data.frame = bot::currentFrame;
         data.macroSize = bot::currentMacro.size();
 
         if (this->m_player1) {
@@ -296,7 +314,7 @@ struct BotPlayLayer : Modify<BotPlayLayer, PlayLayer> {
         if (it == bot::checkpoints.end()) return;
 
         const auto& data = it->second;
-        bot::currentStep = data.step;
+        bot::currentFrame = data.frame;
 
         if (bot::mode == bot::Mode::Record) {
             if (data.macroSize <= bot::currentMacro.size()) {
@@ -305,8 +323,6 @@ struct BotPlayLayer : Modify<BotPlayLayer, PlayLayer> {
         } else if (bot::mode == bot::Mode::Play) {
             bot::syncPlayback();
         }
-
-        bot::suppressRecording = true;
 
         if (this->m_player1) {
             this->m_player1->setPosition(data.p1Pos);
@@ -328,39 +344,16 @@ struct BotPlayLayer : Modify<BotPlayLayer, PlayLayer> {
             this->m_player2->releaseButton(PlayerButton::Right);
         }
 
-        bot::suppressRecording = false;
-
         bot::p1State = bot::ButtonState();
         bot::p2State = bot::ButtonState();
         bot::isSubStepping = false;
         bot::dualUpdatedInP1 = false;
-        bot::resetTimingBaseline();
+        bot::isSimulatingInput = false;
+        bot::frameStartTime = std::chrono::steady_clock::now();
     }
 };
 
 struct BotPlayerObject : Modify<BotPlayerObject, PlayerObject> {
-    void pushButton(PlayerButton button) {
-        PlayerObject::pushButton(button);
-
-        auto pl = PlayLayer::get();
-        if (!pl) return;
-        if (this != pl->m_player1 && this != pl->m_player2) return;
-
-        bool isPlayer1 = (this == pl->m_player1);
-        bot::recordAction(isPlayer1, button, true);
-    }
-
-    void releaseButton(PlayerButton button) {
-        PlayerObject::releaseButton(button);
-
-        auto pl = PlayLayer::get();
-        if (!pl) return;
-        if (this != pl->m_player1 && this != pl->m_player2) return;
-
-        bool isPlayer1 = (this == pl->m_player1);
-        bot::recordAction(isPlayer1, button, false);
-    }
-
     void update(float dt) {
         auto pl = PlayLayer::get();
         if (!pl || pl->m_isPaused || bot::isSubStepping) {
@@ -380,7 +373,6 @@ struct BotPlayerObject : Modify<BotPlayerObject, PlayerObject> {
 
         bool isDual = (pl->m_player2 != nullptr && pl->m_player2->isVisible());
         bot::dualUpdatedInP1 = isDual;
-        bot::stepStartTime = std::chrono::steady_clock::now();
 
         if (bot::mode == bot::Mode::Play) {
             double currentFrac = 0.0;
@@ -388,7 +380,7 @@ struct BotPlayerObject : Modify<BotPlayerObject, PlayerObject> {
 
             while (bot::macroIndex < bot::currentMacro.size()) {
                 const auto& act = bot::currentMacro[bot::macroIndex];
-                if (act.step != bot::currentStep) {
+                if (act.step != bot::currentFrame) {
                     break;
                 }
 
@@ -402,7 +394,10 @@ struct BotPlayerObject : Modify<BotPlayerObject, PlayerObject> {
                     currentFrac = targetFrac;
                 }
 
-                bot::applyActionDirect(act, pl);
+                bot::isSimulatingInput = true;
+                pl->handleButton(act.down, act.btn, act.p1);
+                bot::isSimulatingInput = false;
+
                 bot::macroIndex++;
             }
 
@@ -413,12 +408,13 @@ struct BotPlayerObject : Modify<BotPlayerObject, PlayerObject> {
             }
 
             bot::isSubStepping = false;
-            bot::currentStep++;
             return;
         }
 
         PlayerObject::update(dt);
-        bot::currentStep++;
+        if (isDual) {
+            pl->m_player2->update(dt);
+        }
     }
 };
 
@@ -428,7 +424,6 @@ struct BotPauseLayer : Modify<BotPauseLayer, PauseLayer> {
         CCLabelBMFont* speedLabel = nullptr;
         CCMenu* botMenu = nullptr;
         CCLayerColor* macroOverlay = nullptr;
-        ScrollLayer* macroScroll = nullptr;
     };
 
     void customSetup() {
@@ -511,8 +506,8 @@ struct BotPauseLayer : Modify<BotPauseLayer, PauseLayer> {
         }
 
         m_fields->statusLabel->setString(
-            fmt::format("MODE: {} | ACTS: {} | STEP: {} | FILE: {}",
-                modeStr, bot::currentMacro.size(), bot::currentStep, bot::currentMacroName).c_str()
+            fmt::format("MODE: {} | ACTS: {} | FRAME: {} | FILE: {}",
+                modeStr, bot::currentMacro.size(), bot::currentFrame, bot::currentMacroName).c_str()
         );
         m_fields->statusLabel->setColor(col);
 
@@ -524,10 +519,11 @@ struct BotPauseLayer : Modify<BotPauseLayer, PauseLayer> {
     void onRecord(CCObject*) {
         bot::mode = bot::Mode::Record;
         bot::currentMacro.clear();
-        bot::currentStep = 0;
+        bot::currentFrame = 0;
         bot::macroIndex = 0;
         bot::p1State = bot::ButtonState();
         bot::p2State = bot::ButtonState();
+        bot::frameStartTime = std::chrono::steady_clock::now();
         CCScheduler::get()->setTimeScale(static_cast<float>(bot::recSpeed));
         updateLabels();
     }
@@ -535,7 +531,7 @@ struct BotPauseLayer : Modify<BotPauseLayer, PauseLayer> {
     void onPlay(CCObject*) {
         bot::mode = bot::Mode::Play;
         bot::macroIndex = 0;
-        bot::currentStep = 0;
+        bot::currentFrame = 0;
         bot::p1State = bot::ButtonState();
         bot::p2State = bot::ButtonState();
         CCScheduler::get()->setTimeScale(1.0f);
@@ -551,7 +547,7 @@ struct BotPauseLayer : Modify<BotPauseLayer, PauseLayer> {
     void onClear(CCObject*) {
         bot::currentMacro.clear();
         bot::macroIndex = 0;
-        bot::currentStep = 0;
+        bot::currentFrame = 0;
         updateLabels();
     }
 
