@@ -6,8 +6,9 @@
 #include <Geode/binding/CheckpointObject.hpp>
 #include <Geode/binding/ButtonSprite.hpp>
 #include <Geode/binding/CCMenuItemSpriteExtra.hpp>
-#include <Geode/binding/ScrollLayer.hpp>
+#include <Geode/binding/CCScrollLayerExt.hpp>
 #include <Geode/binding/CCContentLayer.hpp>
+#include <Geode/ui/ScrollLayer.hpp>
 #include <Geode/ui/TextInput.hpp>
 #include <Geode/ui/Notification.hpp>
 #include <chrono>
@@ -496,7 +497,7 @@ class $modify(BotPauseLayer, PauseLayer) {
             scroll->m_contentLayer->addChild(rowNode);
         }
 
-        scroll->moveToTop();
+        scroll->scrollToTop();
         m_fields->m_fileListContainer->addChild(scroll);
     }
 
