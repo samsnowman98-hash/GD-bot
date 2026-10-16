@@ -48,7 +48,7 @@ namespace bot {
         bool isHeld(int btn) const {
             if (btn == 1) return jump;
             if (btn == 2) return left;
-            if (btn == 3) return right;
+            if (btn == 3) right;
             return false;
         }
 
@@ -222,15 +222,16 @@ struct BotPlayLayer : Modify<BotPlayLayer, PlayLayer> {
         }
     }
 
-    bool handleButton(bool isDown, int button, bool isPlayer1) {
+    void handleButton(bool isDown, int button, bool isPlayer1) {
         if (bot::mode == bot::Mode::Play) {
-            return false;
+            return;
         }
 
         if (bot::mode == bot::Mode::Record) {
             auto& state = isPlayer1 ? bot::p1State : bot::p2State;
             if (isDown == state.isHeld(button)) {
-                return PlayLayer::handleButton(isDown, button, isPlayer1);
+                PlayLayer::handleButton(isDown, button, isPlayer1);
+                return;
             }
             state.setHeld(button, isDown);
 
@@ -247,7 +248,8 @@ struct BotPlayLayer : Modify<BotPlayLayer, PlayLayer> {
             act.btn = static_cast<uint8_t>(button);
             bot::currentMacro.push_back(act);
         }
-        return PlayLayer::handleButton(isDown, button, isPlayer1);
+
+        PlayLayer::handleButton(isDown, button, isPlayer1);
     }
 
     CheckpointObject* createCheckpoint() {
@@ -319,6 +321,8 @@ struct BotPlayLayer : Modify<BotPlayLayer, PlayLayer> {
 
         bot::p1State = bot::ButtonState();
         bot::p2State = bot::ButtonState();
+        bot::isSubStepping = false;
+        bot::dualUpdatedInP1 = false;
         bot::resetTimingBaseline();
     }
 };
@@ -332,6 +336,7 @@ struct BotPlayerObject : Modify<BotPlayerObject, PlayerObject> {
         }
 
         if (this == pl->m_player2 && bot::dualUpdatedInP1) {
+            bot::dualUpdatedInP1 = false;
             return;
         }
 
@@ -380,9 +385,6 @@ struct BotPlayerObject : Modify<BotPlayerObject, PlayerObject> {
         }
 
         PlayerObject::update(dt);
-        if (isDual) {
-            pl->m_player2->update(dt);
-        }
         bot::currentStep++;
     }
 };
