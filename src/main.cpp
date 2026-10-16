@@ -5,6 +5,7 @@
 #include <Geode/modify/GJBaseGameLayer.hpp>
 #include <Geode/binding/GJGameLevel.hpp>
 #include <Geode/binding/CheckpointObject.hpp>
+#include <Geode/ui/TextInput.hpp>
 #include <chrono>
 #include <vector>
 #include <string>
@@ -21,15 +22,14 @@ namespace bot {
     enum class Mode { Off, Record, Play };
 
     struct Action {
-        uint32_t step = 0;
-        double frac = 0.0;
+        double time = 0.0;
         bool down = false;
         bool p1 = true;
         uint8_t btn = 1;
     };
 
     struct CheckpointData {
-        uint32_t frame = 0;
+        double time = 0.0;
         size_t macroSize = 0;
         CCPoint p1Pos = CCPointZero;
         double p1YVel = 0.0;
@@ -58,24 +58,29 @@ namespace bot {
             else if (btn == 2) left = held;
             else if (btn == 3) right = held;
         }
+
+        void reset() {
+            jump = false;
+            left = false;
+            right = false;
+        }
     };
 
     inline Mode mode = Mode::Off;
     inline std::vector<Action> currentMacro;
     inline size_t macroIndex = 0;
-    inline uint32_t currentFrame = 0;
+    inline double levelTime = 0.0;
+    inline double currentFrameTime = 0.0;
     inline float currentFrameDt = 1.0f / 60.0f;
+    inline std::chrono::steady_clock::time_point frameRealStart;
     inline double recSpeed = 1.0;
-    inline std::chrono::steady_clock::time_point frameStartTime;
     inline std::unordered_map<CheckpointObject*, CheckpointData> checkpoints;
     inline std::string currentMacroName = "autosave";
     inline ButtonState p1State;
     inline ButtonState p2State;
     inline bool isSubStepping = false;
-    inline bool dualUpdatedInP1 = false;
-    inline bool isSimulatingInput = false;
 
-    inline constexpr uint32_t MAGIC = 0x32544F42;
+    inline constexpr uint32_t MAGIC = 0x33544F42;
     inline constexpr double SMALLEST = 1e-5;
 
     inline std::filesystem::path getMacrosDir() {
@@ -96,8 +101,7 @@ namespace bot {
         file.write(reinterpret_cast<const char*>(&count), sizeof(count));
 
         for (const auto& act : currentMacro) {
-            file.write(reinterpret_cast<const char*>(&act.step), sizeof(act.step));
-            file.write(reinterpret_cast<const char*>(&act.frac), sizeof(act.frac));
+            file.write(reinterpret_cast<const char*>(&act.time), sizeof(act.time));
             uint8_t flags = (act.down ? 1 : 0) | (act.p1 ? 2 : 0);
             file.write(reinterpret_cast<const char*>(&flags), sizeof(flags));
             file.write(reinterpret_cast<const char*>(&act.btn), sizeof(act.btn));
@@ -121,8 +125,7 @@ namespace bot {
 
         for (uint32_t i = 0; i < count; i++) {
             Action act;
-            file.read(reinterpret_cast<char*>(&act.step), sizeof(act.step));
-            file.read(reinterpret_cast<char*>(&act.frac), sizeof(act.frac));
+            file.read(reinterpret_cast<char*>(&act.time), sizeof(act.time));
             uint8_t flags = 0;
             file.read(reinterpret_cast<char*>(&flags), sizeof(flags));
             file.read(reinterpret_cast<char*>(&act.btn), sizeof(act.btn));
@@ -131,7 +134,7 @@ namespace bot {
             currentMacro.push_back(act);
         }
         macroIndex = 0;
-        currentFrame = 0;
+        levelTime = 0.0;
         currentMacroName = name;
         return true;
     }
@@ -150,8 +153,30 @@ namespace bot {
 
     inline void syncPlayback() {
         macroIndex = 0;
-        while (macroIndex < currentMacro.size() && currentMacro[macroIndex].step < currentFrame) {
+        while (macroIndex < currentMacro.size() && currentMacro[macroIndex].time < levelTime) {
             macroIndex++;
+        }
+    }
+
+    inline void applyAction(const Action& act, PlayLayer* pl) {
+        PlayerButton btn = static_cast<PlayerButton>(act.btn);
+        bool isDual = (pl->m_player2 != nullptr && pl->m_player2->isVisible());
+        bool twoPlayer = pl->m_level ? pl->m_level->m_twoPlayerMode : false;
+
+        if (twoPlayer) {
+            PlayerObject* target = act.p1 ? pl->m_player1 : pl->m_player2;
+            if (target) {
+                if (act.down) target->pushButton(btn);
+                else target->releaseButton(btn);
+            }
+        } else {
+            if (act.down) {
+                if (pl->m_player1) pl->m_player1->pushButton(btn);
+                if (isDual && pl->m_player2) pl->m_player2->pushButton(btn);
+            } else {
+                if (pl->m_player1) pl->m_player1->releaseButton(btn);
+                if (isDual && pl->m_player2) pl->m_player2->releaseButton(btn);
+            }
         }
     }
 
@@ -165,20 +190,18 @@ namespace bot {
         state.setHeld(button, down);
 
         auto now = std::chrono::steady_clock::now();
-        double elapsed = std::chrono::duration<double>(now - frameStartTime).count();
-        double expectedDuration = static_cast<double>(currentFrameDt) / (recSpeed > SMALLEST ? recSpeed : 1.0);
+        double elapsedReal = std::chrono::duration<double>(now - frameRealStart).count();
+        double speed = recSpeed > SMALLEST ? recSpeed : 1.0;
+        double expectedReal = static_cast<double>(currentFrameDt) / speed;
 
         double frac = 0.0;
-        if (expectedDuration > 1e-6) {
-            frac = elapsed / expectedDuration;
+        if (expectedReal > 1e-7) {
+            frac = elapsedReal / expectedReal;
         }
-        if (frac < 0.0 || frac >= 1.0) {
-            frac = 0.0;
-        }
+        frac = std::clamp(frac, 0.0, 0.999);
 
         Action act;
-        act.step = currentFrame;
-        act.frac = frac;
+        act.time = currentFrameTime + (frac * static_cast<double>(currentFrameDt));
         act.down = down;
         act.p1 = isPlayer1;
         act.btn = static_cast<uint8_t>(button);
@@ -195,10 +218,6 @@ struct BotBaseGameLayer : Modify<BotBaseGameLayer, GJBaseGameLayer> {
         }
 
         if (bot::mode == bot::Mode::Play) {
-            if (!bot::isSimulatingInput) {
-                return;
-            }
-            GJBaseGameLayer::handleButton(push, button, player1);
             return;
         }
 
@@ -214,17 +233,17 @@ struct BotPlayLayer : Modify<BotPlayLayer, PlayLayer> {
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
         if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
 
-        bot::currentFrame = 0;
+        bot::levelTime = 0.0;
+        bot::currentFrameTime = 0.0;
         bot::macroIndex = 0;
         bot::checkpoints.clear();
-        bot::p1State = bot::ButtonState();
-        bot::p2State = bot::ButtonState();
+        bot::p1State.reset();
+        bot::p2State.reset();
         bot::isSubStepping = false;
-        bot::dualUpdatedInP1 = false;
-        bot::isSimulatingInput = false;
         bot::recSpeed = Mod::get()->getSettingValue<double>("record-speed");
         if (bot::recSpeed < 0.01) bot::recSpeed = 1.0;
-        bot::frameStartTime = std::chrono::steady_clock::now();
+        if (bot::recSpeed > 2.0) bot::recSpeed = 2.0;
+        bot::frameRealStart = std::chrono::steady_clock::now();
 
         if (bot::mode == bot::Mode::Record) {
             CCScheduler::get()->setTimeScale(static_cast<float>(bot::recSpeed));
@@ -236,28 +255,28 @@ struct BotPlayLayer : Modify<BotPlayLayer, PlayLayer> {
 
     void update(float dt) {
         if (!this->m_isPaused) {
-            bot::frameStartTime = std::chrono::steady_clock::now();
+            bot::currentFrameTime = bot::levelTime;
             bot::currentFrameDt = dt;
+            bot::frameRealStart = std::chrono::steady_clock::now();
         }
 
         PlayLayer::update(dt);
 
         if (!this->m_isPaused) {
-            bot::currentFrame++;
+            bot::levelTime += static_cast<double>(dt);
         }
     }
 
     void resetLevel() {
         PlayLayer::resetLevel();
 
-        bot::currentFrame = 0;
+        bot::levelTime = 0.0;
+        bot::currentFrameTime = 0.0;
         bot::macroIndex = 0;
-        bot::p1State = bot::ButtonState();
-        bot::p2State = bot::ButtonState();
+        bot::p1State.reset();
+        bot::p2State.reset();
         bot::isSubStepping = false;
-        bot::dualUpdatedInP1 = false;
-        bot::isSimulatingInput = false;
-        bot::frameStartTime = std::chrono::steady_clock::now();
+        bot::frameRealStart = std::chrono::steady_clock::now();
 
         if (this->m_player1) {
             this->m_player1->releaseButton(PlayerButton::Jump);
@@ -282,7 +301,7 @@ struct BotPlayLayer : Modify<BotPlayLayer, PlayLayer> {
         if (!cp) return cp;
 
         bot::CheckpointData data;
-        data.frame = bot::currentFrame;
+        data.time = bot::levelTime;
         data.macroSize = bot::currentMacro.size();
 
         if (this->m_player1) {
@@ -314,7 +333,8 @@ struct BotPlayLayer : Modify<BotPlayLayer, PlayLayer> {
         if (it == bot::checkpoints.end()) return;
 
         const auto& data = it->second;
-        bot::currentFrame = data.frame;
+        bot::levelTime = data.time;
+        bot::currentFrameTime = data.time;
 
         if (bot::mode == bot::Mode::Record) {
             if (data.macroSize <= bot::currentMacro.size()) {
@@ -344,12 +364,10 @@ struct BotPlayLayer : Modify<BotPlayLayer, PlayLayer> {
             this->m_player2->releaseButton(PlayerButton::Right);
         }
 
-        bot::p1State = bot::ButtonState();
-        bot::p2State = bot::ButtonState();
+        bot::p1State.reset();
+        bot::p2State.reset();
         bot::isSubStepping = false;
-        bot::dualUpdatedInP1 = false;
-        bot::isSimulatingInput = false;
-        bot::frameStartTime = std::chrono::steady_clock::now();
+        bot::frameRealStart = std::chrono::steady_clock::now();
     }
 };
 
@@ -361,30 +379,31 @@ struct BotPlayerObject : Modify<BotPlayerObject, PlayerObject> {
             return;
         }
 
-        if (this == pl->m_player2 && bot::dualUpdatedInP1) {
-            bot::dualUpdatedInP1 = false;
-            return;
-        }
-
         if (this != pl->m_player1) {
             PlayerObject::update(dt);
             return;
         }
 
-        bool isDual = (pl->m_player2 != nullptr && pl->m_player2->isVisible());
-        bot::dualUpdatedInP1 = isDual;
-
         if (bot::mode == bot::Mode::Play) {
+            bool isDual = (pl->m_player2 != nullptr && pl->m_player2->isVisible());
+            double frameStart = bot::currentFrameTime;
+            double frameEnd = frameStart + static_cast<double>(dt);
             double currentFrac = 0.0;
+
             bot::isSubStepping = true;
 
             while (bot::macroIndex < bot::currentMacro.size()) {
                 const auto& act = bot::currentMacro[bot::macroIndex];
-                if (act.step != bot::currentFrame) {
+                if (act.time >= frameEnd) {
                     break;
                 }
 
-                double targetFrac = std::clamp(act.frac, 0.0, 0.999);
+                double targetFrac = 0.0;
+                if (dt > 1e-7) {
+                    targetFrac = (act.time - frameStart) / static_cast<double>(dt);
+                }
+                targetFrac = std::clamp(targetFrac, 0.0, 0.999);
+
                 if (targetFrac > currentFrac) {
                     float subDelta = static_cast<float>((targetFrac - currentFrac) * dt);
                     PlayerObject::update(subDelta);
@@ -394,10 +413,7 @@ struct BotPlayerObject : Modify<BotPlayerObject, PlayerObject> {
                     currentFrac = targetFrac;
                 }
 
-                bot::isSimulatingInput = true;
-                pl->handleButton(act.down, act.btn, act.p1);
-                bot::isSimulatingInput = false;
-
+                bot::applyAction(act, pl);
                 bot::macroIndex++;
             }
 
@@ -412,16 +428,13 @@ struct BotPlayerObject : Modify<BotPlayerObject, PlayerObject> {
         }
 
         PlayerObject::update(dt);
-        if (isDual) {
-            pl->m_player2->update(dt);
-        }
     }
 };
 
 struct BotPauseLayer : Modify<BotPauseLayer, PauseLayer> {
     struct Fields {
         CCLabelBMFont* statusLabel = nullptr;
-        CCLabelBMFont* speedLabel = nullptr;
+        TextInput* speedInput = nullptr;
         CCMenu* botMenu = nullptr;
         CCLayerColor* macroOverlay = nullptr;
     };
@@ -461,25 +474,36 @@ struct BotPauseLayer : Modify<BotPauseLayer, PauseLayer> {
         macrosSpr->setScale(0.55f);
         auto macrosBtn = CCMenuItemSpriteExtra::create(macrosSpr, this, menu_selector(BotPauseLayer::onMacros));
 
-        auto minusSpr = ButtonSprite::create("-", "bigFont.fnt", "GJ_button_01.png", 0.7f);
-        minusSpr->setScale(0.55f);
-        auto minusBtn = CCMenuItemSpriteExtra::create(minusSpr, this, menu_selector(BotPauseLayer::onSpeedMinus));
+        auto spdLabel = CCLabelBMFont::create("SPD:", "goldFont.fnt");
+        spdLabel->setScale(0.5f);
 
-        m_fields->speedLabel = CCLabelBMFont::create(fmt::format("{:.2f}x", bot::recSpeed).c_str(), "bigFont.fnt");
-        m_fields->speedLabel->setScale(0.35f);
-
-        auto plusSpr = ButtonSprite::create("+", "bigFont.fnt", "GJ_button_01.png", 0.7f);
-        plusSpr->setScale(0.55f);
-        auto plusBtn = CCMenuItemSpriteExtra::create(plusSpr, this, menu_selector(BotPauseLayer::onSpeedPlus));
+        m_fields->speedInput = TextInput::create(55.0f, "1.0", "bigFont.fnt");
+        m_fields->speedInput->setScale(0.55f);
+        m_fields->speedInput->setFilter("0123456789.");
+        m_fields->speedInput->setMaxCharCount(4);
+        m_fields->speedInput->setString(fmt::format("{:.2f}", bot::recSpeed));
+        m_fields->speedInput->setCallback([this](std::string const& str) {
+            if (str.empty()) return;
+            try {
+                double val = std::stod(str);
+                if (val >= 0.01 && val <= 2.0) {
+                    bot::recSpeed = val;
+                    Mod::get()->setSettingValue<double>("record-speed", bot::recSpeed);
+                    if (bot::mode == bot::Mode::Record) {
+                        CCScheduler::get()->setTimeScale(static_cast<float>(bot::recSpeed));
+                    }
+                    this->updateLabels();
+                }
+            } catch (...) {}
+        });
 
         m_fields->botMenu->addChild(recBtn);
         m_fields->botMenu->addChild(playBtn);
         m_fields->botMenu->addChild(stopBtn);
         m_fields->botMenu->addChild(clearBtn);
         m_fields->botMenu->addChild(macrosBtn);
-        m_fields->botMenu->addChild(minusBtn);
-        m_fields->botMenu->addChild(m_fields->speedLabel);
-        m_fields->botMenu->addChild(plusBtn);
+        m_fields->botMenu->addChild(spdLabel);
+        m_fields->botMenu->addChild(m_fields->speedInput);
 
         m_fields->botMenu->updateLayout();
         this->addChild(m_fields->botMenu, 100);
@@ -506,24 +530,20 @@ struct BotPauseLayer : Modify<BotPauseLayer, PauseLayer> {
         }
 
         m_fields->statusLabel->setString(
-            fmt::format("MODE: {} | ACTS: {} | FRAME: {} | FILE: {}",
-                modeStr, bot::currentMacro.size(), bot::currentFrame, bot::currentMacroName).c_str()
+            fmt::format("MODE: {} | ACTS: {} | TIME: {:.2f}s | FILE: {}",
+                modeStr, bot::currentMacro.size(), bot::levelTime, bot::currentMacroName).c_str()
         );
         m_fields->statusLabel->setColor(col);
-
-        if (m_fields->speedLabel) {
-            m_fields->speedLabel->setString(fmt::format("{:.2f}x", bot::recSpeed).c_str());
-        }
     }
 
     void onRecord(CCObject*) {
         bot::mode = bot::Mode::Record;
         bot::currentMacro.clear();
-        bot::currentFrame = 0;
+        bot::levelTime = 0.0;
         bot::macroIndex = 0;
-        bot::p1State = bot::ButtonState();
-        bot::p2State = bot::ButtonState();
-        bot::frameStartTime = std::chrono::steady_clock::now();
+        bot::p1State.reset();
+        bot::p2State.reset();
+        bot::frameRealStart = std::chrono::steady_clock::now();
         CCScheduler::get()->setTimeScale(static_cast<float>(bot::recSpeed));
         updateLabels();
     }
@@ -531,9 +551,9 @@ struct BotPauseLayer : Modify<BotPauseLayer, PauseLayer> {
     void onPlay(CCObject*) {
         bot::mode = bot::Mode::Play;
         bot::macroIndex = 0;
-        bot::currentFrame = 0;
-        bot::p1State = bot::ButtonState();
-        bot::p2State = bot::ButtonState();
+        bot::levelTime = 0.0;
+        bot::p1State.reset();
+        bot::p2State.reset();
         CCScheduler::get()->setTimeScale(1.0f);
         updateLabels();
     }
@@ -547,25 +567,7 @@ struct BotPauseLayer : Modify<BotPauseLayer, PauseLayer> {
     void onClear(CCObject*) {
         bot::currentMacro.clear();
         bot::macroIndex = 0;
-        bot::currentFrame = 0;
-        updateLabels();
-    }
-
-    void onSpeedMinus(CCObject*) {
-        bot::recSpeed = std::max(0.1, bot::recSpeed - 0.1);
-        Mod::get()->setSettingValue<double>("record-speed", bot::recSpeed);
-        if (bot::mode == bot::Mode::Record) {
-            CCScheduler::get()->setTimeScale(static_cast<float>(bot::recSpeed));
-        }
-        updateLabels();
-    }
-
-    void onSpeedPlus(CCObject*) {
-        bot::recSpeed = std::min(1.0, bot::recSpeed + 0.1);
-        Mod::get()->setSettingValue<double>("record-speed", bot::recSpeed);
-        if (bot::mode == bot::Mode::Record) {
-            CCScheduler::get()->setTimeScale(static_cast<float>(bot::recSpeed));
-        }
+        bot::levelTime = 0.0;
         updateLabels();
     }
 
