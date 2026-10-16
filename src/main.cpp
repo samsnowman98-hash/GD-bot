@@ -1,5 +1,5 @@
 // CBF-style TAS bot for Geometry Dash 2.2081 / Geode 5.x (Android & Windows)
-// Pixel-Perfect Acheron Precision + 100% Deterministic Physics + Fixed Fast Spam
+// Pixel-Perfect Acheron Precision + Dynamic Speed Normalization + Auto 1x Reset
 
 #include <Geode/Geode.hpp>
 #include <Geode/modify/PlayLayer.hpp>
@@ -132,12 +132,6 @@ namespace bot {
             pl->m_clickBetweenSteps = gm->getGameVariable("0177");
             pl->m_clickOnSteps = gm->getGameVariable("0176");
         }
-    }
-
-    inline void setMode(Mode m) {
-        mode = m;
-        applyClickFlags();
-        resetEngine();
     }
 
     inline void setTimeScale(float s) {
@@ -382,8 +376,8 @@ namespace bot {
         if (mode == Mode::Off) return;
 
         if (idle) {
+            // При паузе синхронизируем якорь времени, НЕ сбрасывая physicsAccumulator!
             lastFrameTime = currentFrameTime;
-            physicsAccumulator = 0.0;
             inputVector.clear();
         }
     }
@@ -399,17 +393,24 @@ namespace bot {
         p->m_lastCollisionBottom = -1;
         p->m_lastCollisionTop = -1;
     }
+
+    inline void setMode(Mode m) {
+        mode = m;
+        applyClickFlags();
+        resetEngine();
+    }
 }
 
 // ---------------------------------------------------------------------------
-// Scheduler
+// Scheduler: детерминированный шаг кадра под герцовку экрана
 // ---------------------------------------------------------------------------
 class $modify(BotScheduler, CCScheduler) {
     void update(float dt) {
         bot::onFrameStart();
         if (bot::mode != bot::Mode::Off) {
-            float fixedDt = 1.0f / 60.0f;
-            CCScheduler::update(fixedDt);
+            float interval = CCDirector::sharedDirector()->getAnimationInterval();
+            if (interval <= 0.0f) interval = 1.0f / 60.0f;
+            CCScheduler::update(interval);
         } else {
             CCScheduler::update(dt);
         }
@@ -472,7 +473,7 @@ class $modify(BotBaseGameLayer, GJBaseGameLayer) {
 };
 
 // ---------------------------------------------------------------------------
-// Нарезка подшагов строго во время физического шага (100% точность)
+// Нарезка шага с зеркальной физикой Record / Play и вращением корабля
 // ---------------------------------------------------------------------------
 class $modify(BotPlayerObject, PlayerObject) {
     void update(float stepDelta) {
@@ -565,23 +566,19 @@ class $modify(BotPlayerObject, PlayerObject) {
         bool p1StartedOnGround = this->m_isOnGround;
         bool p2StartedOnGround = p2 && p2->m_isOnGround;
 
-        if (mode == Mode::Play) {
-            p1Split = true;
-            p2Split = isDual;
-        } else {
-            bool p1NotBuffering = p1StartedOnGround
-                || this->m_touchingRings->count()
-                || this->m_isDashing
-                || (this->m_isDart || this->m_isBird || this->m_isShip || this->m_isSwing);
+        // Зеркальное условие сплита для Record и Play (исключает рассинхрон)
+        bool p1NotBuffering = p1StartedOnGround
+            || this->m_touchingRings->count()
+            || this->m_isDashing
+            || (this->m_isDart || this->m_isBird || this->m_isShip || this->m_isSwing);
 
-            bool p2NotBuffering = p2 && (p2StartedOnGround
-                || p2->m_touchingRings->count()
-                || p2->m_isDashing
-                || (p2->m_isDart || p2->m_isBird || p2->m_isShip || p2->m_isSwing));
+        bool p2NotBuffering = p2 && (p2StartedOnGround
+            || p2->m_touchingRings->count()
+            || p2->m_isDashing
+            || (p2->m_isDart || p2->m_isBird || p2->m_isShip || p2->m_isSwing));
 
-            p1Split = p1NotBuffering;
-            p2Split = p2NotBuffering && isDual;
-        }
+        p1Split = p1NotBuffering;
+        p2Split = p2NotBuffering && isDual;
 
         p1Pos = PlayerObject::getPosition();
         if (p2) p2Pos = p2->getPosition();
@@ -625,6 +622,7 @@ class $modify(BotPlayerObject, PlayerObject) {
                     }
                     if (!this->m_isOnSlope || this->m_isDart) pl->checkCollisions(this, 0.0f, true);
                     else pl->checkCollisions(this, substepDelta, true);
+                    PlayerObject::updateRotation(substepDelta); // Поворот хитбокса корабля на каждом подшаге
                     bot::resetCollisionLog(this);
                 }
             }
@@ -639,6 +637,7 @@ class $modify(BotPlayerObject, PlayerObject) {
                         }
                         if (!p2->m_isOnSlope || p2->m_isDart) pl->checkCollisions(p2, 0.0f, true);
                         else pl->checkCollisions(p2, substepDelta, true);
+                        p2->updateRotation(substepDelta);
                         bot::resetCollisionLog(p2);
                     }
                 }
@@ -744,7 +743,6 @@ class $modify(BotPlayLayer, PlayLayer) {
         auto const& data = it->second;
         bot::step = data.step;
 
-        // 1. ИДЕАЛЬНОЕ СКЛЕИВАНИЕ МАКРОСА
         if (bot::mode == bot::Mode::Record) {
             if (data.macroSize <= bot::macro.size()) {
                 bot::macro.erase(bot::macro.begin() + data.macroSize, bot::macro.end());
@@ -760,7 +758,6 @@ class $modify(BotPlayLayer, PlayLayer) {
             bot::syncPlayback(this);
         }
 
-        // 2. ВОССТАНОВЛЕНИЕ ЗАЖАТИЙ КНОПОК
         ++bot::silent;
         for (int b = 1; b <= 3; ++b) {
             bot::currentHeld[b][0] = data.held[b][0];
@@ -770,19 +767,16 @@ class $modify(BotPlayLayer, PlayLayer) {
         }
         --bot::silent;
 
-        // 3. УСТРАНЕНИЕ ЛАГА ВОЗРОЖДЕНИЯ
         bot::lastFrameTime = bot::getCurrentTimestamp();
-        bot::physicsAccumulator = 0.0;
         bot::inputVector.clear();
         this->m_queuedButtons.clear();
 
-        // 4. ДЕТЕРМИНИЗМ РАНДОМА
         srand(1337 + data.step);
     }
 };
 
 // ---------------------------------------------------------------------------
-// Меню паузы
+// Меню паузы с автосбросом скорости на 1х
 // ---------------------------------------------------------------------------
 class $modify(BotPauseLayer, PauseLayer) {
     struct Fields {
@@ -791,6 +785,7 @@ class $modify(BotPauseLayer, PauseLayer) {
         ButtonSprite* m_offSprite = nullptr;
         ButtonSprite* m_recSprite = nullptr;
         ButtonSprite* m_playSprite = nullptr;
+        TextInput* m_speedInput = nullptr;
     };
 
     void updateStatusUI() {
@@ -941,9 +936,14 @@ class $modify(BotPauseLayer, PauseLayer) {
                 Notification::create("No macro!", NotificationIcon::Warning)->show();
                 return;
             }
+            // Пожелание 1: Воспроизведение ВСЕГДА на обычной скорости 1x
+            bot::recSpeed = 1.0;
+            bot::setTimeScale(1.0f);
+            if (m_fields->m_speedInput) m_fields->m_speedInput->setString("1.00");
+
             bot::setMode(bot::Mode::Play);
             this->updateStatusUI();
-            Notification::create("Playing...", NotificationIcon::Success)->show();
+            Notification::create("Playing at 1.0x...", NotificationIcon::Success)->show();
             this->onRestart(nullptr);
         });
         playBtn->setPosition(panelW * 0.8f, panelH - 58.0f);
@@ -965,6 +965,7 @@ class $modify(BotPauseLayer, PauseLayer) {
             bot::recSpeed = bot::parseSpeedString(str);
         });
         speedInput->setString(fmt::format("{}", bot::recSpeed));
+        m_fields->m_speedInput = speedInput;
         panelBg->addChild(speedInput);
 
         auto saveMenu = CCMenu::create();
@@ -989,8 +990,14 @@ class $modify(BotPauseLayer, PauseLayer) {
                 tmStruct.tm_hour, tmStruct.tm_min, tmStruct.tm_sec
             );
             if (bot::saveMacro(bot::getMacroDir() / filename, bot::macro)) {
+                // Пожелание 1: После сохранения скорость ВСЕГДА сбрасывается на 1.0x
+                bot::recSpeed = 1.0;
+                bot::setTimeScale(1.0f);
+                if (m_fields->m_speedInput) m_fields->m_speedInput->setString("1.00");
+
                 this->refreshMacroList();
-                Notification::create("Saved macro", NotificationIcon::Success)->show();
+                this->updateStatusUI();
+                Notification::create("Saved & speed reset to 1.0x", NotificationIcon::Success)->show();
             }
             else {
                 Notification::create("Save failed", NotificationIcon::Error)->show();
