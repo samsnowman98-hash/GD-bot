@@ -51,7 +51,6 @@ namespace bot {
         bool endStep = true;
     };
 
-    // Полный слепок состояния игрока для идеального респавна на кораблике
     struct CheckpointData {
         uint32_t step = 0;
         size_t macroSize = 0;
@@ -64,8 +63,6 @@ namespace bot {
         double p2YVel = 0.0;
         float p1Rot = 0.f;
         float p2Rot = 0.f;
-        bool p1Holding = false;
-        bool p2Holding = false;
         bool p1UpsideDown = false;
         bool p2UpsideDown = false;
         double physicsAccumulator = 0.0;
@@ -297,7 +294,6 @@ namespace bot {
         --silent;
     }
 
-    // Теоретически точное распределение кликов по физической шкале 240 TPS
     inline void buildStepQueue(int stepCount) {
         double stepDeltaTime = (1.0 / 240.0) / std::max(0.0001, recSpeed);
         size_t inputIdx = 0;
@@ -695,7 +691,6 @@ class $modify(BotPlayerObject, PlayerObject) {
 // ---------------------------------------------------------------------------
 class $modify(BotPlayLayer, PlayLayer) {
     void visit() {
-        // Визуальная экстраполяция активна только на замедлении
         if (bot::mode == bot::Mode::Record && bot::recSpeed < 0.95 && !bot::zeroFrame && this->m_player1 && !this->m_playerDied) {
             double now = bot::getCurrentTimestamp();
             double expectedStepReal = (1.0 / 240.0) / std::max(0.0001, bot::recSpeed);
@@ -704,26 +699,23 @@ class $modify(BotPlayLayer, PlayLayer) {
 
             auto p1 = this->m_player1;
             cocos2d::CCPoint origPos1 = p1->getPosition();
-            cocos2d::CCPoint offset1 = {
-                static_cast<float>(p1->m_xVelocity * (1.0 / 240.0) * alpha),
-                static_cast<float>(p1->m_yVelocity * (1.0 / 240.0) * alpha)
-            };
+            float dx1 = origPos1.x - p1->m_lastPosition.x;
+            float dy1 = static_cast<float>(p1->m_yVelocity * (1.0 / 240.0));
+            cocos2d::CCPoint offset1 = { dx1 * alpha, dy1 * alpha };
             p1->setPosition(origPos1 + offset1);
 
             cocos2d::CCPoint origPos2 = {0.f, 0.f};
             auto p2 = this->m_player2;
             if (p2) {
                 origPos2 = p2->getPosition();
-                cocos2d::CCPoint offset2 = {
-                    static_cast<float>(p2->m_xVelocity * (1.0 / 240.0) * alpha),
-                    static_cast<float>(p2->m_yVelocity * (1.0 / 240.0) * alpha)
-                };
+                float dx2 = origPos2.x - p2->m_lastPosition.x;
+                float dy2 = static_cast<float>(p2->m_yVelocity * (1.0 / 240.0));
+                cocos2d::CCPoint offset2 = { dx2 * alpha, dy2 * alpha };
                 p2->setPosition(origPos2 + offset2);
             }
 
-            PlayLayer::visit(); // Отрисовываем мягкий сглаженный кадр
+            PlayLayer::visit();
 
-            // МГНОВЕННО восстанавливаем реальные координаты физики!
             p1->setPosition(origPos1);
             if (p2) p2->setPosition(origPos2);
             return;
@@ -777,7 +769,6 @@ class $modify(BotPlayLayer, PlayLayer) {
             data.p1LastPos = p1->m_lastPosition;
             data.p1YVel = p1->m_yVelocity;
             data.p1Rot = p1->getRotation();
-            data.p1Holding = p1->m_isHolding;
             data.p1UpsideDown = p1->m_isUpsideDown;
 
             if (this->m_player2) {
@@ -786,7 +777,6 @@ class $modify(BotPlayLayer, PlayLayer) {
                 data.p2LastPos = p2->m_lastPosition;
                 data.p2YVel = p2->m_yVelocity;
                 data.p2Rot = p2->getRotation();
-                data.p2Holding = p2->m_isHolding;
                 data.p2UpsideDown = p2->m_isUpsideDown;
             }
             data.physicsAccumulator = bot::physicsAccumulator;
@@ -836,7 +826,6 @@ class $modify(BotPlayLayer, PlayLayer) {
             this->m_player1->m_lastPosition = data.p1LastPos;
             this->m_player1->m_yVelocity = data.p1YVel;
             this->m_player1->setRotation(data.p1Rot);
-            this->m_player1->m_isHolding = data.p1Holding;
             this->m_player1->m_isUpsideDown = data.p1UpsideDown;
             bot::p1Pos = data.p1Pos;
             bot::resetCollisionLog(this->m_player1);
@@ -846,7 +835,6 @@ class $modify(BotPlayLayer, PlayLayer) {
             this->m_player2->m_lastPosition = data.p2LastPos;
             this->m_player2->m_yVelocity = data.p2YVel;
             this->m_player2->setRotation(data.p2Rot);
-            this->m_player2->m_isHolding = data.p2Holding;
             this->m_player2->m_isUpsideDown = data.p2UpsideDown;
             bot::p2Pos = data.p2Pos;
             bot::resetCollisionLog(this->m_player2);
@@ -1035,7 +1023,6 @@ class $modify(BotPauseLayer, PauseLayer) {
                 Notification::create("No macro!", NotificationIcon::Warning)->show();
                 return;
             }
-            // Сброс на 1х скорость при воспроизведении
             bot::recSpeed = 1.0;
             bot::setTimeScale(1.0f);
             if (m_fields->m_speedInput) m_fields->m_speedInput->setString("1.00");
@@ -1089,7 +1076,6 @@ class $modify(BotPauseLayer, PauseLayer) {
                 tmStruct.tm_hour, tmStruct.tm_min, tmStruct.tm_sec
             );
             if (bot::saveMacro(bot::getMacroDir() / filename, bot::macro)) {
-                // Автосброс скорости на 1х после сохранения
                 bot::recSpeed = 1.0;
                 bot::setTimeScale(1.0f);
                 if (m_fields->m_speedInput) m_fields->m_speedInput->setString("1.00");
