@@ -57,12 +57,10 @@ struct CheckpointData {
     CCPoint p1Pos;
     double p1YVel = 0.0;
     float p1Rot = 0.0f;
-    bool p1CanJump = true;
     bool p1OnGround = true;
     CCPoint p2Pos;
     double p2YVel = 0.0;
     float p2Rot = 0.0f;
-    bool p2CanJump = true;
     bool p2OnGround = true;
 };
 
@@ -451,8 +449,7 @@ class $modify(BotPlayerObject, PlayerObject) {
 
             PlayerObject::update(static_cast<float>(thisDelta));
 
-            if (pl->m_player1) pl->checkCollisions(pl->m_player1, 0.0f, true);
-            if (pl->m_player2 && pl->m_isDualMode) pl->checkCollisions(pl->m_player2, 0.0f, true);
+            pl->checkCollisions(this, 0.0f, isP1);
 
             bot::resetCollisionLog(this);
 
@@ -470,9 +467,10 @@ class $modify(BotPlayerObject, PlayerObject) {
         if (isP1) bot::p1Split = false;
         if (isP2) bot::p2Split = false;
 
-        if (!pl->m_isDualMode && isP1) {
+        bool isDual = (pl->m_player2 != nullptr && pl->m_player2->isVisible());
+        if (!isDual && isP1) {
             bot::g.step++;
-        } else if (pl->m_isDualMode && isP2) {
+        } else if (isDual && isP2) {
             bot::g.step++;
         }
     }
@@ -542,14 +540,12 @@ class $modify(BotPlayLayer, PlayLayer) {
                 data.p1Pos = this->m_player1->getPosition();
                 data.p1YVel = this->m_player1->m_yVelocity;
                 data.p1Rot = this->m_player1->getRotation();
-                data.p1CanJump = this->m_player1->m_canJump;
                 data.p1OnGround = this->m_player1->m_isOnGround;
             }
             if (this->m_player2) {
                 data.p2Pos = this->m_player2->getPosition();
                 data.p2YVel = this->m_player2->m_yVelocity;
                 data.p2Rot = this->m_player2->getRotation();
-                data.p2CanJump = this->m_player2->m_canJump;
                 data.p2OnGround = this->m_player2->m_isOnGround;
             }
             bot::g.checkpoints[cp] = data;
@@ -584,14 +580,12 @@ class $modify(BotPlayLayer, PlayLayer) {
             this->m_player1->setPosition(data.p1Pos);
             this->m_player1->m_yVelocity = data.p1YVel;
             this->m_player1->setRotation(data.p1Rot);
-            this->m_player1->m_canJump = data.p1CanJump;
             this->m_player1->m_isOnGround = data.p1OnGround;
         }
         if (this->m_player2) {
             this->m_player2->setPosition(data.p2Pos);
             this->m_player2->m_yVelocity = data.p2YVel;
             this->m_player2->setRotation(data.p2Rot);
-            this->m_player2->m_canJump = data.p2CanJump;
             this->m_player2->m_isOnGround = data.p2OnGround;
         }
 
@@ -853,12 +847,14 @@ class $modify(BotPauseLayer, PauseLayer) {
     void onSpeedDown(CCObject*) {
         bot::recSpeed -= 0.1;
         if (bot::recSpeed < 0.05) bot::recSpeed = 0.05;
+        (void)Mod::get()->setSettingValue<double>("record-speed", bot::recSpeed);
         this->updateBotLabel();
     }
 
     void onSpeedUp(CCObject*) {
         bot::recSpeed += 0.1;
         if (bot::recSpeed > 1.0) bot::recSpeed = 1.0;
+        (void)Mod::get()->setSettingValue<double>("record-speed", bot::recSpeed);
         this->updateBotLabel();
     }
 
