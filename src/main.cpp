@@ -14,7 +14,6 @@
 #include <Geode/ui/Notification.hpp>
 #include <Geode/ui/ScrollLayer.hpp>
 #include <Geode/loader/Mod.hpp>
-#include <Geode/loader/SettingEvent.hpp>
 
 #include <chrono>
 #include <deque>
@@ -505,7 +504,7 @@ class $modify(BotPlayLayer, PlayLayer) {
         bool ret = PlayLayer::init(level, useReplay, dontCreateObjects);
         if (!ret) return false;
 
-        bot::g.levelID = level ? level->m_levelID.value() : 0;
+        bot::g.levelID = level ? static_cast<int>(level->m_levelID) : 0;
         bot::g.levelName = level ? std::string(level->m_levelName.c_str()) : std::string("unknown");
         std::string hashSource = fmt::format("{}_{}", bot::g.levelName, level ? level->m_levelString.size() : 0);
         bot::g.levelHash = std::hash<std::string>{}(hashSource);
@@ -902,7 +901,4 @@ class $modify(BotPauseLayer, PauseLayer) {
 
 $on_mod(Loaded) {
     bot::recSpeed = Mod::get()->getSettingValue<double>("record-speed");
-    listenForSettingChanges<double>("record-speed", [](double value) {
-        bot::recSpeed = value;
-    });
 }
