@@ -605,7 +605,7 @@ class $modify(BotPlayLayer, PlayLayer) {
         bot::resetEngine();
         if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
 
-        if (auto cbf = Loader::get()->getLoadedMod("syzzi.click_between_frames"); cbf && cbf->isEnabled()) {
+        if (Loader::get()->isModLoaded("syzzi.click_between_frames")) {
             Notification::create("Disable Click Between Frames mod: it conflicts with the bot", NotificationIcon::Warning, 4.f)->show();
         }
         return true;
