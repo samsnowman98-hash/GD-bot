@@ -32,14 +32,14 @@ using namespace geode::prelude;
 
 namespace bot {
 
-    constexpr uint32_t kMagic = 0x33544F42; // Сигнатура файла "BOT3"
+    constexpr uint32_t kMagic = 0x33544F42; // Сигнатура "BOT3"
 
     enum class Mode { Off, Record, Play };
 
     struct Action {
-        uint64_t id = 0;         // Монотонный ID для сохранения строгого порядка Press/Release
+        uint64_t id = 0;         // Монотонный ID для строгого порядка Press/Release
         uint32_t step = 0;       // Номер 240Hz физического тика
-        double frac = 0.0;       // Непрерывное наносекундное смещение [0.0, 1.0) внутри тика
+        double frac = 0.0;       // Наносекундное смещение [0.0, 1.0) внутри тика
         uint8_t button = 1;      // 1 = Jump, 2 = Left, 3 = Right
         bool down = false;       // true = Press, false = Release
         bool p1 = true;          // true = Player 1, false = Player 2
@@ -47,7 +47,7 @@ namespace bot {
         bool operator<(Action const& o) const {
             if (step != o.step) return step < o.step;
             if (std::abs(frac - o.frac) > 1e-9) return frac < o.frac;
-            return id < o.id;   // При равном frac строгий порядок кликов НЕ нарушается
+            return id < o.id;   // При равном времени порядок поступления кликов не нарушается
         }
     };
 
@@ -149,7 +149,7 @@ namespace bot {
         return dir;
     }
 
-    // Полное аппаратное и программное снятие зажатий (защита от залипаний)
+    // Кроссплатформенный безопасный сброс зажатий (Android NDK + Windows)
     inline void forceReleaseEverything(PlayLayer* pl) {
         if (!pl) return;
         ++silent;
@@ -158,16 +158,6 @@ namespace bot {
             pl->handleButton(false, b, false);
             currentHeld[b][0] = false;
             currentHeld[b][1] = false;
-        }
-        if (pl->m_player1) {
-            pl->m_player1->m_isHolding = false;
-            pl->m_player1->m_hasJustHeld = false;
-            pl->m_player1->m_jumpBuffered = false;
-        }
-        if (pl->m_player2) {
-            pl->m_player2->m_isHolding = false;
-            pl->m_player2->m_hasJustHeld = false;
-            pl->m_player2->m_jumpBuffered = false;
         }
         pl->m_queuedButtons.clear();
         --silent;
@@ -262,7 +252,7 @@ namespace bot {
 }
 
 // ---------------------------------------------------------------------------
-// Перехват ввода (Вычисление CBF смещения с точностью до наносекунд)
+// Перехват ввода (Вычисление CBF смещения с наносекундной точностью)
 // ---------------------------------------------------------------------------
 class $modify(BotBaseGameLayer, GJBaseGameLayer) {
     void handleButton(bool down, int button, bool isPlayer1) {
@@ -291,10 +281,8 @@ class $modify(BotBaseGameLayer, GJBaseGameLayer) {
             double now = getHighPrecisionTimestamp();
             float timewarp = (pl ? pl->m_gameState.m_timeWarp : 1.0f);
             if (timewarp <= 0.0001f) timewarp = 1.0f;
-            
-            // Физическая длительность тика с учетом реального масштабирования
-            double stepDuration = (1.0 / 240.0) * timewarp / std::max(0.0001, recSpeed);
 
+            double stepDuration = (1.0 / 240.0) * timewarp / std::max(0.0001, recSpeed);
             double elapsed = now - stepStartTimestamp;
             double frac = 0.0;
             if (stepDuration > 0.0) {
@@ -304,7 +292,7 @@ class $modify(BotBaseGameLayer, GJBaseGameLayer) {
             Action a;
             a.id = ++actionCounter;
             a.step = step;
-            a.frac = frac; // Абсолютная математическая точность без TPS-округлений
+            a.frac = frac; // Абсолютная суб-тиковая точность без TPS-округления
             a.button = static_cast<uint8_t>(button);
             a.down = down;
             a.p1 = isPlayer1;
@@ -315,7 +303,6 @@ class $modify(BotBaseGameLayer, GJBaseGameLayer) {
     }
 
     void processCommands(float dt, bool isHalfTick, bool isLastTick) {
-        // Очистка очереди РобТопа от случайных кликов во время воспроизведения
         if (bot::mode == bot::Mode::Play && bot::isPlayLayer(this)) {
             this->m_queuedButtons.clear();
         }
@@ -324,7 +311,7 @@ class $modify(BotBaseGameLayer, GJBaseGameLayer) {
 };
 
 // ---------------------------------------------------------------------------
-// Суб-тиковая нарезка физики с компенсацией накопления погрешности
+// Суб-тиковая нарезка физики
 // ---------------------------------------------------------------------------
 class $modify(BotPlayerObject, PlayerObject) {
     void update(float dt) {
@@ -343,7 +330,7 @@ class $modify(BotPlayerObject, PlayerObject) {
             return;
         }
 
-        // P1 ВСЕГДА начинает новый 240Hz шаг физики, P2 следует в том же шаге
+        // P1 всегда начинает шаг тика, P2 идет следом в том же шаге
         if (isP1) {
             ++step;
             stepStartTimestamp = getHighPrecisionTimestamp();
@@ -356,7 +343,7 @@ class $modify(BotPlayerObject, PlayerObject) {
             return;
         }
 
-        // ---- Режим PLAY: Нарезка суб-тиков с точностью до микросекунд ----
+        // ---- Режим PLAY: суб-тиковое деление шага ----
         auto it = std::lower_bound(
             macro.begin(), macro.end(), curStep,
             [](Action const& a, uint32_t s) { return a.step < s; }
@@ -394,12 +381,11 @@ class $modify(BotPlayerObject, PlayerObject) {
                 PlayerObject::update(static_cast<float>(subStepDouble));
             }
 
-            // Переключение состояния ввода в идеальную долю времени
             pl->handleButton(act.down, act.button, act.p1);
             accumulatedFrac = currentFrac;
         }
 
-        // Математически точный остаток шага (исключает дрифт float)
+        // Доигрывание остатка времени шага (компенсация float)
         double remainingDouble = totalStepDuration - spentDtDouble;
         if (remainingDouble > 1e-9) {
             PlayerObject::update(static_cast<float>(remainingDouble));
@@ -411,11 +397,10 @@ class $modify(BotPlayerObject, PlayerObject) {
 };
 
 // ---------------------------------------------------------------------------
-// Контроль уровня, чекпоинты и визуальная интерполяция
+// Контроль уровня и чекпоинтов
 // ---------------------------------------------------------------------------
 class $modify(BotPlayLayer, PlayLayer) {
     void visit() {
-        // Визуальная интерполяция позиции для плавности экрана при медленной записи
         if (bot::mode == bot::Mode::Record && bot::recSpeed < 0.95 && this->m_player1 && !this->m_playerDied && !this->m_isPaused) {
             double now = bot::getHighPrecisionTimestamp();
             float timewarp = this->m_gameState.m_timeWarp <= 0.0001f ? 1.0f : this->m_gameState.m_timeWarp;
@@ -572,7 +557,7 @@ class $modify(BotPlayLayer, PlayLayer) {
 };
 
 // ---------------------------------------------------------------------------
-// GUI Меню паузы
+// GUI в PauseLayer
 // ---------------------------------------------------------------------------
 class $modify(BotPauseLayer, PauseLayer) {
     struct Fields {
