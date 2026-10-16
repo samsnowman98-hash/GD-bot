@@ -1,5 +1,5 @@
 // CBF-style TAS bot for Geometry Dash 2.2081 / Geode 5.x (Android & Windows)
-// Pixel-Perfect Sub-Tick Precision (<= 10 microseconds) + Anti-Stuck Key Engine
+// Continuous Frame Projection Engine — Zero TPS Snapping / Absolute CBF Accuracy
 
 #ifdef GEODE_IS_WINDOWS
     #define NOMINMAX
@@ -32,14 +32,14 @@ using namespace geode::prelude;
 
 namespace bot {
 
-    constexpr uint32_t kMagic = 0x33544F42; // Сигнатура "BOT3"
+    constexpr uint32_t kMagic = 0x34544F42; // Сигнатура "BOT4"
 
     enum class Mode { Off, Record, Play };
 
     struct Action {
-        uint64_t id = 0;         // Монотонный ID для строгого порядка Press/Release
+        uint64_t id = 0;         // Строгий монотонный идентификатор
         uint32_t step = 0;       // Номер 240Hz физического тика
-        double frac = 0.0;       // Наносекундное смещение [0.0, 1.0) внутри тика
+        double frac = 0.0;       // Плавное наносекундное смещение [0.0, 1.0)
         uint8_t button = 1;      // 1 = Jump, 2 = Left, 3 = Right
         bool down = false;       // true = Press, false = Release
         bool p1 = true;          // true = Player 1, false = Player 2
@@ -47,7 +47,7 @@ namespace bot {
         bool operator<(Action const& o) const {
             if (step != o.step) return step < o.step;
             if (std::abs(frac - o.frac) > 1e-9) return frac < o.frac;
-            return id < o.id;   // При равном времени порядок поступления кликов не нарушается
+            return id < o.id;   // Сохраняет строгую последовательность Press -> Release
         }
     };
 
@@ -80,28 +80,19 @@ namespace bot {
 
     inline double recSpeed = 1.0;
     inline float appliedScale = 1.0f;
-    inline double stepStartTimestamp = 0.0;
+
+    // Временные границы текущего и предыдущего кадров
+    inline double lastFrameRealTime = 0.0;
+    inline double currentFrameRealTime = 0.0;
+    inline double physicsAccumulator = 0.0;
 
     inline bool currentHeld[4][2] = {};
     inline std::unordered_map<CheckpointObject*, CheckpointData> checkpoints;
 
-    // Высокоточный аппаратный таймер (наносекундный уровень)
+    // Высокоточный таймер
     inline double getHighPrecisionTimestamp() {
-#ifdef GEODE_IS_WINDOWS
-        static LARGE_INTEGER freq;
-        static bool init = false;
-        if (!init) {
-            QueryPerformanceFrequency(&freq);
-            init = true;
-        }
-        LARGE_INTEGER counter;
-        QueryPerformanceCounter(&counter);
-        return static_cast<double>(counter.QuadPart) / static_cast<double>(freq.QuadPart);
-#else
-        struct timespec ts;
-        clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
-        return static_cast<double>(ts.tv_sec) + static_cast<double>(ts.tv_nsec) * 1e-9;
-#endif
+        using namespace std::chrono;
+        return duration<double>(steady_clock::now().time_since_epoch()).count();
     }
 
     inline bool isPlayLayer(GJBaseGameLayer* l) {
@@ -149,7 +140,6 @@ namespace bot {
         return dir;
     }
 
-    // Кроссплатформенный безопасный сброс зажатий (Android NDK + Windows)
     inline void forceReleaseEverything(PlayLayer* pl) {
         if (!pl) return;
         ++silent;
@@ -252,66 +242,94 @@ namespace bot {
 }
 
 // ---------------------------------------------------------------------------
-// Перехват ввода (Вычисление CBF смещения с наносекундной точностью)
+// Захват кликов без прилипания к TPS через аппаратные очереди
 // ---------------------------------------------------------------------------
 class $modify(BotBaseGameLayer, GJBaseGameLayer) {
     void handleButton(bool down, int button, bool isPlayer1) {
-        using namespace bot;
-
         if (button <= 3) {
-            currentHeld[button][isPlayer1 ? 0 : 1] = down;
+            bot::currentHeld[button][isPlayer1 ? 0 : 1] = down;
         }
 
-        if (mode == Mode::Off || silent > 0 || !isPlayLayer(this)) {
+        if (bot::mode == bot::Mode::Off || bot::silent > 0 || !bot::isPlayLayer(this)) {
             GJBaseGameLayer::handleButton(down, button, isPlayer1);
             return;
         }
 
-        if (mode == Mode::Play) {
-            if (isPlayingBack) {
+        if (bot::mode == bot::Mode::Play) {
+            if (bot::isPlayingBack) {
                 GJBaseGameLayer::handleButton(down, button, isPlayer1);
             }
-            return; // Внешний физический ввод блокируется при воспроизведении
+            return;
         }
 
-        if (mode == Mode::Record) {
-            auto pl = PlayLayer::get();
-            if (pl && (pl->m_playerDied || pl->m_isPaused)) return;
-
-            double now = getHighPrecisionTimestamp();
-            float timewarp = (pl ? pl->m_gameState.m_timeWarp : 1.0f);
-            if (timewarp <= 0.0001f) timewarp = 1.0f;
-
-            double stepDuration = (1.0 / 240.0) * timewarp / std::max(0.0001, recSpeed);
-            double elapsed = now - stepStartTimestamp;
-            double frac = 0.0;
-            if (stepDuration > 0.0) {
-                frac = std::clamp(elapsed / stepDuration, 0.0, 0.999999999);
-            }
-
-            Action a;
-            a.id = ++actionCounter;
-            a.step = step;
-            a.frac = frac; // Абсолютная суб-тиковая точность без TPS-округления
-            a.button = static_cast<uint8_t>(button);
-            a.down = down;
-            a.p1 = isPlayer1;
-
-            macro.push_back(a);
-            GJBaseGameLayer::handleButton(down, button, isPlayer1);
-        }
+        // В Record режиме прямой handleButton пропускается в движок,
+        // а запись в макрос производится в processCommands с точным frac!
+        GJBaseGameLayer::handleButton(down, button, isPlayer1);
     }
 
     void processCommands(float dt, bool isHalfTick, bool isLastTick) {
-        if (bot::mode == bot::Mode::Play && bot::isPlayLayer(this)) {
-            this->m_queuedButtons.clear();
+        using namespace bot;
+
+        if (!isPlayLayer(this)) {
+            GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
+            return;
         }
+
+        // Блокировка случайных внешних кликов во время воспроизведения
+        if (mode == Mode::Play) {
+            this->m_queuedButtons.clear();
+            GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
+            return;
+        }
+
+        // В режиме записи считываем оригинальные аппаратные таймстампы кликов
+        if (mode == Mode::Record && !this->m_queuedButtons.empty()) {
+            double const now = currentFrameRealTime;
+            double frameDuration = now - lastFrameRealTime;
+            if (frameDuration <= 1e-9) frameDuration = (1.0 / 60.0);
+
+            float timewarp = this->m_gameState.m_timeWarp <= 0.0001f ? 1.0f : this->m_gameState.m_timeWarp;
+            double const stepDuration = (1.0 / 240.0) * timewarp;
+
+            // Расчет числа физических шагов в текущем кадре
+            int stepsThisFrame = std::max(1, static_cast<int>(std::round(dt / stepDuration)));
+
+            for (auto const& cmd : this->m_queuedButtons) {
+                double clickTime = cmd.m_timestamp;
+
+                // Нормализация таймстампа с учетом ОС и разных шкал времени
+                if (clickTime > now + 1000.0) clickTime /= 1000.0;
+                if (clickTime > now + 1000000.0) clickTime /= 1000000.0;
+                if (clickTime < lastFrameRealTime - 1.0 || clickTime > now + 0.1) {
+                    clickTime = now;
+                }
+
+                // Непрерывная проекция клика внутрь кадра
+                double progress = std::clamp((clickTime - lastFrameRealTime) / frameDuration, 0.0, 0.999999);
+                double continuousStep = static_cast<double>(step) + progress * static_cast<double>(stepsThisFrame);
+
+                uint32_t targetStep = static_cast<uint32_t>(continuousStep);
+                double targetFrac = continuousStep - static_cast<double>(targetStep);
+                targetFrac = std::clamp(targetFrac, 0.0, 0.999999999);
+
+                Action a;
+                a.id = ++actionCounter;
+                a.step = targetStep;
+                a.frac = targetFrac; // Плавное математическое распределение (без TPS snapping!)
+                a.button = static_cast<uint8_t>(cmd.m_button);
+                a.down = cmd.m_isPush;
+                a.p1 = !cmd.m_isPlayer2;
+
+                macro.push_back(a);
+            }
+        }
+
         GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
     }
 };
 
 // ---------------------------------------------------------------------------
-// Суб-тиковая нарезка физики
+// Суб-тиковая физика и продвижение шагов
 // ---------------------------------------------------------------------------
 class $modify(BotPlayerObject, PlayerObject) {
     void update(float dt) {
@@ -330,10 +348,8 @@ class $modify(BotPlayerObject, PlayerObject) {
             return;
         }
 
-        // P1 всегда начинает шаг тика, P2 идет следом в том же шаге
         if (isP1) {
             ++step;
-            stepStartTimestamp = getHighPrecisionTimestamp();
         }
 
         uint32_t const curStep = step;
@@ -343,7 +359,7 @@ class $modify(BotPlayerObject, PlayerObject) {
             return;
         }
 
-        // ---- Режим PLAY: суб-тиковое деление шага ----
+        // ---- Воспроизведение (Play) с непрерывной нарезкой шага ----
         auto it = std::lower_bound(
             macro.begin(), macro.end(), curStep,
             [](Action const& a, uint32_t s) { return a.step < s; }
@@ -381,11 +397,11 @@ class $modify(BotPlayerObject, PlayerObject) {
                 PlayerObject::update(static_cast<float>(subStepDouble));
             }
 
+            // Клик применяется ровно на расчетной микросекунде
             pl->handleButton(act.down, act.button, act.p1);
             accumulatedFrac = currentFrac;
         }
 
-        // Доигрывание остатка времени шага (компенсация float)
         double remainingDouble = totalStepDuration - spentDtDouble;
         if (remainingDouble > 1e-9) {
             PlayerObject::update(static_cast<float>(remainingDouble));
@@ -397,16 +413,25 @@ class $modify(BotPlayerObject, PlayerObject) {
 };
 
 // ---------------------------------------------------------------------------
-// Контроль уровня и чекпоинтов
+// Контроль кадров, чекпоинтов и интерполяции
 // ---------------------------------------------------------------------------
 class $modify(BotPlayLayer, PlayLayer) {
+    void update(float dt) {
+        bot::lastFrameRealTime = bot::currentFrameRealTime;
+        bot::currentFrameRealTime = bot::getHighPrecisionTimestamp();
+        if (bot::lastFrameRealTime <= 1e-9) {
+            bot::lastFrameRealTime = bot::currentFrameRealTime - (1.0 / 60.0);
+        }
+
+        PlayLayer::update(dt);
+    }
+
     void visit() {
         if (bot::mode == bot::Mode::Record && bot::recSpeed < 0.95 && this->m_player1 && !this->m_playerDied && !this->m_isPaused) {
             double now = bot::getHighPrecisionTimestamp();
-            float timewarp = this->m_gameState.m_timeWarp <= 0.0001f ? 1.0f : this->m_gameState.m_timeWarp;
-            double stepDuration = (1.0 / 240.0) * timewarp / std::max(0.0001, bot::recSpeed);
-            double elapsed = now - bot::stepStartTimestamp;
-            float alpha = std::clamp(static_cast<float>(elapsed / stepDuration), 0.0f, 1.0f);
+            double frameDuration = bot::currentFrameRealTime - bot::lastFrameRealTime;
+            if (frameDuration <= 1e-9) frameDuration = (1.0 / 60.0);
+            float alpha = std::clamp(static_cast<float>((now - bot::currentFrameRealTime) / frameDuration), 0.0f, 1.0f);
 
             auto p1 = this->m_player1;
             CCPoint orig1 = p1->getPosition();
@@ -437,6 +462,8 @@ class $modify(BotPlayLayer, PlayLayer) {
         bot::actionCounter = 0;
         bot::checkpoints.clear();
         bot::macro.clear();
+        bot::lastFrameRealTime = 0.0;
+        bot::currentFrameRealTime = bot::getHighPrecisionTimestamp();
         srand(1337);
 
         if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
@@ -457,7 +484,8 @@ class $modify(BotPlayLayer, PlayLayer) {
             bot::checkpoints.clear();
             if (bot::mode == bot::Mode::Record) bot::macro.clear();
         }
-        bot::stepStartTimestamp = bot::getHighPrecisionTimestamp();
+        bot::lastFrameRealTime = bot::getHighPrecisionTimestamp();
+        bot::currentFrameRealTime = bot::lastFrameRealTime;
     }
 
     CheckpointObject* createCheckpoint() {
@@ -506,7 +534,6 @@ class $modify(BotPlayLayer, PlayLayer) {
         auto const& data = it->second;
         bot::step = data.step;
 
-        // Синхронизация вектора макроса
         if (bot::mode == bot::Mode::Record) {
             if (data.macroSize <= bot::macro.size()) {
                 bot::macro.erase(bot::macro.begin() + data.macroSize, bot::macro.end());
@@ -519,7 +546,6 @@ class $modify(BotPlayLayer, PlayLayer) {
             }
         }
 
-        // Восстановление физического вектора
         auto restoreState = [](PlayerObject* p, bot::PlayerPhysicsState const& s) {
             if (!p) return;
             p->setPosition(s.pos);
@@ -536,7 +562,6 @@ class $modify(BotPlayLayer, PlayLayer) {
             restoreState(this->m_player2, data.p2State);
         }
 
-        // АНТИ-ЗАЛИПАНИЕ: В режиме записи отпускаем всё, чтобы палец человека не десинкался с игрой!
         if (bot::mode == bot::Mode::Record) {
             bot::forceReleaseEverything(this);
         } else if (bot::mode == bot::Mode::Play) {
@@ -550,14 +575,15 @@ class $modify(BotPlayLayer, PlayLayer) {
             --bot::silent;
         }
 
-        bot::stepStartTimestamp = bot::getHighPrecisionTimestamp();
+        bot::lastFrameRealTime = bot::getHighPrecisionTimestamp();
+        bot::currentFrameRealTime = bot::lastFrameRealTime;
         this->m_queuedButtons.clear();
         srand(1337 + data.step);
     }
 };
 
 // ---------------------------------------------------------------------------
-// GUI в PauseLayer
+// Интерфейс меню паузы
 // ---------------------------------------------------------------------------
 class $modify(BotPauseLayer, PauseLayer) {
     struct Fields {
