@@ -316,14 +316,14 @@ class $modify(BotPlayLayer, PlayLayer) {
 
         if (this->m_player1) {
             bcp.posP1 = this->m_player1->getPosition();
-            bcp.yVelP1 = this->m_player1->m_yAccel;
+            bcp.yVelP1 = this->m_player1->m_yVelocity;   // ИСПРАВЛЕНО
             bcp.rotP1 = this->m_player1->getRotation();
             bcp.isOnGroundP1 = this->m_player1->m_isOnGround;
             bcp.isUpsideDownP1 = this->m_player1->m_isUpsideDown;
         }
         if (this->m_player2) {
             bcp.posP2 = this->m_player2->getPosition();
-            bcp.yVelP2 = this->m_player2->m_yAccel;
+            bcp.yVelP2 = this->m_player2->m_yVelocity;   // ИСПРАВЛЕНО
             bcp.rotP2 = this->m_player2->getRotation();
             bcp.isOnGroundP2 = this->m_player2->m_isOnGround;
             bcp.isUpsideDownP2 = this->m_player2->m_isUpsideDown;
@@ -352,7 +352,7 @@ class $modify(BotPlayLayer, PlayLayer) {
 
                 if (this->m_player1) {
                     this->m_player1->setPosition(it->posP1);
-                    this->m_player1->m_yAccel = it->yVelP1;
+                    this->m_player1->m_yVelocity = it->yVelP1;   // ИСПРАВЛЕНО
                     this->m_player1->setRotation(it->rotP1);
                     this->m_player1->m_isOnGround = it->isOnGroundP1;
                     this->m_player1->m_isUpsideDown = it->isUpsideDownP1;
@@ -363,7 +363,7 @@ class $modify(BotPlayLayer, PlayLayer) {
                 }
                 if (this->m_player2) {
                     this->m_player2->setPosition(it->posP2);
-                    this->m_player2->m_yAccel = it->yVelP2;
+                    this->m_player2->m_yVelocity = it->yVelP2;   // ИСПРАВЛЕНО
                     this->m_player2->setRotation(it->rotP2);
                     this->m_player2->m_isOnGround = it->isOnGroundP2;
                     this->m_player2->m_isUpsideDown = it->isUpsideDownP2;
@@ -387,10 +387,15 @@ class $modify(BotPlayLayer, PlayLayer) {
         }
     }
 
-    void removeLastCheckpoint() {
-        PlayLayer::removeLastCheckpoint();
-        if (!bot::checkpoints.empty()) {
-            bot::checkpoints.pop_back();
+    // Синхронизация bot::checkpoints при удалении любого чекпоинта игрой
+    void removeCheckpoint(CheckpointObject* cp) {
+        PlayLayer::removeCheckpoint(cp);
+        if (!cp) return;
+        for (auto it = bot::checkpoints.begin(); it != bot::checkpoints.end(); ++it) {
+            if (it->cp == cp) {
+                bot::checkpoints.erase(it);
+                break;
+            }
         }
     }
 };
