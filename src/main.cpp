@@ -286,7 +286,6 @@ namespace bot {
         --silent;
     }
 
-    // Идеальная равномерная раскладка кликов внутри кадров
     inline void buildStepQueue(int stepCount) {
         double deltaTime = currentFrameTime - lastFrameTime;
         if (deltaTime <= 0.0) deltaTime = 1e-6;
@@ -362,7 +361,6 @@ namespace bot {
         physicsAccumulator += modifiedDelta;
         int stepCount = static_cast<int>(physicsAccumulator / physicsStepDuration);
 
-        // На замедлении не трогаем очередь, пока не накопится реальный шаг
         if (stepCount <= 0) return;
 
         physicsAccumulator -= static_cast<double>(stepCount) * physicsStepDuration;
@@ -404,12 +402,11 @@ namespace bot {
 }
 
 // ---------------------------------------------------------------------------
-// Scheduler: детерминированный шаг времени для идеальной физики Acheron
+// Scheduler
 // ---------------------------------------------------------------------------
 class $modify(BotScheduler, CCScheduler) {
     void update(float dt) {
         bot::onFrameStart();
-        // В режиме TAS бот стабилизирует дельту, защищая от троттлинга Android
         if (bot::mode != bot::Mode::Off) {
             float fixedDt = 1.0f / 60.0f;
             CCScheduler::update(fixedDt);
@@ -475,7 +472,7 @@ class $modify(BotBaseGameLayer, GJBaseGameLayer) {
 };
 
 // ---------------------------------------------------------------------------
-// Нарезка шага с идеальной хитбокс-точностью для кораблика на Ачероне
+// Нарезка подшагов строго во время физического шага (100% точность)
 // ---------------------------------------------------------------------------
 class $modify(BotPlayerObject, PlayerObject) {
     void update(float stepDelta) {
@@ -568,7 +565,6 @@ class $modify(BotPlayerObject, PlayerObject) {
         bool p1StartedOnGround = this->m_isOnGround;
         bool p2StartedOnGround = p2 && p2->m_isOnGround;
 
-        // В Play гарантируем повторение сплита
         if (mode == Mode::Play) {
             p1Split = true;
             p2Split = isDual;
@@ -624,11 +620,9 @@ class $modify(BotPlayerObject, PlayerObject) {
             if (p1Split) {
                 PlayerObject::update(substepDelta);
                 if (!s.endStep) {
-                    // Исправление: кораблик не имеет состояния isOnGround куба
                     if (!this->m_isShip && firstLoop && ((this->m_yVelocity < 0) ^ this->m_isUpsideDown)) {
                         this->m_isOnGround = p1StartedOnGround;
                     }
-                    // Исправление: substepDelta вместо stepDelta для исключения вылета хитбокса в пилу!
                     if (!this->m_isOnSlope || this->m_isDart) pl->checkCollisions(this, 0.0f, true);
                     else pl->checkCollisions(this, substepDelta, true);
                     bot::resetCollisionLog(this);
@@ -839,7 +833,7 @@ class $modify(BotPauseLayer, PauseLayer) {
         float viewW = 160.0f;
         float viewH = 100.0f;
         float rowH = 22.0f;
-        totalH = std::max(viewH, static_cast<float>(files.size()) * rowH);
+        float totalH = std::max(viewH, static_cast<float>(files.size()) * rowH);
 
         auto scroll = ScrollLayer::create(CCSize{ viewW, viewH });
         scroll->m_contentLayer->setContentSize(CCSize{ viewW, totalH });
