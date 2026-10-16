@@ -9,7 +9,7 @@
 #include <Geode/binding/PlayerObject.hpp>
 #include <Geode/binding/GameManager.hpp>
 #include <Geode/binding/CheckpointObject.hpp>
-#include <Geode/binding/GameLevel.hpp>
+#include <Geode/binding/GJGameLevel.hpp>
 #include <Geode/ui/Notification.hpp>
 #include <chrono>
 #include <deque>
