@@ -36,6 +36,7 @@ using namespace geode::prelude;
 namespace bot {
 
     constexpr double SMALLEST = std::numeric_limits<float>::min();
+    constexpr double MIN_PART = 5e-4; // минимальная часть шага (доля), короче неразличима в float-координатах
     constexpr uint32_t kMagic = 0x32544F42; // "BOT2"
 
     enum class Mode { Off, Record, Play };
@@ -78,6 +79,7 @@ namespace bot {
     inline double lastFrameTime = 0.0;
     inline double currentFrameTime = 0.0;
     inline bool skipUpdate = true;
+    inline bool zeroFrame = false;   // кадр без физических шагов (замедление / очень высокий FPS)
     inline bool inputThisStep = false;
     inline bool p1Split = false;
     inline bool p2Split = false;
@@ -410,10 +412,24 @@ class $modify(BotBaseGameLayer, GJBaseGameLayer) {
 
     double getModifiedDelta(float dt) {
         double md = GJBaseGameLayer::getModifiedDelta(dt);
-        if (bot::mode != bot::Mode::Off && bot::isPlayLayer(this)) {
-            bot::onFrame(PlayLayer::get(), md);
+        if (bot::isPlayLayer(this)) {
+            bot::zeroFrame = !(md > 0.0);
+            if (bot::mode != bot::Mode::Off) bot::onFrame(PlayLayer::get(), md);
         }
         return md;
+    }
+
+    // На замедлении игра прогоняет шаг нулевой длины в каждом кадре без реальных шагов и обрабатывает в нём
+    // очередь кликов. Прячем клики на время такого шага: они должны попасть в реальный шаг и разложиться по времени.
+    void processCommands(float dt, bool isHalfTick, bool isLastTick) {
+        if (bot::mode != bot::Mode::Off && bot::zeroFrame && bot::isPlayLayer(this)) {
+            std::vector<PlayerButtonCommand> saved(this->m_queuedButtons.begin(), this->m_queuedButtons.end());
+            this->m_queuedButtons.clear();
+            GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
+            this->m_queuedButtons.insert(this->m_queuedButtons.begin(), saved.begin(), saved.end());
+            return;
+        }
+        GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
     }
 };
 
@@ -425,6 +441,12 @@ class $modify(BotPlayerObject, PlayerObject) {
         using namespace bot;
         auto pl = PlayLayer::get();
         if (!pl || midStep) {
+            PlayerObject::update(stepDelta);
+            return;
+        }
+
+        // шаг нулевой длины: это не физический шаг, не считаем его и не режем
+        if (zeroFrame || stepDelta <= 1e-9f) {
             PlayerObject::update(stepDelta);
             return;
         }
@@ -521,6 +543,7 @@ class $modify(BotPlayerObject, PlayerObject) {
         midStep = true;
         bool firstLoop = true;
         double acc = 0.0;
+        double carry = 0.0;
         Sub pending;
 
         for (auto const& s : subs) {
@@ -531,7 +554,15 @@ class $modify(BotPlayerObject, PlayerObject) {
             }
             pending = s;
 
-            float const substepDelta = static_cast<float>(stepDelta * s.deltaFactor);
+            // слишком короткую часть не считаем физикой (шум float), её время уходит в следующую часть
+            double const part = s.deltaFactor + carry;
+            if (!s.endStep && part < MIN_PART) {
+                carry = part;
+                acc += s.deltaFactor;
+                continue;
+            }
+            carry = 0.0;
+            float const substepDelta = static_cast<float>(stepDelta * part);
             rotationDelta = substepDelta;
 
             if (p1Split) {
@@ -569,6 +600,10 @@ class $modify(BotPlayerObject, PlayerObject) {
     // вызывается в конце обычного шага; доделываем вращение, оставшееся после нарезки
     void updateRotation(float t) {
         auto pl = PlayLayer::get();
+        if (bot::zeroFrame) {
+            PlayerObject::updateRotation(t);
+            return;
+        }
         if (pl && bot::mode != bot::Mode::Off && !bot::midStep) {
             if (this == pl->m_player1 && bot::p1Split) {
                 PlayerObject::updateRotation(bot::rotationDelta);
