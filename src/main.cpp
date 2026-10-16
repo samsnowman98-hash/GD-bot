@@ -36,7 +36,7 @@ using namespace geode::prelude;
 namespace bot {
 
     constexpr double SMALLEST = std::numeric_limits<float>::min();
-    constexpr double MIN_PART = 5e-4; // минимальная часть шага (доля), короче неразличима в float-координатах
+    constexpr double MIN_PART = 1e-5; // минимальная часть шага (доля): короче только защита от денормалей float
     constexpr uint32_t kMagic = 0x32544F42; // "BOT2"
 
     enum class Mode { Off, Record, Play };
@@ -154,7 +154,7 @@ namespace bot {
             else break;
         }
         if (!hasDigits) return 1.0;
-        return std::clamp(whole + frac, 0.01, 2.0);
+        return std::clamp(whole + frac, 0.0001, 2.0);
     }
 
     // ---- файлы ----
@@ -205,6 +205,38 @@ namespace bot {
         }
         actions = std::move(tmp);
         return true;
+    }
+
+    // Статистика макроса: сколько нажатий/отпусканий и самый короткий клик (в долях физического шага)
+    struct Stats {
+        size_t pushes = 0;
+        size_t releases = 0;
+        double minHold = -1.0;
+    };
+
+    inline Stats macroStats() {
+        Stats st;
+        double pushAt[4][2] = {};
+        bool held[4][2] = {};
+        for (auto const& a : macro) {
+            if (a.button > 3) continue;
+            int p = a.p1 ? 0 : 1;
+            double t = static_cast<double>(a.step) + a.frac;
+            if (a.down) {
+                ++st.pushes;
+                held[a.button][p] = true;
+                pushAt[a.button][p] = t;
+            }
+            else {
+                ++st.releases;
+                if (held[a.button][p]) {
+                    double d = t - pushAt[a.button][p];
+                    if (st.minHold < 0.0 || d < st.minHold) st.minHold = d;
+                    held[a.button][p] = false;
+                }
+            }
+        }
+        return st;
     }
 
     // ---- кнопки ----
@@ -263,8 +295,14 @@ namespace bot {
         }
 
         for (auto cmd : pl->m_queuedButtons) {
-            // защита: если время пришло в миллисекундах, переводим в секунды
-            if (cmd.m_timestamp > currentFrameTime + 5.0) cmd.m_timestamp /= 1000.0;
+            double ts = cmd.m_timestamp;
+            // защита: время пришло в миллисекундах -> секунды
+            if (ts > currentFrameTime + 5.0) ts /= 1000.0;
+            // некорректное время (ноль, слишком старое или из будущего): считаем, что клик пришёл в этом кадре
+            if (!(ts > lastFrameTime - 5.0) || ts > currentFrameTime + 1.0) ts = currentFrameTime;
+            // порядок кликов не должен нарушаться
+            if (!inputVector.empty() && ts < inputVector.back().m_timestamp) ts = inputVector.back().m_timestamp;
+            cmd.m_timestamp = ts;
             inputVector.push_back(cmd);
         }
         pl->m_queuedButtons.clear();
@@ -708,10 +746,13 @@ class $modify(BotPauseLayer, PauseLayer) {
 
     void updateStatusUI() {
         if (m_fields->m_statusLabel) {
+            auto stats = bot::macroStats();
+            std::string minStr = stats.minHold >= 0.0 ? fmt::format("{:.4f}", stats.minHold) : std::string("-");
+            std::string info = fmt::format("{} acts P{}/R{} min {}", bot::macro.size(), stats.pushes, stats.releases, minStr);
             std::string st = "OFF";
-            if (bot::mode == bot::Mode::Record) st = fmt::format("REC ({} acts)", bot::macro.size());
-            else if (bot::mode == bot::Mode::Play) st = fmt::format("PLAY ({} acts)", bot::macro.size());
-            else if (!bot::macro.empty()) st = fmt::format("OFF ({} acts loaded)", bot::macro.size());
+            if (bot::mode == bot::Mode::Record) st = "REC " + info;
+            else if (bot::mode == bot::Mode::Play) st = "PLAY " + info;
+            else if (!bot::macro.empty()) st = "OFF " + info;
             m_fields->m_statusLabel->setString(st.c_str());
         }
         if (m_fields->m_offSprite) {
@@ -874,7 +915,7 @@ class $modify(BotPauseLayer, PauseLayer) {
         speedInput->setCallback([](std::string const& str) {
             bot::recSpeed = bot::parseSpeedString(str);
         });
-        speedInput->setString(fmt::format("{:.2f}", bot::recSpeed));
+        speedInput->setString(fmt::format("{}", bot::recSpeed));
         panelBg->addChild(speedInput);
 
         auto saveMenu = CCMenu::create();
