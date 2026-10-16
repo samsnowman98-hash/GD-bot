@@ -1,8 +1,5 @@
 // CBF-style TAS bot for Geometry Dash 2.2081 / Geode 5.x (Android & Windows)
-//
-// Макрос хранится как {step, frac}: номер физического шага + доля шага (double).
-// Запись берёт реальное время нажатия (m_queuedButtons[i].m_timestamp), раскладывает его по шагам кадра
-// и режет шаг на части. Воспроизведение режет шаги точно так же.
+// Полный фикс залипания и удлинения спама на волне
 
 #include <Geode/Geode.hpp>
 #include <Geode/modify/PlayLayer.hpp>
@@ -32,14 +29,14 @@ using namespace geode::prelude;
 namespace bot {
 
     constexpr double SMALLEST = 1e-9;
-    constexpr double MIN_PART = 1e-8; // уменьшено: микроклики больше не отбрасываются и не удлиняются
+    constexpr double MIN_PART = 1e-8;
     constexpr uint32_t kMagic = 0x32544F42; // "BOT2"
 
     enum class Mode { Off, Record, Play };
 
     struct Action {
-        uint32_t step = 0;   // номер физического шага от начала попытки
-        double frac = 0.0;   // доля шага 0..1
+        uint32_t step = 0;
+        double frac = 0.0;
         uint8_t button = 1;
         bool down = false;
         bool p1 = true;
@@ -76,6 +73,7 @@ namespace bot {
     inline bool skipUpdate = true;
     inline bool zeroFrame = false;
     inline bool inputThisStep = false;
+    inline bool p2HandledThisStep = false;
     inline bool p1Split = false;
     inline bool p2Split = false;
     inline bool midStep = false;
@@ -105,15 +103,21 @@ namespace bot {
         lastFrameTime = currentFrameTime;
         skipUpdate = true;
         inputThisStep = false;
+        p2HandledThisStep = false;
         p1Split = false;
         p2Split = false;
         midStep = false;
     }
 
+    // В РЕЖИМЕ ЗАПИСИ ВКЛЮЧАЕМ ClickBetweenSteps, ЧТОБЫ ANDROID НЕ ТЕРЯЛ ОТПУСКАНИЯ ПРИ СПАМЕ
     inline void applyClickFlags() {
         auto pl = PlayLayer::get();
         if (!pl) return;
-        if (mode != Mode::Off) {
+        if (mode == Mode::Record) {
+            pl->m_clickBetweenSteps = true;
+            pl->m_clickOnSteps = true;
+        }
+        else if (mode == Mode::Play) {
             pl->m_clickBetweenSteps = false;
             pl->m_clickOnSteps = false;
         }
@@ -155,7 +159,6 @@ namespace bot {
         return std::clamp(whole + frac, 0.0001, 2.0);
     }
 
-    // ---- файлы ----
     inline std::filesystem::path getMacroDir() {
         auto dir = Mod::get()->getSaveDir() / "macros";
         std::error_code ec;
@@ -236,7 +239,6 @@ namespace bot {
         return st;
     }
 
-    // ---- кнопки ----
     inline void applyInput(PlayLayer* pl, Sub const& s, uint32_t st, double frac) {
         ++applying;
         applyStep = st;
@@ -303,9 +305,8 @@ namespace bot {
             while (inputIdx < inputVector.size()) {
                 auto const& in = inputVector[inputIdx];
                 double rel = in.m_timestamp - lastFrameTime;
-                if (rel < stepDelta * (i + 1)) {
-                    double t = std::clamp(std::fmod(rel, stepDelta) / stepDelta, 0.0, 1.0);
-                    if (rel < 0.0) t = 0.0;
+                if (rel < stepDelta * (i + 1) || (i == stepCount - 1 && inputIdx == inputVector.size() - 1)) {
+                    double t = std::clamp(std::fmod(std::max(0.0, rel), stepDelta) / stepDelta, 0.0, 1.0);
                     Sub s;
                     s.has = true;
                     s.button = static_cast<int>(in.m_button);
@@ -400,7 +401,7 @@ class $modify(BotScheduler, CCScheduler) {
 };
 
 // ---------------------------------------------------------------------------
-// Ввод (как в оригинале)
+// Ввод
 // ---------------------------------------------------------------------------
 class $modify(BotBaseGameLayer, GJBaseGameLayer) {
     void handleButton(bool down, int button, bool isPlayer1) {
@@ -415,20 +416,25 @@ class $modify(BotBaseGameLayer, GJBaseGameLayer) {
             return;
         }
 
-        // Record
-        Action a;
+        // Запись клика строго с сохранением его доли шага
         if (applying > 0) {
+            Action a;
             a.step = applyStep;
             a.frac = applyFrac;
+            a.button = static_cast<uint8_t>(button);
+            a.down = down;
+            a.p1 = isPlayer1;
+            macro.push_back(a);
         }
         else {
+            Action a;
             a.step = step;
             a.frac = 0.0;
+            a.button = static_cast<uint8_t>(button);
+            a.down = down;
+            a.p1 = isPlayer1;
+            macro.push_back(a);
         }
-        a.button = static_cast<uint8_t>(button);
-        a.down = down;
-        a.p1 = isPlayer1;
-        macro.push_back(a);
 
         GJBaseGameLayer::handleButton(down, button, isPlayer1);
     }
@@ -458,7 +464,7 @@ class $modify(BotBaseGameLayer, GJBaseGameLayer) {
 };
 
 // ---------------------------------------------------------------------------
-// Нарезка шага (с исправлением коротких кликов)
+// Нарезка подшагов с гарантией отпускания
 // ---------------------------------------------------------------------------
 class $modify(BotPlayerObject, PlayerObject) {
     void update(float stepDelta) {
@@ -481,7 +487,11 @@ class $modify(BotPlayerObject, PlayerObject) {
         }
 
         if (this != pl->m_player1) {
-            if (!inputThisStep || this != pl->m_player2) PlayerObject::update(stepDelta);
+            if (this == pl->m_player2 && p2HandledThisStep) {
+                p2HandledThisStep = false;
+                return;
+            }
+            PlayerObject::update(stepDelta);
             return;
         }
 
@@ -536,6 +546,7 @@ class $modify(BotPlayerObject, PlayerObject) {
         if (subs.empty()) {
             p1Split = false;
             p2Split = false;
+            p2HandledThisStep = false;
             PlayerObject::update(stepDelta);
             ++step;
             return;
@@ -544,28 +555,35 @@ class $modify(BotPlayerObject, PlayerObject) {
         PlayerObject* p2 = pl->m_player2;
         bool isDual = pl->m_gameState.m_isDualMode;
         bool p1StartedOnGround = this->m_isOnGround;
-        bool p2StartedOnGround = p2->m_isOnGround;
+        bool p2StartedOnGround = p2 && p2->m_isOnGround;
 
-        bool p1NotBuffering = p1StartedOnGround
-            || this->m_touchingRings->count()
-            || this->m_isDashing
-            || (this->m_isDart || this->m_isBird || this->m_isShip || this->m_isSwing);
+        // В Play гарантируем повторение сплита, если действие есть в макросе
+        if (mode == Mode::Play) {
+            p1Split = true;
+            p2Split = isDual;
+        } else {
+            bool p1NotBuffering = p1StartedOnGround
+                || this->m_touchingRings->count()
+                || this->m_isDashing
+                || (this->m_isDart || this->m_isBird || this->m_isShip || this->m_isSwing);
 
-        bool p2NotBuffering = p2StartedOnGround
-            || p2->m_touchingRings->count()
-            || p2->m_isDashing
-            || (p2->m_isDart || p2->m_isBird || p2->m_isShip || p2->m_isSwing);
+            bool p2NotBuffering = p2 && (p2StartedOnGround
+                || p2->m_touchingRings->count()
+                || p2->m_isDashing
+                || (p2->m_isDart || p2->m_isBird || p2->m_isShip || p2->m_isSwing));
+
+            p1Split = p1NotBuffering;
+            p2Split = p2NotBuffering && isDual;
+        }
 
         p1Pos = PlayerObject::getPosition();
-        p2Pos = p2->getPosition();
-
-        p1Split = p1NotBuffering;
-        p2Split = p2NotBuffering && isDual;
+        if (p2) p2Pos = p2->getPosition();
 
         midStep = true;
         bool firstLoop = true;
         double acc = 0.0;
         double carry = 0.0;
+        float spentStepDelta = 0.0f;
         Sub pending;
 
         for (auto const& s : subs) {
@@ -576,15 +594,22 @@ class $modify(BotPlayerObject, PlayerObject) {
             pending = s;
 
             double const part = s.deltaFactor + carry;
-            // ИСПРАВЛЕНИЕ: порог снижен, и если есть pending клик — мы ОБЯЗАНЫ дать физике шаг,
-            // иначе микроклик проглотится и растянется до конца шага
+            // НЕ пропускаем шаг физики, если только что применился клик, чтобы волна успела среагировать
             if (!s.endStep && part < MIN_PART && !pending.has) {
                 carry = part;
                 acc += s.deltaFactor;
                 continue;
             }
             carry = 0.0;
-            float const substepDelta = static_cast<float>(stepDelta * part);
+
+            // БИТ-В-БИТ точное сложение дельты для исключения уплывания X/Y
+            float substepDelta;
+            if (s.endStep) {
+                substepDelta = std::max(0.0f, stepDelta - spentStepDelta);
+            } else {
+                substepDelta = static_cast<float>(stepDelta * part);
+                spentStepDelta += substepDelta;
+            }
             rotationDelta = substepDelta;
 
             if (p1Split) {
@@ -599,22 +624,25 @@ class $modify(BotPlayerObject, PlayerObject) {
             }
             else if (s.endStep) PlayerObject::update(stepDelta);
 
-            if (p2Split) {
-                p2->update(substepDelta);
-                if (!s.endStep) {
-                    if (firstLoop && ((p2->m_yVelocity < 0) ^ p2->m_isUpsideDown)) p2->m_isOnGround = p2StartedOnGround;
-                    if (!p2->m_isOnSlope || p2->m_isDart) pl->checkCollisions(p2, 0.0f, true);
-                    else pl->checkCollisions(p2, stepDelta, true);
-                    p2->updateRotation(substepDelta);
-                    bot::resetCollisionLog(p2);
+            if (p2) {
+                if (p2Split) {
+                    p2->update(substepDelta);
+                    if (!s.endStep) {
+                        if (firstLoop && ((p2->m_yVelocity < 0) ^ p2->m_isUpsideDown)) p2->m_isOnGround = p2StartedOnGround;
+                        if (!p2->m_isOnSlope || p2->m_isDart) pl->checkCollisions(p2, 0.0f, true);
+                        else pl->checkCollisions(p2, stepDelta, true);
+                        p2->updateRotation(substepDelta);
+                        bot::resetCollisionLog(p2);
+                    }
                 }
+                else if (s.endStep) p2->update(stepDelta);
             }
-            else if (s.endStep) p2->update(stepDelta);
 
             acc += s.deltaFactor;
             firstLoop = false;
         }
 
+        p2HandledThisStep = true;
         midStep = false;
         ++step;
     }
