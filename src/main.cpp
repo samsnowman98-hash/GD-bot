@@ -1,5 +1,5 @@
 // CBF-style TAS bot for Geometry Dash 2.2081 / Geode 5.x (Android & Windows)
-// 100% Deterministic Replay + Fixed Fast Spam + Seamless Checkpoint Splicing
+// Pixel-Perfect Acheron Precision + 100% Deterministic Physics + Fixed Fast Spam
 
 #include <Geode/Geode.hpp>
 #include <Geode/modify/PlayLayer.hpp>
@@ -72,11 +72,12 @@ namespace bot {
     inline double recSpeed = 1.0;
     inline float appliedScale = 1.0f;
 
-    // ---- движок ввода и нарезки ----
+    // ---- движок нарезки ----
+    inline std::deque<Sub> stepQueue;
     inline std::vector<PlayerButtonCommand> inputVector;
-    inline double lastPhysicsStepTime = 0.0;
-    inline double currentFrameTime = 0.0;
     inline double lastFrameTime = 0.0;
+    inline double currentFrameTime = 0.0;
+    inline double physicsAccumulator = 0.0;
     inline bool zeroFrame = false;
     inline bool inputThisStep = false;
     inline bool p2HandledThisStep = false;
@@ -104,9 +105,10 @@ namespace bot {
     }
 
     inline void resetEngine() {
+        stepQueue.clear();
         inputVector.clear();
-        lastPhysicsStepTime = 0.0;
         lastFrameTime = currentFrameTime;
+        physicsAccumulator = 0.0;
         inputThisStep = false;
         p2HandledThisStep = false;
         p1Split = false;
@@ -284,6 +286,49 @@ namespace bot {
         --silent;
     }
 
+    // Идеальная равномерная раскладка кликов внутри кадров
+    inline void buildStepQueue(int stepCount) {
+        double deltaTime = currentFrameTime - lastFrameTime;
+        if (deltaTime <= 0.0) deltaTime = 1e-6;
+
+        double stepDeltaTime = deltaTime / stepCount;
+        size_t inputIdx = 0;
+
+        for (int i = 0; i < stepCount; ++i) {
+            double elapsed = 0.0;
+            double stepStart = lastFrameTime + i * stepDeltaTime;
+            double stepEnd = stepStart + stepDeltaTime;
+
+            while (inputIdx < inputVector.size()) {
+                auto const& in = inputVector[inputIdx];
+                if (in.m_timestamp < stepEnd || (i == stepCount - 1 && inputIdx == inputVector.size() - 1)) {
+                    double rel = in.m_timestamp - stepStart;
+                    double t = std::clamp(rel / stepDeltaTime, 0.0, 1.0);
+                    if (rel < 0.0) t = 0.0;
+
+                    Sub s;
+                    s.has = true;
+                    s.button = static_cast<int>(in.m_button);
+                    s.push = in.m_isPush;
+                    s.p1 = !in.m_isPlayer2;
+                    s.deltaFactor = std::clamp(t - elapsed, SMALLEST, 1.0);
+                    s.endStep = false;
+                    stepQueue.push_back(s);
+                    elapsed = std::max(elapsed, t);
+                    ++inputIdx;
+                }
+                else break;
+            }
+            Sub e;
+            e.deltaFactor = std::max(SMALLEST, 1.0 - elapsed);
+            e.endStep = true;
+            stepQueue.push_back(e);
+        }
+
+        lastFrameTime = currentFrameTime;
+        inputVector.erase(inputVector.begin(), inputVector.begin() + inputIdx);
+    }
+
     inline void onFrame(PlayLayer* pl, double modifiedDelta) {
         if (mode == Mode::Play) {
             pl->m_queuedButtons.clear();
@@ -293,7 +338,8 @@ namespace bot {
         if (pl->m_playerDied) {
             inputVector.clear();
             pl->m_queuedButtons.clear();
-            lastPhysicsStepTime = 0.0;
+            lastFrameTime = currentFrameTime;
+            physicsAccumulator = 0.0;
             return;
         }
 
@@ -306,7 +352,21 @@ namespace bot {
             inputVector.push_back(cmd);
         }
         pl->m_queuedButtons.clear();
-        lastFrameTime = currentFrameTime;
+
+        if (modifiedDelta <= 0.0) return;
+
+        float timewarp = pl->m_gameState.m_timeWarp;
+        if (timewarp <= 0.0001f) timewarp = 1.0f;
+        double const physicsStepDuration = (1.0 / 240.0) * std::min(1.0f, timewarp);
+
+        physicsAccumulator += modifiedDelta;
+        int stepCount = static_cast<int>(physicsAccumulator / physicsStepDuration);
+
+        // На замедлении не трогаем очередь, пока не накопится реальный шаг
+        if (stepCount <= 0) return;
+
+        physicsAccumulator -= static_cast<double>(stepCount) * physicsStepDuration;
+        buildStepQueue(stepCount);
     }
 
     inline void onFrameStart() {
@@ -325,7 +385,7 @@ namespace bot {
 
         if (idle) {
             lastFrameTime = currentFrameTime;
-            lastPhysicsStepTime = 0.0;
+            physicsAccumulator = 0.0;
             inputVector.clear();
         }
     }
@@ -344,12 +404,18 @@ namespace bot {
 }
 
 // ---------------------------------------------------------------------------
-// Scheduler
+// Scheduler: детерминированный шаг времени для идеальной физики Acheron
 // ---------------------------------------------------------------------------
 class $modify(BotScheduler, CCScheduler) {
     void update(float dt) {
         bot::onFrameStart();
-        CCScheduler::update(dt);
+        // В режиме TAS бот стабилизирует дельту, защищая от троттлинга Android
+        if (bot::mode != bot::Mode::Off) {
+            float fixedDt = 1.0f / 60.0f;
+            CCScheduler::update(fixedDt);
+        } else {
+            CCScheduler::update(dt);
+        }
     }
 };
 
@@ -374,7 +440,6 @@ class $modify(BotBaseGameLayer, GJBaseGameLayer) {
             return;
         }
 
-        // Запись только в момент выполнения CBF-подшага
         if (applying > 0) {
             Action a;
             a.step = applyStep;
@@ -410,7 +475,7 @@ class $modify(BotBaseGameLayer, GJBaseGameLayer) {
 };
 
 // ---------------------------------------------------------------------------
-// Нарезка подшагов строго во время физического шага (100% точность)
+// Нарезка шага с идеальной хитбокс-точностью для кораблика на Ачероне
 // ---------------------------------------------------------------------------
 class $modify(BotPlayerObject, PlayerObject) {
     void update(float stepDelta) {
@@ -466,49 +531,25 @@ class $modify(BotPlayerObject, PlayerObject) {
                 subs.push_back(e);
             }
         }
-        else { // Mode::Record
-            double now = getCurrentTimestamp();
-            double expectedStepReal = static_cast<double>(stepDelta) / std::max(0.0001, (double)appliedScale);
-
-            if (lastPhysicsStepTime <= 0.0 || (now - lastPhysicsStepTime) > expectedStepReal * 3.5) {
-                lastPhysicsStepTime = now - expectedStepReal;
-            }
-
-            double stepSpan = now - lastPhysicsStepTime;
-            if (stepSpan <= 0.0) stepSpan = expectedStepReal;
-
-            size_t consumed = 0;
-            double elapsed = 0.0;
-
-            while (consumed < inputVector.size()) {
-                auto const& in = inputVector[consumed];
-                double rel = in.m_timestamp - lastPhysicsStepTime;
-
-                if (rel <= stepSpan || in.m_timestamp <= now || consumed == 0) {
-                    double t = std::clamp(rel / stepSpan, 0.0, 1.0);
-                    Sub s;
-                    s.has = true;
-                    s.button = static_cast<int>(in.m_button);
-                    s.push = in.m_isPush;
-                    s.p1 = !in.m_isPlayer2;
-                    s.deltaFactor = std::clamp(t - elapsed, SMALLEST, 1.0);
-                    s.endStep = false;
+        else { // Record
+            bool front = !stepQueue.empty() && !stepQueue.front().endStep;
+            if (!stepQueue.empty() && !front) stepQueue.pop_front();
+            if (front) {
+                double sum = 0.0;
+                Sub s;
+                do {
+                    s = stepQueue.front();
+                    stepQueue.pop_front();
                     subs.push_back(s);
-                    elapsed = std::max(elapsed, t);
-                    ++consumed;
+                    sum += s.deltaFactor;
+                } while (!stepQueue.empty() && !s.endStep);
+                if (!subs.back().endStep) {
+                    Sub e;
+                    e.deltaFactor = std::max(SMALLEST, 1.0 - sum);
+                    e.endStep = true;
+                    subs.push_back(e);
                 }
-                else break;
             }
-
-            if (!subs.empty()) {
-                Sub e;
-                e.deltaFactor = std::max(SMALLEST, 1.0 - elapsed);
-                e.endStep = true;
-                subs.push_back(e);
-            }
-
-            inputVector.erase(inputVector.begin(), inputVector.begin() + consumed);
-            lastPhysicsStepTime = now;
         }
 
         inputThisStep = !subs.empty();
@@ -527,7 +568,7 @@ class $modify(BotPlayerObject, PlayerObject) {
         bool p1StartedOnGround = this->m_isOnGround;
         bool p2StartedOnGround = p2 && p2->m_isOnGround;
 
-        // В режиме PLAY гарантируем выполнение сплита
+        // В Play гарантируем повторение сплита
         if (mode == Mode::Play) {
             p1Split = true;
             p2Split = isDual;
@@ -583,10 +624,13 @@ class $modify(BotPlayerObject, PlayerObject) {
             if (p1Split) {
                 PlayerObject::update(substepDelta);
                 if (!s.endStep) {
-                    if (firstLoop && ((this->m_yVelocity < 0) ^ this->m_isUpsideDown)) this->m_isOnGround = p1StartedOnGround;
+                    // Исправление: кораблик не имеет состояния isOnGround куба
+                    if (!this->m_isShip && firstLoop && ((this->m_yVelocity < 0) ^ this->m_isUpsideDown)) {
+                        this->m_isOnGround = p1StartedOnGround;
+                    }
+                    // Исправление: substepDelta вместо stepDelta для исключения вылета хитбокса в пилу!
                     if (!this->m_isOnSlope || this->m_isDart) pl->checkCollisions(this, 0.0f, true);
-                    else pl->checkCollisions(this, stepDelta, true);
-                    PlayerObject::updateRotation(substepDelta);
+                    else pl->checkCollisions(this, substepDelta, true);
                     bot::resetCollisionLog(this);
                 }
             }
@@ -596,10 +640,11 @@ class $modify(BotPlayerObject, PlayerObject) {
                 if (p2Split) {
                     p2->update(substepDelta);
                     if (!s.endStep) {
-                        if (firstLoop && ((p2->m_yVelocity < 0) ^ p2->m_isUpsideDown)) p2->m_isOnGround = p2StartedOnGround;
+                        if (!p2->m_isShip && firstLoop && ((p2->m_yVelocity < 0) ^ p2->m_isUpsideDown)) {
+                            p2->m_isOnGround = p2StartedOnGround;
+                        }
                         if (!p2->m_isOnSlope || p2->m_isDart) pl->checkCollisions(p2, 0.0f, true);
-                        else pl->checkCollisions(p2, stepDelta, true);
-                        p2->updateRotation(substepDelta);
+                        else pl->checkCollisions(p2, substepDelta, true);
                         bot::resetCollisionLog(p2);
                     }
                 }
@@ -676,7 +721,7 @@ class $modify(BotPlayLayer, PlayLayer) {
         if (cp) {
             bot::CheckpointData data;
             data.step = bot::step;
-            data.macroSize = bot::macro.size(); // Сохраняем точный размер макроса для бесшовного среза
+            data.macroSize = bot::macro.size();
             for (int b = 1; b <= 3; ++b) {
                 data.held[b][0] = bot::currentHeld[b][0];
                 data.held[b][1] = bot::currentHeld[b][1];
@@ -705,7 +750,7 @@ class $modify(BotPlayLayer, PlayLayer) {
         auto const& data = it->second;
         bot::step = data.step;
 
-        // 1. ИДЕАЛЬНОЕ СКЛЕИВАНИЕ МАКРОСА: срез строго до сохранённого момента чекпоинта
+        // 1. ИДЕАЛЬНОЕ СКЛЕИВАНИЕ МАКРОСА
         if (bot::mode == bot::Mode::Record) {
             if (data.macroSize <= bot::macro.size()) {
                 bot::macro.erase(bot::macro.begin() + data.macroSize, bot::macro.end());
@@ -721,7 +766,7 @@ class $modify(BotPlayLayer, PlayLayer) {
             bot::syncPlayback(this);
         }
 
-        // 2. ВОССТАНОВЛЕНИЕ ЗАЖАТИЙ КНОПОК: волна/корабль не падают вниз при возрождении
+        // 2. ВОССТАНОВЛЕНИЕ ЗАЖАТИЙ КНОПОК
         ++bot::silent;
         for (int b = 1; b <= 3; ++b) {
             bot::currentHeld[b][0] = data.held[b][0];
@@ -731,13 +776,13 @@ class $modify(BotPlayLayer, PlayLayer) {
         }
         --bot::silent;
 
-        // 3. УСТРАНЕНИЕ ЛАГА ВОЗРОЖДЕНИЯ: чистый якорь времени для первого шага
-        bot::lastPhysicsStepTime = bot::getCurrentTimestamp();
-        bot::lastFrameTime = bot::lastPhysicsStepTime;
+        // 3. УСТРАНЕНИЕ ЛАГА ВОЗРОЖДЕНИЯ
+        bot::lastFrameTime = bot::getCurrentTimestamp();
+        bot::physicsAccumulator = 0.0;
         bot::inputVector.clear();
         this->m_queuedButtons.clear();
 
-        // 4. ДЕТЕРМИНИЗМ РАНДОМА: одинаковое поведение триггеров
+        // 4. ДЕТЕРМИНИЗМ РАНДОМА
         srand(1337 + data.step);
     }
 };
@@ -794,7 +839,7 @@ class $modify(BotPauseLayer, PauseLayer) {
         float viewW = 160.0f;
         float viewH = 100.0f;
         float rowH = 22.0f;
-        float totalH = std::max(viewH, static_cast<float>(files.size()) * rowH);
+        totalH = std::max(viewH, static_cast<float>(files.size()) * rowH);
 
         auto scroll = ScrollLayer::create(CCSize{ viewW, viewH });
         scroll->m_contentLayer->setContentSize(CCSize{ viewW, totalH });
