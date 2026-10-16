@@ -1,759 +1,669 @@
 #include <Geode/Geode.hpp>
-#include <Geode/modify/CCScheduler.hpp>
-#include <Geode/modify/GJBaseGameLayer.hpp>
-#include <Geode/modify/PlayerObject.hpp>
 #include <Geode/modify/PlayLayer.hpp>
+#include <Geode/modify/PlayerObject.hpp>
 #include <Geode/modify/PauseLayer.hpp>
-#include <Geode/binding/PlayLayer.hpp>
-#include <Geode/binding/GJBaseGameLayer.hpp>
-#include <Geode/binding/PlayerObject.hpp>
-#include <Geode/binding/GameManager.hpp>
-#include <Geode/binding/CheckpointObject.hpp>
 #include <Geode/binding/GJGameLevel.hpp>
-#include <Geode/ui/Notification.hpp>
-#include <Geode/ui/ScrollLayer.hpp>
-#include <Geode/ui/Layout.hpp>
-#include <Geode/loader/Mod.hpp>
-
+#include <Geode/binding/CheckpointObject.hpp>
 #include <chrono>
 #include <vector>
-#include <unordered_map>
+#include <string>
 #include <fstream>
+#include <sstream>
+#include <iomanip>
 #include <algorithm>
-#include <ctime>
+#include <unordered_map>
 #include <filesystem>
 
 using namespace geode::prelude;
 
 namespace bot {
+    enum class Mode { Off, Record, Play };
 
-constexpr double SMALLEST = 0.000001;
-constexpr const char* kMacroExt = ".gdbot";
-constexpr uint32_t kMagic = 0x32544F42;
+    struct Action {
+        uint32_t step = 0;
+        double frac = 0.0;
+        bool down = false;
+        bool p1 = true;
+        uint8_t btn = 1;
+    };
 
-enum class Mode { Off, Record, Play };
+    struct CheckpointData {
+        uint32_t step = 0;
+        size_t macroSize = 0;
+        CCPoint p1Pos = CCPointZero;
+        double p1YVel = 0.0;
+        float p1Rot = 0.0f;
+        bool p1OnGround = false;
+        CCPoint p2Pos = CCPointZero;
+        double p2YVel = 0.0;
+        float p2Rot = 0.0f;
+        bool p2OnGround = false;
+    };
 
-struct Action {
-    uint32_t step;
-    double frac;
-    uint8_t button;
-    bool down;
-    bool p1;
-};
+    struct ButtonState {
+        bool jump = false;
+        bool left = false;
+        bool right = false;
 
-struct CheckpointData {
-    uint32_t step = 0;
-    CCPoint p1Pos;
-    double p1YVel = 0.0;
-    float p1Rot = 0.0f;
-    bool p1OnGround = true;
-    CCPoint p2Pos;
-    double p2YVel = 0.0;
-    float p2Rot = 0.0f;
-    bool p2OnGround = true;
-};
-
-struct State {
-    Mode mode = Mode::Off;
-    uint32_t step = 0;
-    size_t index = 0;
-    int applying = 0;
-    bool cpLoaded = false;
-    int levelID = 0;
-    std::string levelName;
-    uint64_t levelHash = 0;
-    std::vector<Action> macro;
-    std::unordered_map<CheckpointObject*, CheckpointData> checkpoints;
-};
-
-inline State g;
-
-inline double stepStartTime = 0.0;
-inline double recSpeed = 1.0;
-
-inline double getCurrentTimestamp() {
-    using namespace std::chrono;
-    return duration<double>(steady_clock::now().time_since_epoch()).count();
-}
-
-inline void resetTimingBaseline() {
-    stepStartTime = getCurrentTimestamp();
-}
-
-inline void resetEngine() {
-    stepStartTime = getCurrentTimestamp();
-}
-
-inline const char* modeName() {
-    switch (g.mode) {
-        case Mode::Record: return "REC";
-        case Mode::Play: return "PLAY";
-        default: return "OFF";
-    }
-}
-
-inline std::string statusText() {
-    return fmt::format("Bot: {} | acts: {} | Spd: {:.2f}x", modeName(), g.macro.size(), recSpeed);
-}
-
-inline void notify(const std::string& text, NotificationIcon icon) {
-    Notification::create(text, icon)->show();
-}
-
-inline void applyClickFlags(PlayLayer* pl) {
-    if (!pl) return;
-    if (g.mode != Mode::Off) {
-        pl->m_clickBetweenSteps = true;
-        pl->m_clickOnSteps = false;
-    } else {
-        auto gm = GameManager::get();
-        pl->m_clickBetweenSteps = gm->getGameVariable("0177");
-        pl->m_clickOnSteps = gm->getGameVariable("0176");
-    }
-}
-
-inline std::filesystem::path macroPath(const std::string& filename) {
-    return Mod::get()->getSaveDir() / filename;
-}
-
-inline bool writeMacroToFile(const std::filesystem::path& path, const std::vector<Action>& macro) {
-    std::ofstream f(path, std::ios::binary);
-    if (!f.is_open()) return false;
-    uint32_t magic = kMagic;
-    f.write(reinterpret_cast<const char*>(&magic), sizeof(magic));
-    uint32_t count = static_cast<uint32_t>(macro.size());
-    f.write(reinterpret_cast<const char*>(&count), sizeof(count));
-    for (auto& a : macro) {
-        f.write(reinterpret_cast<const char*>(&a.step), sizeof(a.step));
-        f.write(reinterpret_cast<const char*>(&a.frac), sizeof(a.frac));
-        uint8_t flags = 0;
-        if (a.down) flags |= 0x1;
-        if (a.p1) flags |= 0x2;
-        f.write(reinterpret_cast<const char*>(&flags), sizeof(flags));
-        f.write(reinterpret_cast<const char*>(&a.button), sizeof(a.button));
-    }
-    return true;
-}
-
-inline bool readMacroFromFile(const std::filesystem::path& path, std::vector<Action>& macro) {
-    std::ifstream f(path, std::ios::binary);
-    if (!f.is_open()) return false;
-    uint32_t magic = 0;
-    f.read(reinterpret_cast<char*>(&magic), sizeof(magic));
-    if (magic != kMagic) return false;
-    uint32_t count = 0;
-    f.read(reinterpret_cast<char*>(&count), sizeof(count));
-    macro.clear();
-    macro.reserve(count);
-    for (uint32_t i = 0; i < count; i++) {
-        Action a{};
-        f.read(reinterpret_cast<char*>(&a.step), sizeof(a.step));
-        f.read(reinterpret_cast<char*>(&a.frac), sizeof(a.frac));
-        uint8_t flags = 0;
-        f.read(reinterpret_cast<char*>(&flags), sizeof(flags));
-        a.down = (flags & 0x1) != 0;
-        a.p1 = (flags & 0x2) != 0;
-        f.read(reinterpret_cast<char*>(&a.button), sizeof(a.button));
-        macro.push_back(a);
-    }
-    return true;
-}
-
-inline std::string autoFilename() {
-    if (g.levelID != 0) {
-        return fmt::format("level_{}{}", g.levelID, kMacroExt);
-    }
-    return fmt::format("local_{}{}", g.levelHash, kMacroExt);
-}
-
-inline bool saveMacro() {
-    if (g.macro.empty()) return false;
-    return writeMacroToFile(macroPath(autoFilename()), g.macro);
-}
-
-inline bool loadMacro() {
-    std::vector<Action> macro;
-    if (!readMacroFromFile(macroPath(autoFilename()), macro)) return false;
-    g.macro = std::move(macro);
-    return true;
-}
-
-inline void syncPlayback(PlayLayer* pl) {
-    if (!pl) return;
-    auto it = std::lower_bound(g.macro.begin(), g.macro.end(), g.step,
-        [](const Action& a, uint32_t step) { return a.step < step; });
-    g.index = static_cast<size_t>(it - g.macro.begin());
-
-    bool held[4][2] = { { false, false }, { false, false }, { false, false }, { false, false } };
-    for (size_t i = 0; i < g.index; i++) {
-        auto& a = g.macro[i];
-        if (a.button >= 1 && a.button <= 4) {
-            held[a.button - 1][a.p1 ? 0 : 1] = a.down;
+        bool isHeld(int btn) const {
+            if (btn == 1) return jump;
+            if (btn == 2) return left;
+            if (btn == 3) return right;
+            return false;
         }
+
+        void setHeld(int btn, bool held) {
+            if (btn == 1) jump = held;
+            else if (btn == 2) left = held;
+            else if (btn == 3) right = held;
+        }
+    };
+
+    inline Mode mode = Mode::Off;
+    inline std::vector<Action> currentMacro;
+    inline size_t macroIndex = 0;
+    inline uint32_t currentStep = 0;
+    inline double recSpeed = 1.0;
+    inline std::chrono::steady_clock::time_point stepStartTime;
+    inline std::unordered_map<CheckpointObject*, CheckpointData> checkpoints;
+    inline std::string currentMacroName = "autosave";
+    inline ButtonState p1State;
+    inline ButtonState p2State;
+    inline bool isSubStepping = false;
+    inline bool dualUpdatedInP1 = false;
+
+    inline constexpr uint32_t MAGIC = 0x32544F42;
+    inline constexpr double SMALLEST = 1e-5;
+
+    inline void resetTimingBaseline() {
+        stepStartTime = std::chrono::steady_clock::now();
     }
-    for (int b = 0; b < 4; b++) {
-        for (int pIdx = 0; pIdx < 2; pIdx++) {
-            if (held[b][pIdx]) {
-                g.applying++;
-                pl->handleButton(true, b + 1, pIdx == 0);
-                g.applying--;
+
+    inline std::filesystem::path getMacrosDir() {
+        auto dir = Mod::get()->getSaveDir() / "macros";
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+        return dir;
+    }
+
+    inline bool saveToFile(const std::string& name) {
+        auto path = getMacrosDir() / (name + ".gdbot");
+        std::ofstream file(path, std::ios::binary);
+        if (!file.is_open()) return false;
+
+        uint32_t magic = MAGIC;
+        uint32_t count = static_cast<uint32_t>(currentMacro.size());
+        file.write(reinterpret_cast<const char*>(&magic), sizeof(magic));
+        file.write(reinterpret_cast<const char*>(&count), sizeof(count));
+
+        for (const auto& act : currentMacro) {
+            file.write(reinterpret_cast<const char*>(&act.step), sizeof(act.step));
+            file.write(reinterpret_cast<const char*>(&act.frac), sizeof(act.frac));
+            uint8_t flags = (act.down ? 1 : 0) | (act.p1 ? 2 : 0);
+            file.write(reinterpret_cast<const char*>(&flags), sizeof(flags));
+            file.write(reinterpret_cast<const char*>(&act.btn), sizeof(act.btn));
+        }
+        return true;
+    }
+
+    inline bool loadFromFile(const std::string& name) {
+        auto path = getMacrosDir() / (name + ".gdbot");
+        std::ifstream file(path, std::ios::binary);
+        if (!file.is_open()) return false;
+
+        uint32_t magic = 0;
+        uint32_t count = 0;
+        file.read(reinterpret_cast<char*>(&magic), sizeof(magic));
+        if (magic != MAGIC) return false;
+
+        file.read(reinterpret_cast<char*>(&count), sizeof(count));
+        currentMacro.clear();
+        currentMacro.reserve(count);
+
+        for (uint32_t i = 0; i < count; i++) {
+            Action act;
+            file.read(reinterpret_cast<char*>(&act.step), sizeof(act.step));
+            file.read(reinterpret_cast<char*>(&act.frac), sizeof(act.frac));
+            uint8_t flags = 0;
+            file.read(reinterpret_cast<char*>(&flags), sizeof(flags));
+            file.read(reinterpret_cast<char*>(&act.btn), sizeof(act.btn));
+            act.down = (flags & 1) != 0;
+            act.p1 = (flags & 2) != 0;
+            currentMacro.push_back(act);
+        }
+        macroIndex = 0;
+        currentStep = 0;
+        currentMacroName = name;
+        return true;
+    }
+
+    inline std::vector<std::string> listMacros() {
+        std::vector<std::string> list;
+        std::error_code ec;
+        for (const auto& entry : std::filesystem::directory_iterator(getMacrosDir(), ec)) {
+            if (entry.is_regular_file() && entry.path().extension() == ".gdbot") {
+                list.push_back(entry.path().stem().string());
             }
         }
+        std::sort(list.begin(), list.end());
+        return list;
     }
-}
 
-inline void setTimeScale(double s) {
-    CCDirector::get()->getScheduler()->setTimeScale(static_cast<float>(s));
-}
-
-inline void onFrameStart() {
-    if (g.mode != Mode::Record) {
-        setTimeScale(1.0);
-        return;
+    inline void syncPlayback() {
+        macroIndex = 0;
+        while (macroIndex < currentMacro.size() && currentMacro[macroIndex].step < currentStep) {
+            macroIndex++;
+        }
     }
-    auto pl = PlayLayer::get();
-    if (!pl || pl->m_isPaused || pl->m_levelEndAnimationStarted) {
-        setTimeScale(1.0);
-        return;
-    }
-    setTimeScale(recSpeed);
-}
 
-}
-
-class $modify(BotScheduler, CCScheduler) {
-    void update(float dt) {
-        bot::onFrameStart();
-        CCScheduler::update(dt);
-    }
-};
-
-class $modify(BotBaseGameLayer, GJBaseGameLayer) {
-    void handleButton(bool down, int button, bool isPlayer1) {
-        auto pl = PlayLayer::get();
-        if (bot::g.mode == bot::Mode::Off || static_cast<GJBaseGameLayer*>(pl) != this) {
-            GJBaseGameLayer::handleButton(down, button, isPlayer1);
-            return;
-        }
-
-        if (bot::g.mode == bot::Mode::Play) {
-            if (bot::g.applying > 0) {
-                GJBaseGameLayer::handleButton(down, button, isPlayer1);
-            }
-            return;
-        }
-
-        if (bot::g.mode == bot::Mode::Record) {
-            if (bot::g.applying == 0) {
-                double now = bot::getCurrentTimestamp();
-                double stepDuration = (1.0 / 240.0) / (bot::recSpeed > bot::SMALLEST ? bot::recSpeed : 1.0);
-                double frac = std::clamp((now - bot::stepStartTime) / stepDuration, 0.0, 0.999);
-
-                bot::Action a{};
-                a.step = bot::g.step;
-                a.frac = frac;
-                a.button = static_cast<uint8_t>(button);
-                a.down = down;
-                a.p1 = isPlayer1;
-                bot::g.macro.push_back(a);
-            }
-        }
-
-        GJBaseGameLayer::handleButton(down, button, isPlayer1);
-    }
-};
-
-class $modify(BotPlayerObject, PlayerObject) {
-    void update(float stepDelta) {
-        auto pl = PlayLayer::get();
-        if (!pl || bot::g.mode == bot::Mode::Off) {
-            PlayerObject::update(stepDelta);
-            return;
-        }
-
-        bool isP1 = (this == pl->m_player1);
-        bool isP2 = (this == pl->m_player2);
-        if (!isP1 && !isP2) {
-            PlayerObject::update(stepDelta);
-            return;
-        }
-
-        if (bot::g.mode == bot::Mode::Play) {
-            std::vector<bot::Action> myActions;
-            for (size_t i = bot::g.index; i < bot::g.macro.size() && bot::g.macro[i].step == bot::g.step; ++i) {
-                if (bot::g.macro[i].p1 == isP1) {
-                    myActions.push_back(bot::g.macro[i]);
-                }
-            }
-
-            std::sort(myActions.begin(), myActions.end(), [](const bot::Action& a, const bot::Action& b) {
-                return a.frac < b.frac;
-            });
-
-            if (myActions.empty()) {
-                PlayerObject::update(stepDelta);
-            } else {
-                double currentFrac = 0.0;
-                for (auto& a : myActions) {
-                    double targetFrac = std::clamp(a.frac, 0.0, 1.0);
-                    double subDelta = (targetFrac - currentFrac) * stepDelta;
-                    if (subDelta > bot::SMALLEST) {
-                        PlayerObject::update(static_cast<float>(subDelta));
-                        pl->checkCollisions(this, 0.0f, isP1);
-                        currentFrac = targetFrac;
-                    }
-                    bot::g.applying++;
-                    pl->handleButton(a.down, a.button, a.p1);
-                    bot::g.applying--;
-                }
-                double rem = (1.0 - currentFrac) * stepDelta;
-                if (rem > 0.0) {
-                    PlayerObject::update(static_cast<float>(rem));
-                }
-            }
+    inline void applyActionDirect(const Action& act, PlayLayer* pl) {
+        PlayerObject* target = act.p1 ? pl->m_player1 : pl->m_player2;
+        if (!target) return;
+        PlayerButton btn = static_cast<PlayerButton>(act.btn);
+        if (act.down) {
+            target->pushButton(btn);
         } else {
-            PlayerObject::update(stepDelta);
-        }
-
-        bool isDual = (pl->m_player2 != nullptr && pl->m_player2->isVisible());
-        if (!isDual && isP1) {
-            if (bot::g.mode == bot::Mode::Play) {
-                while (bot::g.index < bot::g.macro.size() && bot::g.macro[bot::g.index].step <= bot::g.step) {
-                    bot::g.index++;
-                }
-            }
-            bot::g.step++;
-            bot::stepStartTime = bot::getCurrentTimestamp();
-        } else if (isDual && isP2) {
-            if (bot::g.mode == bot::Mode::Play) {
-                while (bot::g.index < bot::g.macro.size() && bot::g.macro[bot::g.index].step <= bot::g.step) {
-                    bot::g.index++;
-                }
-            }
-            bot::g.step++;
-            bot::stepStartTime = bot::getCurrentTimestamp();
+            target->releaseButton(btn);
         }
     }
-};
+}
 
-class $modify(BotPlayLayer, PlayLayer) {
+struct BotPlayLayer : Modify<BotPlayLayer, PlayLayer> {
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
-        bot::g = bot::State{};
-        bot::resetEngine();
+        if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
+        this->m_clickBetweenSteps = false;
+        bot::currentStep = 0;
+        bot::macroIndex = 0;
+        bot::checkpoints.clear();
+        bot::p1State = bot::ButtonState();
+        bot::p2State = bot::ButtonState();
+        bot::isSubStepping = false;
+        bot::dualUpdatedInP1 = false;
+        bot::recSpeed = Mod::get()->getSettingValue<double>("record-speed");
+        if (bot::recSpeed < 0.01) bot::recSpeed = 1.0;
+        bot::resetTimingBaseline();
 
-        bool ret = PlayLayer::init(level, useReplay, dontCreateObjects);
-        if (!ret) return false;
-
-        bot::g.levelID = level ? static_cast<int>(level->m_levelID) : 0;
-        bot::g.levelName = level ? std::string(level->m_levelName.c_str()) : std::string("unknown");
-        std::string hashSource = fmt::format("{}_{}", bot::g.levelName, level ? level->m_levelString.size() : 0);
-        bot::g.levelHash = std::hash<std::string>{}(hashSource);
-
-        bot::loadMacro();
-        bot::applyClickFlags(this);
-
+        if (bot::mode == bot::Mode::Record) {
+            CCScheduler::get()->setTimeScale(static_cast<float>(bot::recSpeed));
+        } else {
+            CCScheduler::get()->setTimeScale(1.0f);
+        }
         return true;
     }
 
     void resetLevel() {
-        std::srand(1337);
-        bot::g.cpLoaded = false;
-
+        this->m_clickBetweenSteps = false;
         PlayLayer::resetLevel();
 
-        bot::resetEngine();
+        bot::currentStep = 0;
+        bot::macroIndex = 0;
+        bot::p1State = bot::ButtonState();
+        bot::p2State = bot::ButtonState();
+        bot::isSubStepping = false;
+        bot::dualUpdatedInP1 = false;
+        bot::resetTimingBaseline();
 
-        if (!bot::g.cpLoaded) {
-            bot::g.step = 0;
-            bot::g.index = 0;
-            bot::g.checkpoints.clear();
-            if (bot::g.mode == bot::Mode::Record) {
-                bot::g.macro.clear();
-            }
+        if (this->m_player1) {
+            this->m_player1->releaseButton(PlayerButton::Jump);
+            this->m_player1->releaseButton(PlayerButton::Left);
+            this->m_player1->releaseButton(PlayerButton::Right);
         }
+        if (this->m_player2) {
+            this->m_player2->releaseButton(PlayerButton::Jump);
+            this->m_player2->releaseButton(PlayerButton::Left);
+            this->m_player2->releaseButton(PlayerButton::Right);
+        }
+
+        if (bot::mode == bot::Mode::Record) {
+            bot::currentMacro.clear();
+            CCScheduler::get()->setTimeScale(static_cast<float>(bot::recSpeed));
+        } else {
+            CCScheduler::get()->setTimeScale(1.0f);
+        }
+    }
+
+    bool handleButton(bool isDown, int button, bool isPlayer1) {
+        if (bot::mode == bot::Mode::Play) {
+            return false;
+        }
+
+        if (bot::mode == bot::Mode::Record) {
+            auto& state = isPlayer1 ? bot::p1State : bot::p2State;
+            if (isDown == state.isHeld(button)) {
+                return PlayLayer::handleButton(isDown, button, isPlayer1);
+            }
+            state.setHeld(button, isDown);
+
+            auto now = std::chrono::steady_clock::now();
+            double elapsed = std::chrono::duration<double>(now - bot::stepStartTime).count();
+            double stepDuration = (1.0 / 240.0) / (bot::recSpeed > bot::SMALLEST ? bot::recSpeed : 1.0);
+            double frac = std::clamp(elapsed / stepDuration, 0.0, 0.999);
+
+            bot::Action act;
+            act.step = bot::currentStep;
+            act.frac = frac;
+            act.down = isDown;
+            act.p1 = isPlayer1;
+            act.btn = static_cast<uint8_t>(button);
+            bot::currentMacro.push_back(act);
+        }
+        return PlayLayer::handleButton(isDown, button, isPlayer1);
     }
 
     CheckpointObject* createCheckpoint() {
         auto cp = PlayLayer::createCheckpoint();
-        if (cp) {
-            bot::CheckpointData data{};
-            data.step = bot::g.step;
-            if (this->m_player1) {
-                data.p1Pos = this->m_player1->getPosition();
-                data.p1YVel = this->m_player1->m_yVelocity;
-                data.p1Rot = this->m_player1->getRotation();
-                data.p1OnGround = this->m_player1->m_isOnGround;
-            }
-            if (this->m_player2) {
-                data.p2Pos = this->m_player2->getPosition();
-                data.p2YVel = this->m_player2->m_yVelocity;
-                data.p2Rot = this->m_player2->getRotation();
-                data.p2OnGround = this->m_player2->m_isOnGround;
-            }
-            bot::g.checkpoints[cp] = data;
+        if (!cp) return cp;
+
+        bot::CheckpointData data;
+        data.step = bot::currentStep;
+        data.macroSize = bot::currentMacro.size();
+
+        if (this->m_player1) {
+            data.p1Pos = this->m_player1->getPosition();
+            data.p1YVel = this->m_player1->m_yVelocity;
+            data.p1Rot = this->m_player1->getRotation();
+            data.p1OnGround = this->m_player1->m_isOnGround;
         }
+        if (this->m_player2) {
+            data.p2Pos = this->m_player2->getPosition();
+            data.p2YVel = this->m_player2->m_yVelocity;
+            data.p2Rot = this->m_player2->getRotation();
+            data.p2OnGround = this->m_player2->m_isOnGround;
+        }
+
+        bot::checkpoints[cp] = data;
         return cp;
+    }
+
+    void removeCheckpoint(bool p0) {
+        PlayLayer::removeCheckpoint(p0);
     }
 
     void loadFromCheckpoint(CheckpointObject* cp) {
         PlayLayer::loadFromCheckpoint(cp);
+        if (!cp) return;
 
-        bot::g.cpLoaded = true;
-        this->m_playerDied = false;
+        auto it = bot::checkpoints.find(cp);
+        if (it == bot::checkpoints.end()) return;
 
-        this->handleButton(false, 1, true);
-        this->handleButton(false, 1, false);
+        const auto& data = it->second;
+        bot::currentStep = data.step;
 
-        bot::resetTimingBaseline();
-
-        auto it = bot::g.checkpoints.find(cp);
-        if (it == bot::g.checkpoints.end()) {
-            bot::g.step = 0;
-            bot::g.index = 0;
-            if (bot::g.mode != bot::Mode::Off) {
-                bot::g.mode = bot::Mode::Off;
-                bot::applyClickFlags(this);
-                bot::notify("Bot: checkpoint data not found, disabled", NotificationIcon::Warning);
+        if (bot::mode == bot::Mode::Record) {
+            if (data.macroSize <= bot::currentMacro.size()) {
+                bot::currentMacro.resize(data.macroSize);
             }
-            return;
+        } else if (bot::mode == bot::Mode::Play) {
+            bot::syncPlayback();
         }
-
-        auto& data = it->second;
-        bot::g.step = data.step;
 
         if (this->m_player1) {
             this->m_player1->setPosition(data.p1Pos);
             this->m_player1->m_yVelocity = data.p1YVel;
             this->m_player1->setRotation(data.p1Rot);
             this->m_player1->m_isOnGround = data.p1OnGround;
-            this->m_player1->m_isDead = false;
+            this->m_player1->releaseButton(PlayerButton::Jump);
+            this->m_player1->releaseButton(PlayerButton::Left);
+            this->m_player1->releaseButton(PlayerButton::Right);
         }
+
         if (this->m_player2) {
             this->m_player2->setPosition(data.p2Pos);
             this->m_player2->m_yVelocity = data.p2YVel;
             this->m_player2->setRotation(data.p2Rot);
             this->m_player2->m_isOnGround = data.p2OnGround;
-            this->m_player2->m_isDead = false;
+            this->m_player2->releaseButton(PlayerButton::Jump);
+            this->m_player2->releaseButton(PlayerButton::Left);
+            this->m_player2->releaseButton(PlayerButton::Right);
         }
 
-        if (bot::g.mode == bot::Mode::Record) {
-            bot::g.macro.erase(
-                std::remove_if(bot::g.macro.begin(), bot::g.macro.end(),
-                    [](const bot::Action& a) { return a.step >= bot::g.step; }),
-                bot::g.macro.end()
-            );
-        } else if (bot::g.mode == bot::Mode::Play) {
-            bot::syncPlayback(this);
-        }
-    }
-
-    void levelComplete() {
-        if (bot::g.mode == bot::Mode::Record && !bot::g.macro.empty()) {
-            bot::saveMacro();
-            bot::notify("Macro saved", NotificationIcon::Success);
-        }
-
-        bot::g.mode = bot::Mode::Off;
-        bot::applyClickFlags(this);
-        bot::resetEngine();
-
-        PlayLayer::levelComplete();
+        bot::p1State = bot::ButtonState();
+        bot::p2State = bot::ButtonState();
+        bot::resetTimingBaseline();
     }
 };
 
-class $modify(BotPauseLayer, PauseLayer) {
+struct BotPlayerObject : Modify<BotPlayerObject, PlayerObject> {
+    void update(float dt) {
+        auto pl = PlayLayer::get();
+        if (!pl || pl->m_isPaused || bot::isSubStepping) {
+            PlayerObject::update(dt);
+            return;
+        }
+
+        if (this == pl->m_player2 && bot::dualUpdatedInP1) {
+            return;
+        }
+
+        if (this != pl->m_player1) {
+            PlayerObject::update(dt);
+            return;
+        }
+
+        bool isDual = (pl->m_player2 != nullptr && pl->m_player2->isVisible());
+        bot::dualUpdatedInP1 = isDual;
+        bot::stepStartTime = std::chrono::steady_clock::now();
+
+        if (bot::mode == bot::Mode::Play) {
+            double currentFrac = 0.0;
+            bot::isSubStepping = true;
+
+            while (bot::macroIndex < bot::currentMacro.size()) {
+                const auto& act = bot::currentMacro[bot::macroIndex];
+                if (act.step != bot::currentStep) {
+                    break;
+                }
+
+                double targetFrac = std::clamp(act.frac, 0.0, 0.999);
+                if (targetFrac > currentFrac) {
+                    float subDelta = static_cast<float>((targetFrac - currentFrac) * dt);
+                    PlayerObject::update(subDelta);
+                    if (isDual) {
+                        pl->m_player2->update(subDelta);
+                    }
+                    currentFrac = targetFrac;
+                }
+
+                bot::applyActionDirect(act, pl);
+                bot::macroIndex++;
+            }
+
+            float remDelta = static_cast<float>((1.0 - currentFrac) * dt);
+            PlayerObject::update(remDelta);
+            if (isDual) {
+                pl->m_player2->update(remDelta);
+            }
+
+            bot::isSubStepping = false;
+            bot::currentStep++;
+            return;
+        }
+
+        PlayerObject::update(dt);
+        if (isDual) {
+            pl->m_player2->update(dt);
+        }
+        bot::currentStep++;
+    }
+};
+
+struct BotPauseLayer : Modify<BotPauseLayer, PauseLayer> {
     struct Fields {
-        CCMenu* m_mainBotMenu = nullptr;
-        CCNode* m_macroPanel = nullptr;
-        ScrollLayer* m_scroll = nullptr;
-        CCMenu* m_listMenu = nullptr;
+        CCLabelBMFont* statusLabel = nullptr;
+        CCLabelBMFont* speedLabel = nullptr;
+        CCMenu* botMenu = nullptr;
+        CCLayerColor* macroOverlay = nullptr;
+        ScrollLayer* macroScroll = nullptr;
     };
 
     void customSetup() {
         PauseLayer::customSetup();
 
-        auto winSize = CCDirector::get()->getWinSize();
+        auto winSize = CCDirector::sharedDirector()->getWinSize();
 
-        auto mainMenu = CCMenu::create();
-        mainMenu->setPosition({ winSize.width / 2.0f, 42.0f });
-        mainMenu->setContentSize({ winSize.width - 40.0f, 32.0f });
+        m_fields->botMenu = CCMenu::create();
+        m_fields->botMenu->setID("tas-bot-panel"_spr);
+        m_fields->botMenu->setPosition(winSize.width / 2.0f, 42.0f);
+        m_fields->botMenu->setContentSize({winSize.width - 20.0f, 32.0f});
 
         auto layout = RowLayout::create();
         layout->setGap(6.0f);
         layout->setAxisAlignment(AxisAlignment::Center);
-        mainMenu->setLayout(layout);
-        this->addChild(mainMenu, 100);
-        m_fields->m_mainBotMenu = mainMenu;
+        m_fields->botMenu->setLayout(layout);
 
-        auto recSpr = ButtonSprite::create("REC");
+        auto recSpr = ButtonSprite::create("REC", "goldFont.fnt", "GJ_button_01.png", 0.7f);
         recSpr->setScale(0.55f);
-        auto recBtn = CCMenuItemSpriteExtra::create(recSpr, this, menu_selector(BotPauseLayer::onBotRec));
-        mainMenu->addChild(recBtn);
+        auto recBtn = CCMenuItemSpriteExtra::create(recSpr, this, menu_selector(BotPauseLayer::onRecord));
 
-        auto playSpr = ButtonSprite::create("PLAY");
+        auto playSpr = ButtonSprite::create("PLAY", "goldFont.fnt", "GJ_button_02.png", 0.7f);
         playSpr->setScale(0.55f);
-        auto playBtn = CCMenuItemSpriteExtra::create(playSpr, this, menu_selector(BotPauseLayer::onBotPlay));
-        mainMenu->addChild(playBtn);
+        auto playBtn = CCMenuItemSpriteExtra::create(playSpr, this, menu_selector(BotPauseLayer::onPlay));
 
-        auto stopSpr = ButtonSprite::create("STOP");
+        auto stopSpr = ButtonSprite::create("OFF", "goldFont.fnt", "GJ_button_06.png", 0.7f);
         stopSpr->setScale(0.55f);
-        auto stopBtn = CCMenuItemSpriteExtra::create(stopSpr, this, menu_selector(BotPauseLayer::onBotStop));
-        mainMenu->addChild(stopBtn);
+        auto stopBtn = CCMenuItemSpriteExtra::create(stopSpr, this, menu_selector(BotPauseLayer::onStop));
 
-        auto clearSpr = ButtonSprite::create("CLEAR");
+        auto clearSpr = ButtonSprite::create("CLR", "goldFont.fnt", "GJ_button_06.png", 0.7f);
         clearSpr->setScale(0.55f);
-        auto clearBtn = CCMenuItemSpriteExtra::create(clearSpr, this, menu_selector(BotPauseLayer::onBotClear));
-        mainMenu->addChild(clearBtn);
+        auto clearBtn = CCMenuItemSpriteExtra::create(clearSpr, this, menu_selector(BotPauseLayer::onClear));
 
-        auto macrosSpr = ButtonSprite::create("MACROS");
+        auto macrosSpr = ButtonSprite::create("FILES", "goldFont.fnt", "GJ_button_04.png", 0.7f);
         macrosSpr->setScale(0.55f);
-        auto macrosBtn = CCMenuItemSpriteExtra::create(macrosSpr, this, menu_selector(BotPauseLayer::onOpenMacroPanel));
-        mainMenu->addChild(macrosBtn);
+        auto macrosBtn = CCMenuItemSpriteExtra::create(macrosSpr, this, menu_selector(BotPauseLayer::onMacros));
 
-        auto speedDownSpr = ButtonSprite::create("-");
-        speedDownSpr->setScale(0.55f);
-        auto speedDownBtn = CCMenuItemSpriteExtra::create(speedDownSpr, this, menu_selector(BotPauseLayer::onSpeedDown));
-        mainMenu->addChild(speedDownBtn);
+        auto minusSpr = ButtonSprite::create("-", "bigFont.fnt", "GJ_button_01.png", 0.7f);
+        minusSpr->setScale(0.55f);
+        auto minusBtn = CCMenuItemSpriteExtra::create(minusSpr, this, menu_selector(BotPauseLayer::onSpeedMinus));
 
-        auto speedUpSpr = ButtonSprite::create("+");
-        speedUpSpr->setScale(0.55f);
-        auto speedUpBtn = CCMenuItemSpriteExtra::create(speedUpSpr, this, menu_selector(BotPauseLayer::onSpeedUp));
-        mainMenu->addChild(speedUpBtn);
+        m_fields->speedLabel = CCLabelBMFont::create(fmt::format("{:.2f}x", bot::recSpeed).c_str(), "bigFont.fnt");
+        m_fields->speedLabel->setScale(0.35f);
 
-        mainMenu->updateLayout();
+        auto plusSpr = ButtonSprite::create("+", "bigFont.fnt", "GJ_button_01.png", 0.7f);
+        plusSpr->setScale(0.55f);
+        auto plusBtn = CCMenuItemSpriteExtra::create(plusSpr, this, menu_selector(BotPauseLayer::onSpeedPlus));
 
-        auto label = CCLabelBMFont::create(bot::statusText().c_str(), "bigFont.fnt");
-        label->setScale(0.35f);
-        label->setPosition({ winSize.width / 2.0f, 18.0f });
-        label->setID("bot-status");
-        this->addChild(label, 100);
+        m_fields->botMenu->addChild(recBtn);
+        m_fields->botMenu->addChild(playBtn);
+        m_fields->botMenu->addChild(stopBtn);
+        m_fields->botMenu->addChild(clearBtn);
+        m_fields->botMenu->addChild(macrosBtn);
+        m_fields->botMenu->addChild(minusBtn);
+        m_fields->botMenu->addChild(m_fields->speedLabel);
+        m_fields->botMenu->addChild(plusBtn);
 
-        auto panel = CCNode::create();
-        panel->setContentSize({ 320, 220 });
-        panel->setAnchorPoint({ 0.5f, 0.5f });
-        panel->setPosition({ winSize.width / 2.0f, winSize.height / 2.0f });
-        panel->setVisible(false);
-        this->addChild(panel, 200);
-        m_fields->m_macroPanel = panel;
+        m_fields->botMenu->updateLayout();
+        this->addChild(m_fields->botMenu, 100);
 
-        auto bg = CCScale9Sprite::create("square02_small.png");
-        bg->setContentSize({ 320, 220 });
-        bg->setPosition({ 160, 110 });
-        bg->setOpacity(230);
-        panel->addChild(bg);
+        m_fields->statusLabel = CCLabelBMFont::create("", "chatFont.fnt");
+        m_fields->statusLabel->setPosition(winSize.width / 2.0f, 18.0f);
+        m_fields->statusLabel->setScale(0.55f);
+        this->addChild(m_fields->statusLabel, 100);
 
-        auto title = CCLabelBMFont::create("Saved Macros", "bigFont.fnt");
+        updateLabels();
+    }
+
+    void updateLabels() {
+        if (!m_fields->statusLabel) return;
+
+        std::string modeStr = "OFF";
+        ccColor3B col = {180, 180, 180};
+        if (bot::mode == bot::Mode::Record) {
+            modeStr = "REC";
+            col = {255, 60, 60};
+        } else if (bot::mode == bot::Mode::Play) {
+            modeStr = "PLAY";
+            col = {60, 255, 60};
+        }
+
+        m_fields->statusLabel->setString(
+            fmt::format("MODE: {} | ACTS: {} | STEP: {} | FILE: {}",
+                modeStr, bot::currentMacro.size(), bot::currentStep, bot::currentMacroName).c_str()
+        );
+        m_fields->statusLabel->setColor(col);
+
+        if (m_fields->speedLabel) {
+            m_fields->speedLabel->setString(fmt::format("{:.2f}x", bot::recSpeed).c_str());
+        }
+    }
+
+    void onRecord(CCObject*) {
+        bot::mode = bot::Mode::Record;
+        bot::currentMacro.clear();
+        bot::currentStep = 0;
+        bot::macroIndex = 0;
+        bot::p1State = bot::ButtonState();
+        bot::p2State = bot::ButtonState();
+        CCScheduler::get()->setTimeScale(static_cast<float>(bot::recSpeed));
+        updateLabels();
+    }
+
+    void onPlay(CCObject*) {
+        bot::mode = bot::Mode::Play;
+        bot::macroIndex = 0;
+        bot::currentStep = 0;
+        bot::p1State = bot::ButtonState();
+        bot::p2State = bot::ButtonState();
+        CCScheduler::get()->setTimeScale(1.0f);
+        updateLabels();
+    }
+
+    void onStop(CCObject*) {
+        bot::mode = bot::Mode::Off;
+        CCScheduler::get()->setTimeScale(1.0f);
+        updateLabels();
+    }
+
+    void onClear(CCObject*) {
+        bot::currentMacro.clear();
+        bot::macroIndex = 0;
+        bot::currentStep = 0;
+        updateLabels();
+    }
+
+    void onSpeedMinus(CCObject*) {
+        bot::recSpeed = std::max(0.1, bot::recSpeed - 0.1);
+        Mod::get()->setSettingValue<double>("record-speed", bot::recSpeed);
+        if (bot::mode == bot::Mode::Record) {
+            CCScheduler::get()->setTimeScale(static_cast<float>(bot::recSpeed));
+        }
+        updateLabels();
+    }
+
+    void onSpeedPlus(CCObject*) {
+        bot::recSpeed = std::min(1.0, bot::recSpeed + 0.1);
+        Mod::get()->setSettingValue<double>("record-speed", bot::recSpeed);
+        if (bot::mode == bot::Mode::Record) {
+            CCScheduler::get()->setTimeScale(static_cast<float>(bot::recSpeed));
+        }
+        updateLabels();
+    }
+
+    void onMacros(CCObject*) {
+        buildMacroBrowser();
+    }
+
+    void buildMacroBrowser() {
+        if (m_fields->macroOverlay) {
+            m_fields->macroOverlay->removeFromParentAndCleanup(true);
+            m_fields->macroOverlay = nullptr;
+        }
+
+        auto winSize = CCDirector::sharedDirector()->getWinSize();
+
+        m_fields->macroOverlay = CCLayerColor::create({0, 0, 0, 220});
+        m_fields->macroOverlay->setContentSize(winSize);
+        m_fields->macroOverlay->setTouchPriority(-500);
+
+        auto panel = CCScale9Sprite::create("GJ_square01.png");
+        panel->setContentSize({340.0f, 220.0f});
+        panel->setPosition(winSize / 2.0f);
+        m_fields->macroOverlay->addChild(panel);
+
+        auto title = CCLabelBMFont::create("MACROS", "bigFont.fnt");
         title->setScale(0.55f);
-        title->setPosition({ 160, 200 });
-        panel->addChild(title);
+        title->setPosition(winSize.width / 2.0f, winSize.height / 2.0f + 92.0f);
+        m_fields->macroOverlay->addChild(title);
 
-        auto scroll = ScrollLayer::create({ 300, 140 });
-        scroll->setPosition({ 10, 45 });
-        panel->addChild(scroll);
-        m_fields->m_scroll = scroll;
+        auto topMenu = CCMenu::create();
+        topMenu->setPosition(CCPointZero);
+        topMenu->setTouchPriority(-501);
 
-        auto panelMenu = CCMenu::create();
-        panelMenu->setPosition({ 0, 0 });
-        panel->addChild(panelMenu);
+        auto closeSpr = CCSprite::createWithSpriteFrameName("GJ_closeBtn_001.png");
+        closeSpr->setScale(0.7f);
+        auto closeBtn = CCMenuItemSpriteExtra::create(closeSpr, this, menu_selector(BotPauseLayer::onCloseBrowser));
+        closeBtn->setPosition(winSize.width / 2.0f + 155.0f, winSize.height / 2.0f + 95.0f);
+        topMenu->addChild(closeBtn);
 
-        auto saveSpr = ButtonSprite::create("SAVE CURRENT");
+        auto saveSpr = ButtonSprite::create("SAVE CURRENT", "goldFont.fnt", "GJ_button_01.png", 0.7f);
         saveSpr->setScale(0.6f);
-        auto saveBtn = CCMenuItemSpriteExtra::create(saveSpr, this, menu_selector(BotPauseLayer::onSaveCurrentMacro));
-        saveBtn->setPosition({ 90, 22 });
-        panelMenu->addChild(saveBtn);
+        auto saveBtn = CCMenuItemSpriteExtra::create(saveSpr, this, menu_selector(BotPauseLayer::onSaveNewMacro));
+        saveBtn->setPosition(winSize.width / 2.0f, winSize.height / 2.0f - 88.0f);
+        topMenu->addChild(saveBtn);
 
-        auto backSpr = ButtonSprite::create("BACK");
-        backSpr->setScale(0.6f);
-        auto backBtn = CCMenuItemSpriteExtra::create(backSpr, this, menu_selector(BotPauseLayer::onCloseMacroPanel));
-        backBtn->setPosition({ 230, 22 });
-        panelMenu->addChild(backBtn);
+        m_fields->macroOverlay->addChild(topMenu);
 
-        this->refreshMacroList();
-    }
+        auto list = bot::listMacros();
+        float itemH = 28.0f;
+        float contentH = std::max(130.0f, static_cast<float>(list.size()) * itemH);
 
-    void refreshMacroList() {
-        auto scroll = m_fields->m_scroll;
-        if (!scroll) return;
+        auto scroll = ScrollLayer::create({300.0f, 130.0f});
+        scroll->setPosition(winSize.width / 2.0f - 150.0f, winSize.height / 2.0f - 65.0f);
+        scroll->m_contentLayer->setContentSize({300.0f, contentH});
 
-        auto content = scroll->m_contentLayer;
-        content->removeAllChildren();
+        auto rowMenu = CCMenu::create();
+        rowMenu->setPosition(CCPointZero);
+        rowMenu->setContentSize({300.0f, contentH});
+        rowMenu->setTouchPriority(-501);
 
-        auto listMenu = CCMenu::create();
-        listMenu->setPosition({ 0, 0 });
-        content->addChild(listMenu);
-        m_fields->m_listMenu = listMenu;
+        float y = contentH - (itemH / 2.0f);
+        for (const auto& name : list) {
+            auto lbl = CCLabelBMFont::create(name.c_str(), "chatFont.fnt");
+            lbl->setScale(0.55f);
+            lbl->setAnchorPoint({0.0f, 0.5f});
+            lbl->setPosition(10.0f, y);
+            rowMenu->addChild(lbl);
 
-        std::vector<std::filesystem::path> files;
-        auto dir = Mod::get()->getSaveDir();
-        if (std::filesystem::exists(dir)) {
-            for (auto& entry : std::filesystem::directory_iterator(dir)) {
-                if (entry.is_regular_file() && entry.path().extension() == bot::kMacroExt) {
-                    files.push_back(entry.path());
-                }
-            }
-        }
-        std::sort(files.begin(), files.end());
+            auto loadSpr = ButtonSprite::create("LOAD", "goldFont.fnt", "GJ_button_02.png", 0.5f);
+            loadSpr->setScale(0.5f);
+            auto loadBtn = CCMenuItemSpriteExtra::create(loadSpr, this, menu_selector(BotPauseLayer::onLoadItem));
+            loadBtn->setUserObject(CCString::create(name));
+            loadBtn->setPosition(210.0f, y);
+            rowMenu->addChild(loadBtn);
 
-        if (files.empty()) {
-            auto label = CCLabelBMFont::create("No saved macros yet", "chatFont.fnt");
-            label->setScale(0.6f);
-            label->setPosition({ 150, 70 });
-            content->addChild(label);
-            content->setContentSize({ 300, 140 });
-            return;
-        }
+            auto delSpr = ButtonSprite::create("DEL", "goldFont.fnt", "GJ_button_06.png", 0.5f);
+            delSpr->setScale(0.5f);
+            auto delBtn = CCMenuItemSpriteExtra::create(delSpr, this, menu_selector(BotPauseLayer::onDeleteItem));
+            delBtn->setUserObject(CCString::create(name));
+            delBtn->setPosition(260.0f, y);
+            rowMenu->addChild(delBtn);
 
-        float rowH = 28.0f;
-        float totalHeight = std::max(140.0f, static_cast<float>(files.size()) * rowH);
-        content->setContentSize({ 300, totalHeight });
-
-        for (size_t i = 0; i < files.size(); i++) {
-            auto& path = files[i];
-            std::string name = path.filename().string();
-            std::string shown = name.size() > 18 ? (name.substr(0, 18) + "..") : name;
-            float y = totalHeight - static_cast<float>(i + 1) * rowH + (rowH / 2.0f);
-
-            auto label = CCLabelBMFont::create(shown.c_str(), "chatFont.fnt");
-            label->setScale(0.5f);
-            label->setAnchorPoint({ 0.0f, 0.5f });
-            label->setPosition({ 12, y });
-            content->addChild(label);
-
-            auto loadSpr = ButtonSprite::create("LOAD");
-            loadSpr->setScale(0.45f);
-            auto loadBtn = CCMenuItemSpriteExtra::create(loadSpr, this, menu_selector(BotPauseLayer::onLoadFile));
-            loadBtn->setPosition({ 220, y });
-            auto pathStr = CCString::create(path.string());
-            loadBtn->setUserObject(pathStr);
-            listMenu->addChild(loadBtn);
-
-            auto delSpr = ButtonSprite::create("X");
-            delSpr->setScale(0.45f);
-            auto delBtn = CCMenuItemSpriteExtra::create(delSpr, this, menu_selector(BotPauseLayer::onDeleteFile));
-            delBtn->setPosition({ 270, y });
-            auto pathStr2 = CCString::create(path.string());
-            delBtn->setUserObject(pathStr2);
-            listMenu->addChild(delBtn);
+            y -= itemH;
         }
 
+        scroll->m_contentLayer->addChild(rowMenu);
         scroll->moveToTop();
+        m_fields->macroOverlay->addChild(scroll);
+        this->addChild(m_fields->macroOverlay, 200);
     }
 
-    void onOpenMacroPanel(CCObject*) {
-        m_fields->m_macroPanel->setVisible(true);
-        m_fields->m_mainBotMenu->setVisible(false);
-        this->refreshMacroList();
-    }
-
-    void onCloseMacroPanel(CCObject*) {
-        m_fields->m_macroPanel->setVisible(false);
-        m_fields->m_mainBotMenu->setVisible(true);
-        this->updateBotLabel();
-    }
-
-    void onSaveCurrentMacro(CCObject*) {
-        if (bot::g.macro.empty()) {
-            bot::notify("Nothing to save", NotificationIcon::Warning);
-            return;
+    void onCloseBrowser(CCObject*) {
+        if (m_fields->macroOverlay) {
+            m_fields->macroOverlay->removeFromParentAndCleanup(true);
+            m_fields->macroOverlay = nullptr;
         }
-
-        auto now = std::time(nullptr);
-        char timeBuf[32];
-        std::strftime(timeBuf, sizeof(timeBuf), "%m%d_%H%M%S", std::localtime(&now));
-
-        std::string filename = fmt::format("{}_{}{}", bot::g.levelName, timeBuf, bot::kMacroExt);
-        if (bot::writeMacroToFile(bot::macroPath(filename), bot::g.macro)) {
-            bot::notify("Saved as " + filename, NotificationIcon::Success);
-            this->refreshMacroList();
-        } else {
-            bot::notify("Save failed", NotificationIcon::Error);
-        }
+        updateLabels();
     }
 
-    void onLoadFile(CCObject* sender) {
-        auto item = static_cast<CCMenuItemSpriteExtra*>(sender);
-        auto pathStr = static_cast<CCString*>(item->getUserObject());
-        if (!pathStr) return;
-
-        std::vector<bot::Action> macro;
-        if (bot::readMacroFromFile(pathStr->getCString(), macro)) {
-            bot::g.macro = std::move(macro);
-            bot::g.index = 0;
-            bot::notify("Macro loaded", NotificationIcon::Success);
-            this->updateBotLabel();
-        } else {
-            bot::notify("Failed to load macro", NotificationIcon::Error);
-        }
+    void onSaveNewMacro(CCObject*) {
+        auto t = std::time(nullptr);
+        auto tm = *std::localtime(&t);
+        std::ostringstream oss;
+        oss << "macro_" << std::put_time(&tm, "%Y%m%d_%H%M%S");
+        std::string name = oss.str();
+        bot::saveToFile(name);
+        bot::currentMacroName = name;
+        buildMacroBrowser();
     }
 
-    void onDeleteFile(CCObject* sender) {
-        auto item = static_cast<CCMenuItemSpriteExtra*>(sender);
-        auto pathStr = static_cast<CCString*>(item->getUserObject());
-        if (!pathStr) return;
+    void onLoadItem(CCObject* sender) {
+        auto btn = static_cast<CCMenuItemSpriteExtra*>(sender);
+        if (!btn) return;
+        auto str = static_cast<CCString*>(btn->getUserObject());
+        if (!str) return;
 
+        bot::loadFromFile(str->getCString());
+        onCloseBrowser(nullptr);
+    }
+
+    void onDeleteItem(CCObject* sender) {
+        auto btn = static_cast<CCMenuItemSpriteExtra*>(sender);
+        if (!btn) return;
+        auto str = static_cast<CCString*>(btn->getUserObject());
+        if (!str) return;
+
+        auto path = bot::getMacrosDir() / (std::string(str->getCString()) + ".gdbot");
         std::error_code ec;
-        std::filesystem::remove(pathStr->getCString(), ec);
-        this->refreshMacroList();
-    }
-
-    void updateBotLabel() {
-        auto label = static_cast<CCLabelBMFont*>(this->getChildByID("bot-status"));
-        if (label) {
-            label->setString(bot::statusText().c_str());
-        }
-    }
-
-    void onSpeedDown(CCObject*) {
-        bot::recSpeed -= 0.1;
-        if (bot::recSpeed < 0.05) bot::recSpeed = 0.05;
-        (void)Mod::get()->setSettingValue<double>("record-speed", bot::recSpeed);
-        this->updateBotLabel();
-    }
-
-    void onSpeedUp(CCObject*) {
-        bot::recSpeed += 0.1;
-        if (bot::recSpeed > 1.0) bot::recSpeed = 1.0;
-        (void)Mod::get()->setSettingValue<double>("record-speed", bot::recSpeed);
-        this->updateBotLabel();
-    }
-
-    void onBotRec(CCObject*) {
-        bot::g.mode = bot::Mode::Record;
-        bot::g.macro.clear();
-        bot::g.step = 0;
-        bot::g.index = 0;
-        bot::applyClickFlags(PlayLayer::get());
-        this->updateBotLabel();
-        this->onRestart(nullptr);
-    }
-
-    void onBotPlay(CCObject*) {
-        if (bot::g.macro.empty()) {
-            bot::notify("No macro to play", NotificationIcon::Warning);
-            return;
-        }
-        bot::g.mode = bot::Mode::Play;
-        bot::g.step = 0;
-        bot::g.index = 0;
-        bot::applyClickFlags(PlayLayer::get());
-        this->updateBotLabel();
-        this->onRestart(nullptr);
-    }
-
-    void onBotStop(CCObject*) {
-        bot::g.mode = bot::Mode::Off;
-        bot::applyClickFlags(PlayLayer::get());
-        this->updateBotLabel();
-    }
-
-    void onBotClear(CCObject*) {
-        bot::g.macro.clear();
-        bot::g.step = 0;
-        bot::g.index = 0;
-        this->updateBotLabel();
+        std::filesystem::remove(path, ec);
+        buildMacroBrowser();
     }
 };
-
-$on_mod(Loaded) {
-    bot::recSpeed = Mod::get()->getSettingValue<double>("record-speed");
-}
