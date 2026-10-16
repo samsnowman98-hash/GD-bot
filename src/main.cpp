@@ -6,7 +6,6 @@
 #include <Geode/binding/CheckpointObject.hpp>
 #include <Geode/binding/PlayerObject.hpp>
 #include <Geode/ui/TextInput.hpp>
-#include <Geode/ui/Popup.hpp>
 
 #include <chrono>
 #include <vector>
@@ -73,10 +72,7 @@ namespace bot {
     inline ButtonState p1State;
     inline ButtonState p2State;
 
-    // True while we synthesize input from playback so the record hook ignores it.
     inline bool internalInput = false;
-
-    // Bumped on every reset / checkpoint load; substep loop uses it to bail out.
     inline uint32_t resetCounter = 0;
 
     inline std::unordered_map<CheckpointObject*, CheckpointData> checkpoints;
@@ -203,13 +199,12 @@ namespace bot {
 }
 
 // ===========================================================================
-//  Input hook — record user input, block it during playback
+//  Input hook
 // ===========================================================================
 struct BotBaseGameLayer : Modify<BotBaseGameLayer, GJBaseGameLayer> {
     void handleButton(bool push, int button, bool player1) {
         if (!bot::internalInput) {
             if (bot::mode == bot::Mode::Play) {
-                // Block user input while playback is still active.
                 if (bot::macroIndex < bot::currentMacro.size()) return;
             } else if (bot::mode == bot::Mode::Record) {
                 auto pl = PlayLayer::get();
@@ -245,7 +240,7 @@ struct BotBaseGameLayer : Modify<BotBaseGameLayer, GJBaseGameLayer> {
 };
 
 // ===========================================================================
-//  PlayLayer hook — timing, substep playback, checkpoints
+//  PlayLayer hook
 // ===========================================================================
 struct BotPlayLayer : Modify<BotPlayLayer, PlayLayer> {
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
@@ -271,7 +266,7 @@ struct BotPlayLayer : Modify<BotPlayLayer, PlayLayer> {
         return true;
     }
 
-    void update(float dt) {
+    void update(float dt) override {
         if (this->m_isPaused) {
             PlayLayer::update(dt);
             return;
@@ -313,7 +308,6 @@ struct BotPlayLayer : Modify<BotPlayLayer, PlayLayer> {
             return;
         }
 
-        // Record / Off — single step, capture real time reference for this frame.
         bot::frameStartReal = std::chrono::steady_clock::now();
         bot::frameStartGameTime = bot::gameTime;
         bot::currentFrameDt = dt;
@@ -328,7 +322,6 @@ struct BotPlayLayer : Modify<BotPlayLayer, PlayLayer> {
 
         this->m_clickBetweenSteps = false;
 
-        // Full restart in Record → autosave the attempt before wiping.
         if (bot::mode == bot::Mode::Record && !bot::currentMacro.empty()) {
             bot::saveToFile("autosave");
         }
@@ -395,9 +388,6 @@ struct BotPlayLayer : Modify<BotPlayLayer, PlayLayer> {
     }
 
 private:
-    // Push/release player buttons to match ButtonState.
-    // NB: don't touch m_isHolding — it doesn't exist in this GD version,
-    // PlayerObject::pushButton/releaseButton is what actually matters.
     void applyHeldStateToGame() {
         auto apply = [](PlayerObject* po, const bot::ButtonState& s) {
             if (!po) return;
@@ -414,124 +404,33 @@ private:
 };
 
 // ===========================================================================
-//  Macro browser popup — Popup<> blocks input under itself natively
+//  Touch-blocking overlay layer (Cocos2d-x 2.2 touch delegate)
 // ===========================================================================
-class MacroBrowserPopup : public Popup<> {
-protected:
-    bool setup() override {
-        this->setTitle("MACROS");
-
-        auto winSize = m_mainLayer->getContentSize();
-
-        // Save current button
-        auto saveSpr = ButtonSprite::create(
-            "SAVE CURRENT", "goldFont.fnt", "GJ_button_01.png", 0.7f);
-        saveSpr->setScale(0.6f);
-        auto saveBtn = CCMenuItemSpriteExtra::create(
-            saveSpr, this, menu_selector(MacroBrowserPopup::onSaveNewMacro));
-
-        auto btnMenu = CCMenu::create();
-        btnMenu->addChild(saveBtn);
-        btnMenu->setPosition({winSize.width / 2.0f, 22.0f});
-        m_mainLayer->addChild(btnMenu);
-
-        // List
-        auto list = bot::listMacros();
-        float itemH = 28.0f;
-        float contentH = std::max(130.0f, static_cast<float>(list.size()) * itemH);
-
-        auto scroll = ScrollLayer::create({300.0f, 130.0f});
-        scroll->setPosition({winSize.width / 2.0f - 150.0f, winSize.height / 2.0f - 65.0f});
-        scroll->m_contentLayer->setContentSize({300.0f, contentH});
-
-        auto rowMenu = CCMenu::create();
-        rowMenu->setPosition(CCPointZero);
-        rowMenu->setContentSize({300.0f, contentH});
-
-        float y = contentH - (itemH / 2.0f);
-        for (const auto& name : list) {
-            auto lbl = CCLabelBMFont::create(name.c_str(), "chatFont.fnt");
-            lbl->setScale(0.55f);
-            lbl->setAnchorPoint({0.0f, 0.5f});
-            lbl->setPosition(10.0f, y);
-            rowMenu->addChild(lbl);
-
-            auto loadSpr = ButtonSprite::create(
-                "LOAD", "goldFont.fnt", "GJ_button_02.png", 0.5f);
-            loadSpr->setScale(0.5f);
-            auto loadBtn = CCMenuItemSpriteExtra::create(
-                loadSpr, this, menu_selector(MacroBrowserPopup::onLoadItem));
-            loadBtn->setUserObject(CCString::create(name.c_str()));
-            loadBtn->setPosition(210.0f, y);
-            rowMenu->addChild(loadBtn);
-
-            auto delSpr = ButtonSprite::create(
-                "DEL", "goldFont.fnt", "GJ_button_06.png", 0.5f);
-            delSpr->setScale(0.5f);
-            auto delBtn = CCMenuItemSpriteExtra::create(
-                delSpr, this, menu_selector(MacroBrowserPopup::onDeleteItem));
-            delBtn->setUserObject(CCString::create(name.c_str()));
-            delBtn->setPosition(260.0f, y);
-            rowMenu->addChild(delBtn);
-
-            y -= itemH;
-        }
-
-        scroll->m_contentLayer->addChild(rowMenu);
-        scroll->moveToTop();
-        m_mainLayer->addChild(scroll);
-
-        return true;
-    }
-
-    void onSaveNewMacro(CCObject*) {
-        auto t = std::time(nullptr);
-        auto tm = *std::localtime(&t);
-        std::ostringstream oss;
-        oss << "macro_" << std::put_time(&tm, "%Y%m%d_%H%M%S");
-        std::string name = oss.str();
-        if (bot::saveToFile(name)) {
-            bot::currentMacroName = name;
-        }
-        // Close; user reopens FILES to see the new entry.
-        this->onClose(nullptr);
-    }
-
-    void onLoadItem(CCObject* sender) {
-        auto btn = static_cast<CCMenuItemSpriteExtra*>(sender);
-        if (!btn) return;
-        auto str = static_cast<CCString*>(btn->getUserObject());
-        if (!str) return;
-
-        bot::loadFromFile(str->getCString());
-        // Loading resets timing; disarm bot so user re-arms REC/PLAY manually.
-        bot::mode = bot::Mode::Off;
-        CCScheduler::get()->setTimeScale(1.0f);
-        this->onClose(nullptr);
-    }
-
-    void onDeleteItem(CCObject* sender) {
-        auto btn = static_cast<CCMenuItemSpriteExtra*>(sender);
-        if (!btn) return;
-        auto str = static_cast<CCString*>(btn->getUserObject());
-        if (!str) return;
-
-        auto path = bot::getMacrosDir()
-            / (std::string(str->getCString()) + bot::FILE_EXT);
-        std::error_code ec;
-        std::filesystem::remove(path, ec);
-        this->onClose(nullptr);
-    }
-
+class MacroOverlayLayer : public CCLayerColor {
 public:
-    static MacroBrowserPopup* create() {
-        auto ret = new MacroBrowserPopup();
-        if (ret && ret->initAnchored(360.f, 240.f, "GJ_square01.png")) {
+    static MacroOverlayLayer* create(const ccColor4B& color) {
+        auto ret = new MacroOverlayLayer();
+        if (ret && ret->initWithColor(color)) {
             ret->autorelease();
             return ret;
         }
         delete ret;
         return nullptr;
+    }
+
+    bool init() {
+        if (!CCLayerColor::init()) return false;
+        this->setTouchEnabled(true);
+        return true;
+    }
+
+    void registerWithTouchDispatcher() override {
+        // High priority (-500) and swallowsTouches=true so touches don't pass to PauseLayer
+        CCTouchDispatcher::get()->addTargetedDelegate(this, -500, true);
+    }
+
+    bool ccTouchBegan(CCTouch*, CCEvent*) override {
+        return true;
     }
 };
 
@@ -543,6 +442,7 @@ struct BotPauseLayer : Modify<BotPauseLayer, PauseLayer> {
         CCLabelBMFont* statusLabel = nullptr;
         TextInput* speedInput = nullptr;
         CCMenu* botMenu = nullptr;
+        CCLayerColor* macroOverlay = nullptr;
     };
 
     void customSetup() {
@@ -552,36 +452,36 @@ struct BotPauseLayer : Modify<BotPauseLayer, PauseLayer> {
 
         m_fields->botMenu = CCMenu::create();
         m_fields->botMenu->setID("tas-bot-panel"_spr);
-        m_fields->botMenu->setPosition(winSize.width / 2.0f, 40.0f);
-        m_fields->botMenu->setContentSize({winSize.width - 20.0f, 30.0f});
+        m_fields->botMenu->setPosition(winSize.width / 2.0f, 42.0f);
+        m_fields->botMenu->setContentSize({winSize.width - 20.0f, 32.0f});
 
         auto layout = RowLayout::create();
         layout->setGap(6.0f);
         layout->setAxisAlignment(AxisAlignment::Center);
         m_fields->botMenu->setLayout(layout);
 
-        auto addBtn = [&](const char* text, const char* font,
-                          const char* bg, SEL_MenuHandler cb) {
-            auto spr = ButtonSprite::create(text, font, bg, 0.7f);
-            spr->setScale(0.55f);
-            auto btn = CCMenuItemSpriteExtra::create(spr, this, cb);
-            m_fields->botMenu->addChild(btn);
-        };
+        auto recSpr = ButtonSprite::create("REC", "goldFont.fnt", "GJ_button_01.png", 0.7f);
+        recSpr->setScale(0.55f);
+        auto recBtn = CCMenuItemSpriteExtra::create(recSpr, this, menu_selector(BotPauseLayer::onRecord));
 
-        addBtn("REC",   "goldFont.fnt", "GJ_button_01.png",
-               menu_selector(BotPauseLayer::onRecord));
-        addBtn("PLAY",  "goldFont.fnt", "GJ_button_02.png",
-               menu_selector(BotPauseLayer::onPlay));
-        addBtn("OFF",   "goldFont.fnt", "GJ_button_06.png",
-               menu_selector(BotPauseLayer::onStop));
-        addBtn("CLR",   "goldFont.fnt", "GJ_button_06.png",
-               menu_selector(BotPauseLayer::onClear));
-        addBtn("FILES", "goldFont.fnt", "GJ_button_04.png",
-               menu_selector(BotPauseLayer::onMacros));
+        auto playSpr = ButtonSprite::create("PLAY", "goldFont.fnt", "GJ_button_02.png", 0.7f);
+        playSpr->setScale(0.55f);
+        auto playBtn = CCMenuItemSpriteExtra::create(playSpr, this, menu_selector(BotPauseLayer::onPlay));
+
+        auto stopSpr = ButtonSprite::create("OFF", "goldFont.fnt", "GJ_button_06.png", 0.7f);
+        stopSpr->setScale(0.55f);
+        auto stopBtn = CCMenuItemSpriteExtra::create(stopSpr, this, menu_selector(BotPauseLayer::onStop));
+
+        auto clearSpr = ButtonSprite::create("CLR", "goldFont.fnt", "GJ_button_06.png", 0.7f);
+        clearSpr->setScale(0.55f);
+        auto clearBtn = CCMenuItemSpriteExtra::create(clearSpr, this, menu_selector(BotPauseLayer::onClear));
+
+        auto macrosSpr = ButtonSprite::create("FILES", "goldFont.fnt", "GJ_button_04.png", 0.7f);
+        macrosSpr->setScale(0.55f);
+        auto macrosBtn = CCMenuItemSpriteExtra::create(macrosSpr, this, menu_selector(BotPauseLayer::onMacros));
 
         auto spdLabel = CCLabelBMFont::create("SPD:", "goldFont.fnt");
         spdLabel->setScale(0.5f);
-        m_fields->botMenu->addChild(spdLabel);
 
         m_fields->speedInput = TextInput::create(60.0f, "1.0", "bigFont.fnt");
         m_fields->speedInput->setScale(0.55f);
@@ -598,6 +498,13 @@ struct BotPauseLayer : Modify<BotPauseLayer, PauseLayer> {
                 }
             }
         });
+
+        m_fields->botMenu->addChild(recBtn);
+        m_fields->botMenu->addChild(playBtn);
+        m_fields->botMenu->addChild(stopBtn);
+        m_fields->botMenu->addChild(clearBtn);
+        m_fields->botMenu->addChild(macrosBtn);
+        m_fields->botMenu->addChild(spdLabel);
         m_fields->botMenu->addChild(m_fields->speedInput);
 
         m_fields->botMenu->updateLayout();
@@ -609,14 +516,6 @@ struct BotPauseLayer : Modify<BotPauseLayer, PauseLayer> {
         this->addChild(m_fields->statusLabel, 100);
 
         updateLabels();
-
-        // Refresh labels periodically so changes made inside macro popup
-        // are reflected on the pause screen behind it.
-        this->schedule(schedule_selector(BotPauseLayer::refreshTick), 0.25f);
-    }
-
-    void refreshTick(float) {
-        updateLabels();
     }
 
     void updateLabels() {
@@ -625,24 +524,26 @@ struct BotPauseLayer : Modify<BotPauseLayer, PauseLayer> {
         std::string modeStr = "OFF";
         ccColor3B col = {180, 180, 180};
         if (bot::mode == bot::Mode::Record) {
-            modeStr = "REC";  col = {255, 60, 60};
+            modeStr = "REC";
+            col = {255, 60, 60};
         } else if (bot::mode == bot::Mode::Play) {
-            modeStr = "PLAY"; col = {60, 255, 60};
+            modeStr = "PLAY";
+            col = {60, 255, 60};
         }
 
-        m_fields->statusLabel->setString(fmt::format(
-            "MODE: {} | ACTS: {} | TIME: {:.2f}s | FILE: {}",
-            modeStr, bot::currentMacro.size(), bot::gameTime,
-            bot::currentMacroName).c_str());
+        m_fields->statusLabel->setString(
+            fmt::format("MODE: {} | ACTS: {} | TIME: {:.2f}s | FILE: {}",
+                modeStr, bot::currentMacro.size(), bot::gameTime, bot::currentMacroName).c_str()
+        );
         m_fields->statusLabel->setColor(col);
     }
 
     void onRecord(CCObject*) {
         bot::mode = bot::Mode::Record;
         bot::currentMacro.clear();
-        bot::macroIndex = 0;
         bot::gameTime = 0.0;
         bot::frameStartGameTime = 0.0;
+        bot::macroIndex = 0;
         bot::p1State.reset();
         bot::p2State.reset();
         bot::resetTiming();
@@ -681,6 +582,134 @@ struct BotPauseLayer : Modify<BotPauseLayer, PauseLayer> {
     }
 
     void onMacros(CCObject*) {
-        MacroBrowserPopup::create()->show();
+        buildMacroBrowser();
+    }
+
+    void buildMacroBrowser() {
+        if (m_fields->macroOverlay) {
+            m_fields->macroOverlay->removeFromParentAndCleanup(true);
+            m_fields->macroOverlay = nullptr;
+        }
+
+        auto winSize = CCDirector::sharedDirector()->getWinSize();
+
+        // MacroOverlayLayer swallows touches so PauseLayer buttons underneath aren't clicked
+        m_fields->macroOverlay = MacroOverlayLayer::create({0, 0, 0, 220});
+        m_fields->macroOverlay->setContentSize(winSize);
+
+        auto panel = CCScale9Sprite::create("GJ_square01.png");
+        panel->setContentSize({340.0f, 220.0f});
+        panel->setPosition(winSize / 2.0f);
+        m_fields->macroOverlay->addChild(panel);
+
+        auto title = CCLabelBMFont::create("MACROS", "bigFont.fnt");
+        title->setScale(0.55f);
+        title->setPosition(winSize.width / 2.0f, winSize.height / 2.0f + 92.0f);
+        m_fields->macroOverlay->addChild(title);
+
+        auto topMenu = CCMenu::create();
+        topMenu->setPosition(CCPointZero);
+        topMenu->setTouchPriority(-501);
+
+        auto closeSpr = CCSprite::createWithSpriteFrameName("GJ_closeBtn_001.png");
+        closeSpr->setScale(0.7f);
+        auto closeBtn = CCMenuItemSpriteExtra::create(closeSpr, this, menu_selector(BotPauseLayer::onCloseBrowser));
+        closeBtn->setPosition(winSize.width / 2.0f + 155.0f, winSize.height / 2.0f + 95.0f);
+        topMenu->addChild(closeBtn);
+
+        auto saveSpr = ButtonSprite::create("SAVE CURRENT", "goldFont.fnt", "GJ_button_01.png", 0.7f);
+        saveSpr->setScale(0.6f);
+        auto saveBtn = CCMenuItemSpriteExtra::create(saveSpr, this, menu_selector(BotPauseLayer::onSaveNewMacro));
+        saveBtn->setPosition(winSize.width / 2.0f, winSize.height / 2.0f - 88.0f);
+        topMenu->addChild(saveBtn);
+
+        m_fields->macroOverlay->addChild(topMenu);
+
+        auto list = bot::listMacros();
+        float itemH = 28.0f;
+        float contentH = std::max(130.0f, static_cast<float>(list.size()) * itemH);
+
+        auto scroll = ScrollLayer::create({300.0f, 130.0f});
+        scroll->setPosition(winSize.width / 2.0f - 150.0f, winSize.height / 2.0f - 65.0f);
+        scroll->m_contentLayer->setContentSize({300.0f, contentH});
+
+        auto rowMenu = CCMenu::create();
+        rowMenu->setPosition(CCPointZero);
+        rowMenu->setContentSize({300.0f, contentH});
+        rowMenu->setTouchPriority(-501);
+
+        float y = contentH - (itemH / 2.0f);
+        for (const auto& name : list) {
+            auto lbl = CCLabelBMFont::create(name.c_str(), "chatFont.fnt");
+            lbl->setScale(0.55f);
+            lbl->setAnchorPoint({0.0f, 0.5f});
+            lbl->setPosition(10.0f, y);
+            rowMenu->addChild(lbl);
+
+            auto loadSpr = ButtonSprite::create("LOAD", "goldFont.fnt", "GJ_button_02.png", 0.5f);
+            loadSpr->setScale(0.5f);
+            auto loadBtn = CCMenuItemSpriteExtra::create(loadSpr, this, menu_selector(BotPauseLayer::onLoadItem));
+            loadBtn->setUserObject(CCString::create(name.c_str()));
+            loadBtn->setPosition(210.0f, y);
+            rowMenu->addChild(loadBtn);
+
+            auto delSpr = ButtonSprite::create("DEL", "goldFont.fnt", "GJ_button_06.png", 0.5f);
+            delSpr->setScale(0.5f);
+            auto delBtn = CCMenuItemSpriteExtra::create(delSpr, this, menu_selector(BotPauseLayer::onDeleteItem));
+            delBtn->setUserObject(CCString::create(name.c_str()));
+            delBtn->setPosition(260.0f, y);
+            rowMenu->addChild(delBtn);
+
+            y -= itemH;
+        }
+
+        scroll->m_contentLayer->addChild(rowMenu);
+        scroll->moveToTop();
+        m_fields->macroOverlay->addChild(scroll);
+        this->addChild(m_fields->macroOverlay, 200);
+    }
+
+    void onCloseBrowser(CCObject*) {
+        if (m_fields->macroOverlay) {
+            m_fields->macroOverlay->removeFromParentAndCleanup(true);
+            m_fields->macroOverlay = nullptr;
+        }
+        updateLabels();
+    }
+
+    void onSaveNewMacro(CCObject*) {
+        auto t = std::time(nullptr);
+        auto tm = *std::localtime(&t);
+        std::ostringstream oss;
+        oss << "macro_" << std::put_time(&tm, "%Y%m%d_%H%M%S");
+        std::string name = oss.str();
+        if (bot::saveToFile(name)) {
+            bot::currentMacroName = name;
+        }
+        buildMacroBrowser();
+    }
+
+    void onLoadItem(CCObject* sender) {
+        auto btn = static_cast<CCMenuItemSpriteExtra*>(sender);
+        if (!btn) return;
+        auto str = static_cast<CCString*>(btn->getUserObject());
+        if (!str) return;
+
+        bot::loadFromFile(str->getCString());
+        bot::mode = bot::Mode::Off;
+        CCScheduler::get()->setTimeScale(1.0f);
+        onCloseBrowser(nullptr);
+    }
+
+    void onDeleteItem(CCObject* sender) {
+        auto btn = static_cast<CCMenuItemSpriteExtra*>(sender);
+        if (!btn) return;
+        auto str = static_cast<CCString*>(btn->getUserObject());
+        if (!str) return;
+
+        auto path = bot::getMacrosDir() / (std::string(str->getCString()) + bot::FILE_EXT);
+        std::error_code ec;
+        std::filesystem::remove(path, ec);
+        buildMacroBrowser();
     }
 };
