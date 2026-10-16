@@ -7,10 +7,10 @@
 		"ios": "2.2081"
 	},
 	"id": "myname.gd_bot",
-	"name": "My GD Bot",
+	"name": "FermBot",
 	"version": "v1.0.0",
-	"developer": "User",
-	"description": "Macro practice bot for Geometry Dash 2.2081",
+	"developer": "StayAlone",
+	"description": "Мой гдбот в ранней бете",
 	"dependencies": {
 		"geode.node-ids": ">=1.23.3"
 	},
