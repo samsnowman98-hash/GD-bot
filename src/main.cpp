@@ -1,758 +1,629 @@
 #include <Geode/Geode.hpp>
 #include <Geode/modify/PlayLayer.hpp>
 #include <Geode/modify/PlayerObject.hpp>
-#include <Geode/modify/PauseLayer.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
-#include <Geode/binding/GJGameLevel.hpp>
+#include <Geode/modify/PauseLayer.hpp>
 #include <Geode/binding/CheckpointObject.hpp>
+#include <Geode/binding/ButtonSprite.hpp>
+#include <Geode/binding/CCMenuItemSpriteExtra.hpp>
+#include <Geode/binding/ScrollLayer.hpp>
+#include <Geode/binding/CCContentLayer.hpp>
 #include <Geode/ui/TextInput.hpp>
+#include <Geode/ui/Notification.hpp>
 #include <chrono>
 #include <vector>
 #include <string>
 #include <fstream>
-#include <sstream>
-#include <iomanip>
-#include <algorithm>
-#include <unordered_map>
 #include <filesystem>
+#include <algorithm>
+#include <cmath>
+#include <ctime>
 
 using namespace geode::prelude;
 
+enum class BotState {
+    Off,
+    Record,
+    Play
+};
+
+struct Action {
+    uint32_t step;
+    double frac;
+    bool down;
+    bool p1;
+    uint8_t btn;
+};
+
+struct BotMacro {
+    std::vector<Action> actions;
+};
+
+struct BotCheckpoint {
+    CheckpointObject* cp;
+    uint32_t step;
+    size_t macroActionCount;
+    size_t playIndexP1;
+    size_t playIndexP2;
+
+    cocos2d::CCPoint posP1;
+    double yVelP1;
+    float rotP1;
+    bool isOnGroundP1;
+    bool isUpsideDownP1;
+
+    cocos2d::CCPoint posP2;
+    double yVelP2;
+    float rotP2;
+    bool isOnGroundP2;
+    bool isUpsideDownP2;
+};
+
 namespace bot {
-    enum class Mode { Off, Record, Play };
-
-    struct Action {
-        uint32_t step = 0;
-        double frac = 0.0;
-        bool down = false;
-        bool p1 = true;
-        uint8_t btn = 1;
-    };
-
-    struct CheckpointData {
-        uint32_t step = 0;
-        size_t macroSize = 0;
-        CCPoint p1Pos = CCPointZero;
-        double p1YVel = 0.0;
-        float p1Rot = 0.0f;
-        bool p1OnGround = false;
-        CCPoint p2Pos = CCPointZero;
-        double p2YVel = 0.0;
-        float p2Rot = 0.0f;
-        bool p2OnGround = false;
-    };
-
-    struct ButtonState {
-        bool jump = false;
-        bool left = false;
-        bool right = false;
-
-        bool isHeld(int btn) const {
-            if (btn == 1) return jump;
-            if (btn == 2) return left;
-            if (btn == 3) return right;
-            return false;
-        }
-
-        void setHeld(int btn, bool held) {
-            if (btn == 1) jump = held;
-            else if (btn == 2) left = held;
-            else if (btn == 3) right = held;
-        }
-
-        void reset() {
-            jump = false;
-            left = false;
-            right = false;
-        }
-    };
-
-    inline Mode mode = Mode::Off;
-    inline std::vector<Action> currentMacro;
-    inline size_t macroIndex = 0;
+    inline BotState state = BotState::Off;
+    inline BotMacro currentMacro;
     inline uint32_t currentStep = 0;
-    inline float currentStepDt = 1.0f / 240.0f;
+    inline std::chrono::steady_clock::time_point stepStartTime = std::chrono::steady_clock::now();
+    inline size_t playIndexP1 = 0;
+    inline size_t playIndexP2 = 0;
+    inline bool isReplaying = false;
     inline double recSpeed = 1.0;
-    inline std::chrono::steady_clock::time_point stepStartTime;
-    inline std::unordered_map<CheckpointObject*, CheckpointData> checkpoints;
-    inline std::string currentMacroName = "autosave";
-    inline ButtonState p1State;
-    inline ButtonState p2State;
-    inline bool isSubStepping = false;
-    inline bool dualUpdatedInP1 = false;
+    inline std::vector<BotCheckpoint> checkpoints;
 
-    inline constexpr uint32_t MAGIC = 0x32544F42;
-    inline constexpr double SMALLEST = 1e-5;
-
-    inline void resetTimingBaseline() {
-        stepStartTime = std::chrono::steady_clock::now();
-    }
-
-    inline double parseSpeedString(const std::string& str) {
-        if (str.empty()) return -1.0;
-        double integerPart = 0.0;
-        double fracPart = 0.0;
-        double divisor = 10.0;
-        bool inFrac = false;
-        bool hasDigits = false;
-
-        for (char c : str) {
-            if (c >= '0' && c <= '9') {
-                hasDigits = true;
-                if (!inFrac) {
-                    integerPart = integerPart * 10.0 + (c - '0');
-                } else {
-                    fracPart += (c - '0') / divisor;
-                    divisor *= 10.0;
-                }
-            } else if (c == '.' || c == ',') {
-                if (inFrac) break;
-                inFrac = true;
-            }
-        }
-        if (!hasDigits) return -1.0;
-        return integerPart + fracPart;
-    }
-
-    inline std::filesystem::path getMacrosDir() {
-        auto dir = Mod::get()->getSaveDir() / "macros";
+    inline std::filesystem::path getMacroDir() {
+        auto dir = geode::Mod::get()->getSaveDir() / "macros";
         std::error_code ec;
         std::filesystem::create_directories(dir, ec);
         return dir;
     }
 
-    inline bool saveToFile(const std::string& name) {
-        auto path = getMacrosDir() / (name + ".gdbot");
-        std::ofstream file(path, std::ios::binary);
-        if (!file.is_open()) return false;
-
-        uint32_t magic = MAGIC;
-        uint32_t count = static_cast<uint32_t>(currentMacro.size());
-        file.write(reinterpret_cast<const char*>(&magic), sizeof(magic));
-        file.write(reinterpret_cast<const char*>(&count), sizeof(count));
-
-        for (const auto& act : currentMacro) {
-            file.write(reinterpret_cast<const char*>(&act.step), sizeof(act.step));
-            file.write(reinterpret_cast<const char*>(&act.frac), sizeof(act.frac));
-            uint8_t flags = (act.down ? 1 : 0) | (act.p1 ? 2 : 0);
-            file.write(reinterpret_cast<const char*>(&flags), sizeof(flags));
-            file.write(reinterpret_cast<const char*>(&act.btn), sizeof(act.btn));
+    inline double parseSpeedString(const std::string& str) {
+        if (str.empty()) return 1.0;
+        std::string s = str;
+        for (char& c : s) {
+            if (c == ',') c = '.';
         }
-        return true;
-    }
+        size_t start = s.find_first_not_of(" \t\r\n");
+        if (start == std::string::npos) return 1.0;
+        size_t end = s.find_last_not_of(" \t\r\n");
+        s = s.substr(start, end - start + 1);
 
-    inline bool loadFromFile(const std::string& name) {
-        auto path = getMacrosDir() / (name + ".gdbot");
-        std::ifstream file(path, std::ios::binary);
-        if (!file.is_open()) return false;
+        double whole = 0.0;
+        double frac = 0.0;
+        double div = 1.0;
+        bool inFrac = false;
+        bool hasDigits = false;
 
-        uint32_t magic = 0;
-        uint32_t count = 0;
-        file.read(reinterpret_cast<char*>(&magic), sizeof(magic));
-        if (magic != MAGIC) return false;
-
-        file.read(reinterpret_cast<char*>(&count), sizeof(count));
-        currentMacro.clear();
-        currentMacro.reserve(count);
-
-        for (uint32_t i = 0; i < count; i++) {
-            Action act;
-            file.read(reinterpret_cast<char*>(&act.step), sizeof(act.step));
-            file.read(reinterpret_cast<char*>(&act.frac), sizeof(act.frac));
-            uint8_t flags = 0;
-            file.read(reinterpret_cast<char*>(&flags), sizeof(flags));
-            file.read(reinterpret_cast<char*>(&act.btn), sizeof(act.btn));
-            act.down = (flags & 1) != 0;
-            act.p1 = (flags & 2) != 0;
-            currentMacro.push_back(act);
-        }
-
-        std::sort(currentMacro.begin(), currentMacro.end(), [](const Action& a, const Action& b) {
-            if (a.step != b.step) return a.step < b.step;
-            return a.frac < b.frac;
-        });
-
-        macroIndex = 0;
-        currentStep = 0;
-        currentMacroName = name;
-        return true;
-    }
-
-    inline std::vector<std::string> listMacros() {
-        std::vector<std::string> list;
-        std::error_code ec;
-        for (const auto& entry : std::filesystem::directory_iterator(getMacrosDir(), ec)) {
-            if (entry.is_regular_file() && entry.path().extension() == ".gdbot") {
-                list.push_back(entry.path().stem().string());
+        for (char c : s) {
+            if (c >= '0' && c <= '9') {
+                hasDigits = true;
+                if (!inFrac) {
+                    whole = whole * 10.0 + static_cast<double>(c - '0');
+                } else {
+                    div *= 10.0;
+                    frac += static_cast<double>(c - '0') / div;
+                }
+            } else if (c == '.' && !inFrac) {
+                inFrac = true;
+            } else {
+                break;
             }
         }
-        std::sort(list.begin(), list.end());
-        return list;
+        if (!hasDigits) return 1.0;
+        double val = whole + frac;
+        if (val < 0.01) val = 0.01;
+        if (val > 2.0) val = 2.0;
+        return val;
     }
 
-    inline void syncPlayback() {
-        macroIndex = 0;
-        while (macroIndex < currentMacro.size() && currentMacro[macroIndex].step < currentStep) {
-            macroIndex++;
+    inline bool saveMacro(const std::filesystem::path& path, const BotMacro& macro) {
+        std::ofstream out(path, std::ios::binary);
+        if (!out) return false;
+        uint32_t magic = 0x32544F42;
+        out.write(reinterpret_cast<const char*>(&magic), 4);
+        uint32_t count = static_cast<uint32_t>(macro.actions.size());
+        out.write(reinterpret_cast<const char*>(&count), 4);
+        for (const auto& act : macro.actions) {
+            out.write(reinterpret_cast<const char*>(&act.step), 4);
+            out.write(reinterpret_cast<const char*>(&act.frac), 8);
+            uint8_t flags = (act.down ? 1 : 0) | (act.p1 ? 2 : 0);
+            out.write(reinterpret_cast<const char*>(&flags), 1);
+            out.write(reinterpret_cast<const char*>(&act.btn), 1);
         }
+        return true;
     }
 
-    inline void recordAction(bool isPlayer1, int button, bool down, uint32_t step, double frac) {
-        if (mode != Mode::Record) return;
-
-        auto& state = isPlayer1 ? p1State : p2State;
-        if (state.isHeld(button) == down) {
-            return;
+    inline bool loadMacro(const std::filesystem::path& path, BotMacro& macro) {
+        std::ifstream in(path, std::ios::binary);
+        if (!in) return false;
+        uint32_t magic = 0;
+        in.read(reinterpret_cast<char*>(&magic), 4);
+        if (magic != 0x32544F42) return false;
+        uint32_t count = 0;
+        in.read(reinterpret_cast<char*>(&count), 4);
+        macro.actions.clear();
+        macro.actions.reserve(count);
+        for (uint32_t i = 0; i < count; ++i) {
+            Action act;
+            in.read(reinterpret_cast<char*>(&act.step), 4);
+            in.read(reinterpret_cast<char*>(&act.frac), 8);
+            uint8_t flags = 0;
+            in.read(reinterpret_cast<char*>(&flags), 1);
+            act.down = (flags & 1) != 0;
+            act.p1 = (flags & 2) != 0;
+            in.read(reinterpret_cast<char*>(&act.btn), 1);
+            macro.actions.push_back(act);
         }
-        state.setHeld(button, down);
-
-        Action act;
-        act.step = step;
-        act.frac = frac;
-        act.down = down;
-        act.p1 = isPlayer1;
-        act.btn = static_cast<uint8_t>(button);
-        currentMacro.push_back(act);
+        return true;
     }
 }
 
-struct BotBaseGameLayer : Modify<BotBaseGameLayer, GJBaseGameLayer> {
+static void stepPlayerWithCBF(PlayerObject* player, bool isP1, float dt, PlayLayer* pl) {
+    size_t& idx = isP1 ? bot::playIndexP1 : bot::playIndexP2;
+    double currentFrac = 0.0;
+
+    while (idx < bot::currentMacro.actions.size()) {
+        const auto& act = bot::currentMacro.actions[idx];
+        if (act.p1 != isP1) {
+            idx++;
+            continue;
+        }
+        if (act.step > bot::currentStep) {
+            break;
+        }
+
+        double targetFrac = (act.step == bot::currentStep) ? act.frac : currentFrac;
+        if (targetFrac < currentFrac) targetFrac = currentFrac;
+
+        double deltaFrac = targetFrac - currentFrac;
+        if (deltaFrac > 1e-6) {
+            player->update(static_cast<float>(deltaFrac * dt));
+            currentFrac = targetFrac;
+        }
+
+        bot::isReplaying = true;
+        pl->handleButton(act.down, act.btn, act.p1);
+        bot::isReplaying = false;
+
+        idx++;
+    }
+
+    double remainingFrac = 1.0 - currentFrac;
+    if (remainingFrac > 1e-6) {
+        player->update(static_cast<float>(remainingFrac * dt));
+    }
+}
+
+class $modify(BotBaseGameLayer, GJBaseGameLayer) {
     void handleButton(bool push, int button, bool player1) {
-        auto pl = PlayLayer::get();
-        if (!pl || static_cast<GJBaseGameLayer*>(pl) != this) {
+        if (bot::state == BotState::Play) {
+            if (bot::isReplaying) {
+                GJBaseGameLayer::handleButton(push, button, player1);
+            }
+            return;
+        }
+
+        if (bot::state == BotState::Record) {
+            auto now = std::chrono::steady_clock::now();
+            double elapsedSec = std::chrono::duration<double>(now - bot::stepStartTime).count();
+            double speed = (bot::recSpeed > 0.0001) ? bot::recSpeed : 1.0;
+            double stepDurationSec = (1.0 / 240.0) / speed;
+            double stepsElapsed = elapsedSec / stepDurationSec;
+            uint32_t stepOffset = static_cast<uint32_t>(stepsElapsed);
+            double frac = stepsElapsed - static_cast<double>(stepOffset);
+            if (frac < 0.0) frac = 0.0;
+            if (frac > 0.999999) frac = 0.999999;
+            uint32_t targetStep = bot::currentStep + stepOffset;
+
+            bot::currentMacro.actions.push_back({
+                targetStep,
+                frac,
+                push,
+                player1,
+                static_cast<uint8_t>(button)
+            });
+
             GJBaseGameLayer::handleButton(push, button, player1);
             return;
         }
 
-        if (bot::mode == bot::Mode::Play) {
+        GJBaseGameLayer::handleButton(push, button, player1);
+    }
+};
+
+class $modify(BotPlayerObject, PlayerObject) {
+    void update(float dt) {
+        auto pl = PlayLayer::get();
+        if (!pl) {
+            PlayerObject::update(dt);
             return;
         }
 
-        if (bot::mode == bot::Mode::Record && !pl->m_isPaused) {
-            auto now = std::chrono::steady_clock::now();
-            double elapsedReal = std::chrono::duration<double>(now - bot::stepStartTime).count();
-            double speed = bot::recSpeed > bot::SMALLEST ? bot::recSpeed : 1.0;
-            double stepDurationReal = (1.0 / 240.0) / speed;
+        bool isP1 = (this == pl->m_player1);
+        bool isP2 = (this == pl->m_player2);
 
-            double stepsTotal = 0.0;
-            if (stepDurationReal > 1e-7) {
-                stepsTotal = elapsedReal / stepDurationReal;
-            }
-
-            uint32_t stepOffset = static_cast<uint32_t>(stepsTotal);
-            double frac = stepsTotal - static_cast<double>(stepOffset);
-            frac = std::clamp(frac, 0.0, 0.999999);
-
-            uint32_t targetStep = bot::currentStep + stepOffset;
-            bot::recordAction(player1, button, push, targetStep, frac);
+        if (!isP1 && !isP2) {
+            PlayerObject::update(dt);
+            return;
         }
 
-        bool isPlayer2 = !player1;
-        if (push) {
-            this->pushButton(button, isPlayer2);
+        if (isP1) {
+            bot::currentStep++;
+            bot::stepStartTime = std::chrono::steady_clock::now();
+        }
+
+        if (bot::state == BotState::Play) {
+            stepPlayerWithCBF(this, isP1, dt, pl);
         } else {
-            this->releaseButton(button, isPlayer2);
+            PlayerObject::update(dt);
         }
     }
 };
 
-struct BotPlayLayer : Modify<BotPlayLayer, PlayLayer> {
+class $modify(BotPlayLayer, PlayLayer) {
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
         if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
-
         this->m_clickBetweenSteps = false;
-
-        bot::currentStep = 0;
-        bot::macroIndex = 0;
-        bot::checkpoints.clear();
-        bot::p1State.reset();
-        bot::p2State.reset();
-        bot::isSubStepping = false;
-        bot::dualUpdatedInP1 = false;
-        bot::recSpeed = Mod::get()->getSettingValue<double>("record-speed");
-        if (bot::recSpeed < 0.01) bot::recSpeed = 1.0;
-        if (bot::recSpeed > 2.0) bot::recSpeed = 2.0;
-        bot::resetTimingBaseline();
-
-        if (bot::mode == bot::Mode::Record) {
-            CCScheduler::get()->setTimeScale(static_cast<float>(bot::recSpeed));
-        } else {
-            CCScheduler::get()->setTimeScale(1.0f);
-        }
         return true;
     }
 
     void resetLevel() {
         PlayLayer::resetLevel();
-
         this->m_clickBetweenSteps = false;
 
         bot::currentStep = 0;
-        bot::macroIndex = 0;
-        bot::p1State.reset();
-        bot::p2State.reset();
-        bot::isSubStepping = false;
-        bot::dualUpdatedInP1 = false;
-        bot::resetTimingBaseline();
+        bot::stepStartTime = std::chrono::steady_clock::now();
+        bot::playIndexP1 = 0;
+        bot::playIndexP2 = 0;
 
-        this->releaseButton(1, false);
-        this->releaseButton(2, false);
-        this->releaseButton(3, false);
-        this->releaseButton(1, true);
-        this->releaseButton(2, true);
-        this->releaseButton(3, true);
-
-        if (bot::mode == bot::Mode::Record) {
-            CCScheduler::get()->setTimeScale(static_cast<float>(bot::recSpeed));
-        } else {
-            CCScheduler::get()->setTimeScale(1.0f);
+        if (!this->m_isPracticeMode) {
+            bot::checkpoints.clear();
         }
+
+        bot::isReplaying = true;
+        this->handleButton(false, 1, true);
+        this->handleButton(false, 2, true);
+        this->handleButton(false, 3, true);
+        this->handleButton(false, 1, false);
+        this->handleButton(false, 2, false);
+        this->handleButton(false, 3, false);
+        bot::isReplaying = false;
+
+        if (bot::state == BotState::Record) {
+            cocos2d::CCScheduler::get()->setTimeScale(static_cast<float>(bot::recSpeed));
+        } else {
+            cocos2d::CCScheduler::get()->setTimeScale(1.0f);
+        }
+    }
+
+    void onQuit() {
+        cocos2d::CCScheduler::get()->setTimeScale(1.0f);
+        bot::checkpoints.clear();
+        PlayLayer::onQuit();
     }
 
     CheckpointObject* createCheckpoint() {
         auto cp = PlayLayer::createCheckpoint();
         if (!cp) return cp;
 
-        bot::CheckpointData data;
-        data.step = bot::currentStep;
-        data.macroSize = bot::currentMacro.size();
+        BotCheckpoint bcp;
+        bcp.cp = cp;
+        bcp.step = bot::currentStep;
+        bcp.macroActionCount = bot::currentMacro.actions.size();
+        bcp.playIndexP1 = bot::playIndexP1;
+        bcp.playIndexP2 = bot::playIndexP2;
 
         if (this->m_player1) {
-            data.p1Pos = this->m_player1->getPosition();
-            data.p1YVel = this->m_player1->m_yVelocity;
-            data.p1Rot = this->m_player1->getRotation();
-            data.p1OnGround = this->m_player1->m_isOnGround;
+            bcp.posP1 = this->m_player1->getPosition();
+            bcp.yVelP1 = this->m_player1->m_yAccel;
+            bcp.rotP1 = this->m_player1->getRotation();
+            bcp.isOnGroundP1 = this->m_player1->m_isOnGround;
+            bcp.isUpsideDownP1 = this->m_player1->m_isUpsideDown;
         }
         if (this->m_player2) {
-            data.p2Pos = this->m_player2->getPosition();
-            data.p2YVel = this->m_player2->m_yVelocity;
-            data.p2Rot = this->m_player2->getRotation();
-            data.p2OnGround = this->m_player2->m_isOnGround;
+            bcp.posP2 = this->m_player2->getPosition();
+            bcp.yVelP2 = this->m_player2->m_yAccel;
+            bcp.rotP2 = this->m_player2->getRotation();
+            bcp.isOnGroundP2 = this->m_player2->m_isOnGround;
+            bcp.isUpsideDownP2 = this->m_player2->m_isUpsideDown;
         }
 
-        bot::checkpoints[cp] = data;
+        bot::checkpoints.push_back(bcp);
         return cp;
-    }
-
-    void removeCheckpoint(bool p0) {
-        PlayLayer::removeCheckpoint(p0);
     }
 
     void loadFromCheckpoint(CheckpointObject* cp) {
         PlayLayer::loadFromCheckpoint(cp);
         if (!cp) return;
 
-        auto it = bot::checkpoints.find(cp);
-        if (it == bot::checkpoints.end()) return;
+        for (auto it = bot::checkpoints.rbegin(); it != bot::checkpoints.rend(); ++it) {
+            if (it->cp == cp) {
+                bot::currentStep = it->step;
 
-        const auto& data = it->second;
-        bot::currentStep = data.step;
+                if (bot::state == BotState::Record) {
+                    if (bot::currentMacro.actions.size() > it->macroActionCount) {
+                        bot::currentMacro.actions.resize(it->macroActionCount);
+                    }
+                } else if (bot::state == BotState::Play) {
+                    bot::playIndexP1 = it->playIndexP1;
+                    bot::playIndexP2 = it->playIndexP2;
+                }
 
-        if (bot::mode == bot::Mode::Record) {
-            if (data.macroSize <= bot::currentMacro.size()) {
-                bot::currentMacro.resize(data.macroSize);
+                if (this->m_player1) {
+                    this->m_player1->setPosition(it->posP1);
+                    this->m_player1->m_yAccel = it->yVelP1;
+                    this->m_player1->setRotation(it->rotP1);
+                    this->m_player1->m_isOnGround = it->isOnGroundP1;
+                    this->m_player1->m_isUpsideDown = it->isUpsideDownP1;
+                    if (this->m_player1->m_collisionLogTop) this->m_player1->m_collisionLogTop->removeAllObjects();
+                    if (this->m_player1->m_collisionLogBottom) this->m_player1->m_collisionLogBottom->removeAllObjects();
+                    if (this->m_player1->m_collisionLogLeft) this->m_player1->m_collisionLogLeft->removeAllObjects();
+                    if (this->m_player1->m_collisionLogRight) this->m_player1->m_collisionLogRight->removeAllObjects();
+                }
+                if (this->m_player2) {
+                    this->m_player2->setPosition(it->posP2);
+                    this->m_player2->m_yAccel = it->yVelP2;
+                    this->m_player2->setRotation(it->rotP2);
+                    this->m_player2->m_isOnGround = it->isOnGroundP2;
+                    this->m_player2->m_isUpsideDown = it->isUpsideDownP2;
+                    if (this->m_player2->m_collisionLogTop) this->m_player2->m_collisionLogTop->removeAllObjects();
+                    if (this->m_player2->m_collisionLogBottom) this->m_player2->m_collisionLogBottom->removeAllObjects();
+                    if (this->m_player2->m_collisionLogLeft) this->m_player2->m_collisionLogLeft->removeAllObjects();
+                    if (this->m_player2->m_collisionLogRight) this->m_player2->m_collisionLogRight->removeAllObjects();
+                }
+
+                bot::isReplaying = true;
+                this->handleButton(false, 1, true);
+                this->handleButton(false, 2, true);
+                this->handleButton(false, 3, true);
+                this->handleButton(false, 1, false);
+                this->handleButton(false, 2, false);
+                this->handleButton(false, 3, false);
+                bot::isReplaying = false;
+
+                break;
             }
-        } else if (bot::mode == bot::Mode::Play) {
-            bot::syncPlayback();
         }
+    }
 
-        if (this->m_player1) {
-            this->m_player1->setPosition(data.p1Pos);
-            this->m_player1->m_yVelocity = data.p1YVel;
-            this->m_player1->setRotation(data.p1Rot);
-            this->m_player1->m_isOnGround = data.p1OnGround;
+    void removeLastCheckpoint() {
+        PlayLayer::removeLastCheckpoint();
+        if (!bot::checkpoints.empty()) {
+            bot::checkpoints.pop_back();
         }
-
-        if (this->m_player2) {
-            this->m_player2->setPosition(data.p2Pos);
-            this->m_player2->m_yVelocity = data.p2YVel;
-            this->m_player2->setRotation(data.p2Rot);
-            this->m_player2->m_isOnGround = data.p2OnGround;
-        }
-
-        this->releaseButton(1, false);
-        this->releaseButton(2, false);
-        this->releaseButton(3, false);
-        this->releaseButton(1, true);
-        this->releaseButton(2, true);
-        this->releaseButton(3, true);
-
-        bot::p1State.reset();
-        bot::p2State.reset();
-        bot::isSubStepping = false;
-        bot::dualUpdatedInP1 = false;
-        bot::resetTimingBaseline();
     }
 };
 
-struct BotPlayerObject : Modify<BotPlayerObject, PlayerObject> {
-    void update(float dt) {
-        auto pl = PlayLayer::get();
-
-        if (!pl || this != pl->m_player1) {
-            if (pl && this == pl->m_player2 && bot::dualUpdatedInP1) {
-                bot::dualUpdatedInP1 = false;
-                return;
-            }
-            PlayerObject::update(dt);
-            return;
-        }
-
-        if (pl->m_isPaused || bot::isSubStepping) {
-            PlayerObject::update(dt);
-            return;
-        }
-
-        bot::stepStartTime = std::chrono::steady_clock::now();
-        bot::currentStepDt = dt;
-
-        bool isDual = (pl->m_player2 != nullptr && pl->m_player2->isVisible());
-        bot::dualUpdatedInP1 = isDual;
-
-        if (bot::mode == bot::Mode::Play) {
-            double currentFrac = 0.0;
-            bot::isSubStepping = true;
-
-            while (bot::macroIndex < bot::currentMacro.size()) {
-                const auto& act = bot::currentMacro[bot::macroIndex];
-                if (act.step != bot::currentStep) {
-                    if (act.step < bot::currentStep) {
-                        bool isPlayer2 = !act.p1;
-                        if (act.down) pl->pushButton(act.btn, isPlayer2);
-                        else pl->releaseButton(act.btn, isPlayer2);
-                        bot::macroIndex++;
-                        continue;
-                    }
-                    break;
-                }
-
-                double targetFrac = std::clamp(act.frac, 0.0, 0.999999);
-                if (targetFrac > currentFrac) {
-                    float subDelta = static_cast<float>((targetFrac - currentFrac) * dt);
-                    PlayerObject::update(subDelta);
-                    if (isDual) {
-                        pl->m_player2->update(subDelta);
-                    }
-                    currentFrac = targetFrac;
-                }
-
-                bool isPlayer2 = !act.p1;
-                if (act.down) {
-                    pl->pushButton(act.btn, isPlayer2);
-                } else {
-                    pl->releaseButton(act.btn, isPlayer2);
-                }
-
-                bot::macroIndex++;
-            }
-
-            float remDelta = static_cast<float>((1.0 - currentFrac) * dt);
-            PlayerObject::update(remDelta);
-            if (isDual) {
-                pl->m_player2->update(remDelta);
-            }
-
-            bot::isSubStepping = false;
-            bot::currentStep++;
-            return;
-        }
-
-        PlayerObject::update(dt);
-        if (isDual) {
-            pl->m_player2->update(dt);
-        }
-        bot::currentStep++;
-    }
-};
-
-struct BotPauseLayer : Modify<BotPauseLayer, PauseLayer> {
+class $modify(BotPauseLayer, PauseLayer) {
     struct Fields {
-        CCLabelBMFont* statusLabel = nullptr;
-        TextInput* speedInput = nullptr;
-        CCMenu* botMenu = nullptr;
-        CCLayerColor* macroOverlay = nullptr;
+        CCNode* m_fileListContainer = nullptr;
+        CCLabelBMFont* m_statusLabel = nullptr;
+        ButtonSprite* m_offSprite = nullptr;
+        ButtonSprite* m_recSprite = nullptr;
+        ButtonSprite* m_playSprite = nullptr;
     };
 
-    void customSetup() {
-        if (bot::mode == bot::Mode::Record) {
-            auto pl = PlayLayer::get();
-            if (pl) {
-                if (bot::p1State.jump) {
-                    bot::recordAction(true, 1, false, bot::currentStep, 0.0);
-                    pl->releaseButton(1, false);
-                }
-                if (bot::p2State.jump) {
-                    bot::recordAction(false, 1, false, bot::currentStep, 0.0);
-                    pl->releaseButton(1, true);
-                }
+    void updateStatusUI() {
+        if (m_fields->m_statusLabel) {
+            std::string st = "OFF";
+            if (bot::state == BotState::Record) {
+                st = fmt::format("REC ({} acts)", bot::currentMacro.actions.size());
+            } else if (bot::state == BotState::Play) {
+                st = fmt::format("PLAY ({} acts)", bot::currentMacro.actions.size());
+            }
+            m_fields->m_statusLabel->setString(st.c_str());
+        }
+        if (m_fields->m_offSprite) {
+            m_fields->m_offSprite->setColor(bot::state == BotState::Off ? cocos2d::ccColor3B{ 80, 255, 80 } : cocos2d::ccColor3B{ 255, 255, 255 });
+        }
+        if (m_fields->m_recSprite) {
+            m_fields->m_recSprite->setColor(bot::state == BotState::Record ? cocos2d::ccColor3B{ 255, 80, 80 } : cocos2d::ccColor3B{ 255, 255, 255 });
+        }
+        if (m_fields->m_playSprite) {
+            m_fields->m_playSprite->setColor(bot::state == BotState::Play ? cocos2d::ccColor3B{ 80, 200, 255 } : cocos2d::ccColor3B{ 255, 255, 255 });
+        }
+    }
+
+    void refreshMacroList() {
+        if (!m_fields->m_fileListContainer) return;
+        m_fields->m_fileListContainer->removeAllChildren();
+
+        std::vector<std::filesystem::path> files;
+        std::error_code ec;
+        for (const auto& entry : std::filesystem::directory_iterator(bot::getMacroDir(), ec)) {
+            if (entry.is_regular_file() && entry.path().extension() == ".gdbot") {
+                files.push_back(entry.path());
             }
         }
-
-        PauseLayer::customSetup();
-
-        auto winSize = CCDirector::sharedDirector()->getWinSize();
-
-        m_fields->botMenu = CCMenu::create();
-        m_fields->botMenu->setID("tas-bot-panel"_spr);
-        m_fields->botMenu->setPosition(winSize.width / 2.0f, 42.0f);
-        m_fields->botMenu->setContentSize({winSize.width - 20.0f, 32.0f});
-
-        auto layout = RowLayout::create();
-        layout->setGap(6.0f);
-        layout->setAxisAlignment(AxisAlignment::Center);
-        m_fields->botMenu->setLayout(layout);
-
-        auto recSpr = ButtonSprite::create("REC", "goldFont.fnt", "GJ_button_01.png", 0.7f);
-        recSpr->setScale(0.55f);
-        auto recBtn = CCMenuItemSpriteExtra::create(recSpr, this, menu_selector(BotPauseLayer::onRecord));
-
-        auto playSpr = ButtonSprite::create("PLAY", "goldFont.fnt", "GJ_button_02.png", 0.7f);
-        playSpr->setScale(0.55f);
-        auto playBtn = CCMenuItemSpriteExtra::create(playSpr, this, menu_selector(BotPauseLayer::onPlay));
-
-        auto stopSpr = ButtonSprite::create("OFF", "goldFont.fnt", "GJ_button_06.png", 0.7f);
-        stopSpr->setScale(0.55f);
-        auto stopBtn = CCMenuItemSpriteExtra::create(stopSpr, this, menu_selector(BotPauseLayer::onStop));
-
-        auto clearSpr = ButtonSprite::create("CLR", "goldFont.fnt", "GJ_button_06.png", 0.7f);
-        clearSpr->setScale(0.55f);
-        auto clearBtn = CCMenuItemSpriteExtra::create(clearSpr, this, menu_selector(BotPauseLayer::onClear));
-
-        auto macrosSpr = ButtonSprite::create("FILES", "goldFont.fnt", "GJ_button_04.png", 0.7f);
-        macrosSpr->setScale(0.55f);
-        auto macrosBtn = CCMenuItemSpriteExtra::create(macrosSpr, this, menu_selector(BotPauseLayer::onMacros));
-
-        auto spdLabel = CCLabelBMFont::create("SPD:", "goldFont.fnt");
-        spdLabel->setScale(0.5f);
-
-        m_fields->speedInput = TextInput::create(60.0f, "1.0", "bigFont.fnt");
-        m_fields->speedInput->setScale(0.55f);
-        m_fields->speedInput->setFilter("0123456789.,");
-        m_fields->speedInput->setMaxCharCount(6);
-        m_fields->speedInput->setString(fmt::format("{:.2f}", bot::recSpeed));
-        m_fields->speedInput->setCallback([this](std::string const& str) {
-            double val = bot::parseSpeedString(str);
-            if (val >= 0.01 && val <= 2.0) {
-                bot::recSpeed = val;
-                Mod::get()->setSettingValue<double>("record-speed", bot::recSpeed);
-                if (bot::mode == bot::Mode::Record) {
-                    CCScheduler::get()->setTimeScale(static_cast<float>(bot::recSpeed));
-                }
-                this->updateLabels();
-            }
+        std::sort(files.begin(), files.end(), [](const auto& a, const auto& b) {
+            return a.filename().string() > b.filename().string();
         });
 
-        m_fields->botMenu->addChild(recBtn);
-        m_fields->botMenu->addChild(playBtn);
-        m_fields->botMenu->addChild(stopBtn);
-        m_fields->botMenu->addChild(clearBtn);
-        m_fields->botMenu->addChild(macrosBtn);
-        m_fields->botMenu->addChild(spdLabel);
-        m_fields->botMenu->addChild(m_fields->speedInput);
+        float viewW = 160.0f;
+        float viewH = 100.0f;
+        float rowH = 22.0f;
+        float totalH = std::max(viewH, static_cast<float>(files.size()) * rowH);
 
-        m_fields->botMenu->updateLayout();
-        this->addChild(m_fields->botMenu, 100);
+        auto scroll = ScrollLayer::create(cocos2d::CCSize{ viewW, viewH });
+        scroll->m_contentLayer->setContentSize(cocos2d::CCSize{ viewW, totalH });
 
-        m_fields->statusLabel = CCLabelBMFont::create("", "chatFont.fnt");
-        m_fields->statusLabel->setPosition(winSize.width / 2.0f, 18.0f);
-        m_fields->statusLabel->setScale(0.55f);
-        this->addChild(m_fields->statusLabel, 100);
+        for (size_t i = 0; i < files.size(); ++i) {
+            auto path = files[i];
+            float y = totalH - static_cast<float>(i + 1) * rowH;
 
-        updateLabels();
-    }
+            auto rowNode = cocos2d::CCNode::create();
+            rowNode->setPosition(0.0f, y);
+            rowNode->setContentSize(cocos2d::CCSize{ viewW, rowH });
 
-    void updateLabels() {
-        if (!m_fields->statusLabel) return;
-
-        std::string modeStr = "OFF";
-        ccColor3B col = {180, 180, 180};
-        if (bot::mode == bot::Mode::Record) {
-            modeStr = "REC";
-            col = {255, 60, 60};
-        } else if (bot::mode == bot::Mode::Play) {
-            modeStr = "PLAY";
-            col = {60, 255, 60};
-        }
-
-        m_fields->statusLabel->setString(
-            fmt::format("MODE: {} | ACTS: {} | STEP: {} | FILE: {}",
-                modeStr, bot::currentMacro.size(), bot::currentStep, bot::currentMacroName).c_str()
-        );
-        m_fields->statusLabel->setColor(col);
-    }
-
-    void onRecord(CCObject*) {
-        bot::mode = bot::Mode::Record;
-        bot::currentMacro.clear();
-        bot::currentStep = 0;
-        bot::macroIndex = 0;
-        bot::p1State.reset();
-        bot::p2State.reset();
-        bot::resetTimingBaseline();
-        CCScheduler::get()->setTimeScale(static_cast<float>(bot::recSpeed));
-        updateLabels();
-    }
-
-    void onPlay(CCObject*) {
-        bot::mode = bot::Mode::Play;
-        bot::macroIndex = 0;
-        bot::currentStep = 0;
-        bot::p1State.reset();
-        bot::p2State.reset();
-        CCScheduler::get()->setTimeScale(1.0f);
-
-        auto pl = PlayLayer::get();
-        if (pl) {
-            pl->releaseButton(1, false);
-            pl->releaseButton(2, false);
-            pl->releaseButton(3, false);
-            pl->releaseButton(1, true);
-            pl->releaseButton(2, true);
-            pl->releaseButton(3, true);
-        }
-
-        updateLabels();
-    }
-
-    void onStop(CCObject*) {
-        bot::mode = bot::Mode::Off;
-        CCScheduler::get()->setTimeScale(1.0f);
-        updateLabels();
-    }
-
-    void onClear(CCObject*) {
-        bot::currentMacro.clear();
-        bot::macroIndex = 0;
-        bot::currentStep = 0;
-        updateLabels();
-    }
-
-    void onMacros(CCObject*) {
-        buildMacroBrowser();
-    }
-
-    void buildMacroBrowser() {
-        if (m_fields->macroOverlay) {
-            m_fields->macroOverlay->removeFromParentAndCleanup(true);
-            m_fields->macroOverlay = nullptr;
-        }
-
-        auto winSize = CCDirector::sharedDirector()->getWinSize();
-
-        m_fields->macroOverlay = CCLayerColor::create({0, 0, 0, 220});
-        m_fields->macroOverlay->setContentSize(winSize);
-        m_fields->macroOverlay->setTouchPriority(-500);
-
-        auto panel = CCScale9Sprite::create("GJ_square01.png");
-        panel->setContentSize({340.0f, 220.0f});
-        panel->setPosition(winSize / 2.0f);
-        m_fields->macroOverlay->addChild(panel);
-
-        auto title = CCLabelBMFont::create("MACROS", "bigFont.fnt");
-        title->setScale(0.55f);
-        title->setPosition(winSize.width / 2.0f, winSize.height / 2.0f + 92.0f);
-        m_fields->macroOverlay->addChild(title);
-
-        auto topMenu = CCMenu::create();
-        topMenu->setPosition(CCPointZero);
-        topMenu->setTouchPriority(-501);
-
-        auto closeSpr = CCSprite::createWithSpriteFrameName("GJ_closeBtn_001.png");
-        closeSpr->setScale(0.7f);
-        auto closeBtn = CCMenuItemSpriteExtra::create(closeSpr, this, menu_selector(BotPauseLayer::onCloseBrowser));
-        closeBtn->setPosition(winSize.width / 2.0f + 155.0f, winSize.height / 2.0f + 95.0f);
-        topMenu->addChild(closeBtn);
-
-        auto saveSpr = ButtonSprite::create("SAVE CURRENT", "goldFont.fnt", "GJ_button_01.png", 0.7f);
-        saveSpr->setScale(0.6f);
-        auto saveBtn = CCMenuItemSpriteExtra::create(saveSpr, this, menu_selector(BotPauseLayer::onSaveNewMacro));
-        saveBtn->setPosition(winSize.width / 2.0f, winSize.height / 2.0f - 88.0f);
-        topMenu->addChild(saveBtn);
-
-        m_fields->macroOverlay->addChild(topMenu);
-
-        auto list = bot::listMacros();
-        float itemH = 28.0f;
-        float contentH = std::max(130.0f, static_cast<float>(list.size()) * itemH);
-
-        auto scroll = ScrollLayer::create({300.0f, 130.0f});
-        scroll->setPosition(winSize.width / 2.0f - 150.0f, winSize.height / 2.0f - 65.0f);
-        scroll->m_contentLayer->setContentSize({300.0f, contentH});
-
-        auto rowMenu = CCMenu::create();
-        rowMenu->setPosition(CCPointZero);
-        rowMenu->setContentSize({300.0f, contentH});
-        rowMenu->setTouchPriority(-501);
-
-        float y = contentH - (itemH / 2.0f);
-        for (const auto& name : list) {
+            std::string name = path.stem().string();
+            if (name.length() > 14) {
+                name = name.substr(0, 12) + "..";
+            }
             auto lbl = CCLabelBMFont::create(name.c_str(), "chatFont.fnt");
-            lbl->setScale(0.55f);
-            lbl->setAnchorPoint({0.0f, 0.5f});
-            lbl->setPosition(10.0f, y);
-            rowMenu->addChild(lbl);
+            lbl->setScale(0.4f);
+            lbl->setAnchorPoint(cocos2d::CCPoint{ 0.0f, 0.5f });
+            lbl->setPosition(4.0f, rowH / 2.0f);
+            rowNode->addChild(lbl);
 
-            auto loadSpr = ButtonSprite::create("LOAD", "goldFont.fnt", "GJ_button_02.png", 0.5f);
-            loadSpr->setScale(0.5f);
-            auto loadBtn = CCMenuItemSpriteExtra::create(loadSpr, this, menu_selector(BotPauseLayer::onLoadItem));
-            loadBtn->setUserObject(CCString::create(name));
-            loadBtn->setPosition(210.0f, y);
+            auto rowMenu = cocos2d::CCMenu::create();
+            rowMenu->setPosition(0.0f, 0.0f);
+
+            auto loadSpr = ButtonSprite::create("L", 12, true, "goldFont.fnt", "GJ_button_01.png", 16.0f, 0.4f);
+            auto loadBtn = CCMenuItemExt::createSpriteExtra(loadSpr, [this, path](CCObject*) {
+                if (bot::loadMacro(path, bot::currentMacro)) {
+                    bot::state = BotState::Play;
+                    cocos2d::CCScheduler::get()->setTimeScale(1.0f);
+                    this->updateStatusUI();
+                    Notification::create("Macro Loaded", NotificationIcon::Success)->show();
+                } else {
+                    Notification::create("Failed to Load", NotificationIcon::Error)->show();
+                }
+            });
+            loadBtn->setPosition(120.0f, rowH / 2.0f);
             rowMenu->addChild(loadBtn);
 
-            auto delSpr = ButtonSprite::create("DEL", "goldFont.fnt", "GJ_button_06.png", 0.5f);
-            delSpr->setScale(0.5f);
-            auto delBtn = CCMenuItemSpriteExtra::create(delSpr, this, menu_selector(BotPauseLayer::onDeleteItem));
-            delBtn->setUserObject(CCString::create(name));
-            delBtn->setPosition(260.0f, y);
+            auto delSpr = ButtonSprite::create("X", 12, true, "goldFont.fnt", "GJ_button_06.png", 16.0f, 0.4f);
+            auto delBtn = CCMenuItemExt::createSpriteExtra(delSpr, [this, path](CCObject*) {
+                std::error_code ec;
+                std::filesystem::remove(path, ec);
+                this->refreshMacroList();
+                Notification::create("Macro Deleted", NotificationIcon::Info)->show();
+            });
+            delBtn->setPosition(145.0f, rowH / 2.0f);
             rowMenu->addChild(delBtn);
 
-            y -= itemH;
+            rowNode->addChild(rowMenu);
+            scroll->m_contentLayer->addChild(rowNode);
         }
 
-        scroll->m_contentLayer->addChild(rowMenu);
         scroll->moveToTop();
-        m_fields->macroOverlay->addChild(scroll);
-        this->addChild(m_fields->macroOverlay, 200);
+        m_fields->m_fileListContainer->addChild(scroll);
     }
 
-    void onCloseBrowser(CCObject*) {
-        if (m_fields->macroOverlay) {
-            m_fields->macroOverlay->removeFromParentAndCleanup(true);
-            m_fields->macroOverlay = nullptr;
-        }
-        updateLabels();
-    }
+    void customSetup() {
+        PauseLayer::customSetup();
 
-    void onSaveNewMacro(CCObject*) {
-        auto t = std::time(nullptr);
-        auto tm = *std::localtime(&t);
-        std::ostringstream oss;
-        oss << "macro_" << std::put_time(&tm, "%Y%m%d_%H%M%S");
-        std::string name = oss.str();
-        bot::saveToFile(name);
-        bot::currentMacroName = name;
-        buildMacroBrowser();
-    }
+        auto winSize = cocos2d::CCDirector::sharedDirector()->getWinSize();
+        float panelW = 170.0f;
+        float panelH = 260.0f;
+        float panelX = winSize.width - panelW - 8.0f;
+        float panelY = (winSize.height - panelH) / 2.0f;
 
-    void onLoadItem(CCObject* sender) {
-        auto btn = static_cast<CCMenuItemSpriteExtra*>(sender);
-        if (!btn) return;
-        auto str = static_cast<CCString*>(btn->getUserObject());
-        if (!str) return;
+        auto panelBg = cocos2d::CCLayerColor::create(cocos2d::ccc4(0, 0, 0, 190), panelW, panelH);
+        panelBg->setPosition(panelX, panelY);
+        this->addChild(panelBg, 100);
 
-        bot::loadFromFile(str->getCString());
-        onCloseBrowser(nullptr);
-    }
+        auto titleLbl = CCLabelBMFont::create("CBF TAS BOT", "goldFont.fnt");
+        titleLbl->setScale(0.5f);
+        titleLbl->setPosition(panelW / 2.0f, panelH - 16.0f);
+        panelBg->addChild(titleLbl);
 
-    void onDeleteItem(CCObject* sender) {
-        auto btn = static_cast<CCMenuItemSpriteExtra*>(sender);
-        if (!btn) return;
-        auto str = static_cast<CCString*>(btn->getUserObject());
-        if (!str) return;
+        m_fields->m_statusLabel = CCLabelBMFont::create("OFF", "chatFont.fnt");
+        m_fields->m_statusLabel->setScale(0.5f);
+        m_fields->m_statusLabel->setPosition(panelW / 2.0f, panelH - 34.0f);
+        panelBg->addChild(m_fields->m_statusLabel);
 
-        auto path = bot::getMacrosDir() / (std::string(str->getCString()) + ".gdbot");
-        std::error_code ec;
-        std::filesystem::remove(path, ec);
-        buildMacroBrowser();
+        auto modeMenu = cocos2d::CCMenu::create();
+        modeMenu->setPosition(0.0f, 0.0f);
+
+        m_fields->m_offSprite = ButtonSprite::create("OFF", 24, true, "goldFont.fnt", "GJ_button_01.png", 20.0f, 0.4f);
+        auto offBtn = CCMenuItemExt::createSpriteExtra(m_fields->m_offSprite, [this](CCObject*) {
+            bot::state = BotState::Off;
+            cocos2d::CCScheduler::get()->setTimeScale(1.0f);
+            this->updateStatusUI();
+        });
+        offBtn->setPosition(panelW * 0.2f, panelH - 58.0f);
+        modeMenu->addChild(offBtn);
+
+        m_fields->m_recSprite = ButtonSprite::create("REC", 24, true, "goldFont.fnt", "GJ_button_01.png", 20.0f, 0.4f);
+        auto recBtn = CCMenuItemExt::createSpriteExtra(m_fields->m_recSprite, [this](CCObject*) {
+            bot::state = BotState::Record;
+            bot::currentMacro.actions.clear();
+            bot::currentStep = 0;
+            bot::stepStartTime = std::chrono::steady_clock::now();
+            cocos2d::CCScheduler::get()->setTimeScale(static_cast<float>(bot::recSpeed));
+            this->updateStatusUI();
+            Notification::create("Recording Started", NotificationIcon::Info)->show();
+        });
+        recBtn->setPosition(panelW * 0.5f, panelH - 58.0f);
+        modeMenu->addChild(recBtn);
+
+        m_fields->m_playSprite = ButtonSprite::create("PLAY", 24, true, "goldFont.fnt", "GJ_button_01.png", 20.0f, 0.4f);
+        auto playBtn = CCMenuItemExt::createSpriteExtra(m_fields->m_playSprite, [this](CCObject*) {
+            bot::state = BotState::Play;
+            bot::playIndexP1 = 0;
+            bot::playIndexP2 = 0;
+            cocos2d::CCScheduler::get()->setTimeScale(1.0f);
+            this->updateStatusUI();
+            Notification::create("Playback Ready", NotificationIcon::Info)->show();
+        });
+        playBtn->setPosition(panelW * 0.8f, panelH - 58.0f);
+        modeMenu->addChild(playBtn);
+
+        panelBg->addChild(modeMenu);
+
+        auto speedLbl = CCLabelBMFont::create("Speed:", "chatFont.fnt");
+        speedLbl->setScale(0.45f);
+        speedLbl->setAnchorPoint(cocos2d::CCPoint{ 0.0f, 0.5f });
+        speedLbl->setPosition(10.0f, panelH - 84.0f);
+        panelBg->addChild(speedLbl);
+
+        auto speedInput = TextInput::create(65.0f, "1.00", "chatFont.fnt");
+        speedInput->setString(fmt::format("{:.2f}", bot::recSpeed));
+        speedInput->setFilter("0123456789.,");
+        speedInput->setScale(0.7f);
+        speedInput->setPosition(100.0f, panelH - 84.0f);
+        speedInput->setCallback([](std::string const& str) {
+            bot::recSpeed = bot::parseSpeedString(str);
+            if (bot::state == BotState::Record) {
+                cocos2d::CCScheduler::get()->setTimeScale(static_cast<float>(bot::recSpeed));
+            }
+        });
+        panelBg->addChild(speedInput);
+
+        auto saveMenu = cocos2d::CCMenu::create();
+        saveMenu->setPosition(0.0f, 0.0f);
+        auto saveSpr = ButtonSprite::create("SAVE CURRENT", 80, true, "goldFont.fnt", "GJ_button_01.png", 20.0f, 0.4f);
+        auto saveBtn = CCMenuItemExt::createSpriteExtra(saveSpr, [this](CCObject*) {
+            if (bot::currentMacro.actions.empty()) {
+                Notification::create("Macro is Empty", NotificationIcon::Warning)->show();
+                return;
+            }
+            auto now = std::chrono::system_clock::now();
+            auto timeT = std::chrono::system_clock::to_time_t(now);
+            std::tm tmStruct{};
+#ifdef GEODE_IS_WINDOWS
+            localtime_s(&tmStruct, &timeT);
+#else
+            localtime_r(&timeT, &tmStruct);
+#endif
+            std::string filename = fmt::format(
+                "macro_{:04d}{:02d}{:02d}_{:02d}{:02d}{:02d}.gdbot",
+                tmStruct.tm_year + 1900,
+                tmStruct.tm_mon + 1,
+                tmStruct.tm_mday,
+                tmStruct.tm_hour,
+                tmStruct.tm_min,
+                tmStruct.tm_sec
+            );
+            auto fullPath = bot::getMacroDir() / filename;
+            if (bot::saveMacro(fullPath, bot::currentMacro)) {
+                this->refreshMacroList();
+                Notification::create("Saved Macro", NotificationIcon::Success)->show();
+            } else {
+                Notification::create("Save Failed", NotificationIcon::Error)->show();
+            }
+        });
+        saveBtn->setPosition(panelW / 2.0f, panelH - 110.0f);
+        saveMenu->addChild(saveBtn);
+        panelBg->addChild(saveMenu);
+
+        m_fields->m_fileListContainer = cocos2d::CCNode::create();
+        m_fields->m_fileListContainer->setPosition(5.0f, 15.0f);
+        m_fields->m_fileListContainer->setContentSize(cocos2d::CCSize{ 160.0f, 100.0f });
+        panelBg->addChild(m_fields->m_fileListContainer);
+
+        this->updateStatusUI();
+        this->refreshMacroList();
     }
 };
