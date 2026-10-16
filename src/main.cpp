@@ -22,14 +22,15 @@ namespace bot {
     enum class Mode { Off, Record, Play };
 
     struct Action {
-        double time = 0.0;
+        uint32_t step = 0;
+        double frac = 0.0;
         bool down = false;
         bool p1 = true;
         uint8_t btn = 1;
     };
 
     struct CheckpointData {
-        double time = 0.0;
+        uint32_t step = 0;
         size_t macroSize = 0;
         CCPoint p1Pos = CCPointZero;
         double p1YVel = 0.0;
@@ -69,27 +70,49 @@ namespace bot {
     inline Mode mode = Mode::Off;
     inline std::vector<Action> currentMacro;
     inline size_t macroIndex = 0;
-
-    // Единственный источник правды для времени уровня.
-    // Обновляется ИСКЛЮЧИТЕЛЬНО внутри BotPlayerObject::update (для m_player1).
-    inline double levelTime = 0.0;
-    inline double currentFrameTime = 0.0;
-    inline float currentFrameDt = 1.0f / 60.0f;
-    inline std::chrono::steady_clock::time_point frameRealStart;
-
+    inline uint32_t currentStep = 0;
+    inline float currentStepDt = 1.0f / 240.0f;
     inline double recSpeed = 1.0;
+    inline std::chrono::steady_clock::time_point stepStartTime;
     inline std::unordered_map<CheckpointObject*, CheckpointData> checkpoints;
     inline std::string currentMacroName = "autosave";
     inline ButtonState p1State;
     inline ButtonState p2State;
     inline bool isSubStepping = false;
     inline bool dualUpdatedInP1 = false;
+    inline bool isBotPlayback = false;
 
-    inline constexpr uint32_t MAGIC = 0x33544F42;
+    inline constexpr uint32_t MAGIC = 0x32544F42;
     inline constexpr double SMALLEST = 1e-5;
 
     inline void resetTimingBaseline() {
-        frameRealStart = std::chrono::steady_clock::now();
+        stepStartTime = std::chrono::steady_clock::now();
+    }
+
+    inline double parseSpeedString(const std::string& str) {
+        if (str.empty()) return -1.0;
+        double result = 0.0;
+        double fraction = 0.0;
+        double div = 10.0;
+        bool inFraction = false;
+        bool hasDigits = false;
+
+        for (char c : str) {
+            if (c >= '0' && c <= '9') {
+                hasDigits = true;
+                if (!inFraction) {
+                    result = result * 10.0 + (c - '0');
+                } else {
+                    fraction += (c - '0') / div;
+                    div *= 10.0;
+                }
+            } else if (c == '.' || c == ',') {
+                if (inFraction) break;
+                inFraction = true;
+            }
+        }
+        if (!hasDigits) return -1.0;
+        return result + fraction;
     }
 
     inline std::filesystem::path getMacrosDir() {
@@ -110,7 +133,8 @@ namespace bot {
         file.write(reinterpret_cast<const char*>(&count), sizeof(count));
 
         for (const auto& act : currentMacro) {
-            file.write(reinterpret_cast<const char*>(&act.time), sizeof(act.time));
+            file.write(reinterpret_cast<const char*>(&act.step), sizeof(act.step));
+            file.write(reinterpret_cast<const char*>(&act.frac), sizeof(act.frac));
             uint8_t flags = (act.down ? 1 : 0) | (act.p1 ? 2 : 0);
             file.write(reinterpret_cast<const char*>(&flags), sizeof(flags));
             file.write(reinterpret_cast<const char*>(&act.btn), sizeof(act.btn));
@@ -134,7 +158,8 @@ namespace bot {
 
         for (uint32_t i = 0; i < count; i++) {
             Action act;
-            file.read(reinterpret_cast<char*>(&act.time), sizeof(act.time));
+            file.read(reinterpret_cast<char*>(&act.step), sizeof(act.step));
+            file.read(reinterpret_cast<char*>(&act.frac), sizeof(act.frac));
             uint8_t flags = 0;
             file.read(reinterpret_cast<char*>(&flags), sizeof(flags));
             file.read(reinterpret_cast<char*>(&act.btn), sizeof(act.btn));
@@ -144,11 +169,12 @@ namespace bot {
         }
 
         std::sort(currentMacro.begin(), currentMacro.end(), [](const Action& a, const Action& b) {
-            return a.time < b.time;
+            if (a.step != b.step) return a.step < b.step;
+            return a.frac < b.frac;
         });
 
         macroIndex = 0;
-        levelTime = 0.0;
+        currentStep = 0;
         currentMacroName = name;
         return true;
     }
@@ -167,34 +193,12 @@ namespace bot {
 
     inline void syncPlayback() {
         macroIndex = 0;
-        while (macroIndex < currentMacro.size() && currentMacro[macroIndex].time < levelTime) {
+        while (macroIndex < currentMacro.size() && currentMacro[macroIndex].step < currentStep) {
             macroIndex++;
         }
     }
 
-    inline void applyAction(const Action& act, PlayLayer* pl) {
-        PlayerButton btn = static_cast<PlayerButton>(act.btn);
-        bool isDual = (pl->m_player2 != nullptr && pl->m_player2->isVisible());
-        bool twoPlayer = pl->m_level ? pl->m_level->m_twoPlayerMode : false;
-
-        if (twoPlayer) {
-            PlayerObject* target = act.p1 ? pl->m_player1 : pl->m_player2;
-            if (target) {
-                if (act.down) target->pushButton(btn);
-                else target->releaseButton(btn);
-            }
-        } else {
-            if (act.down) {
-                if (pl->m_player1) pl->m_player1->pushButton(btn);
-                if (isDual && pl->m_player2) pl->m_player2->pushButton(btn);
-            } else {
-                if (pl->m_player1) pl->m_player1->releaseButton(btn);
-                if (isDual && pl->m_player2) pl->m_player2->releaseButton(btn);
-            }
-        }
-    }
-
-    inline void recordAction(bool isPlayer1, int button, bool down) {
+    inline void recordAction(bool isPlayer1, int button, bool down, uint32_t step, double frac) {
         if (mode != Mode::Record) return;
 
         auto& state = isPlayer1 ? p1State : p2State;
@@ -203,19 +207,9 @@ namespace bot {
         }
         state.setHeld(button, down);
 
-        auto now = std::chrono::steady_clock::now();
-        double elapsedReal = std::chrono::duration<double>(now - frameRealStart).count();
-        double speed = recSpeed > SMALLEST ? recSpeed : 1.0;
-        double expectedReal = static_cast<double>(currentFrameDt) / speed;
-
-        double frac = 0.0;
-        if (expectedReal > 1e-7) {
-            frac = elapsedReal / expectedReal;
-        }
-        frac = std::clamp(frac, 0.0, 0.999);
-
         Action act;
-        act.time = currentFrameTime + (frac * static_cast<double>(currentFrameDt));
+        act.step = step;
+        act.frac = frac;
         act.down = down;
         act.p1 = isPlayer1;
         act.btn = static_cast<uint8_t>(button);
@@ -232,11 +226,30 @@ struct BotBaseGameLayer : Modify<BotBaseGameLayer, GJBaseGameLayer> {
         }
 
         if (bot::mode == bot::Mode::Play) {
+            if (!bot::isBotPlayback) {
+                return;
+            }
+            GJBaseGameLayer::handleButton(push, button, player1);
             return;
         }
 
         if (bot::mode == bot::Mode::Record && !pl->m_isPaused) {
-            bot::recordAction(player1, button, push);
+            auto now = std::chrono::steady_clock::now();
+            double elapsedReal = std::chrono::duration<double>(now - bot::stepStartTime).count();
+            double speed = bot::recSpeed > bot::SMALLEST ? bot::recSpeed : 1.0;
+            double stepDurationReal = static_cast<double>(bot::currentStepDt) / speed;
+
+            double stepsTotal = 0.0;
+            if (stepDurationReal > 1e-7) {
+                stepsTotal = elapsedReal / stepDurationReal;
+            }
+
+            uint32_t stepOffset = static_cast<uint32_t>(stepsTotal);
+            double frac = stepsTotal - static_cast<double>(stepOffset);
+            frac = std::clamp(frac, 0.0, 0.999999);
+
+            uint32_t targetStep = bot::currentStep + stepOffset;
+            bot::recordAction(player1, button, push, targetStep, frac);
         }
 
         GJBaseGameLayer::handleButton(push, button, player1);
@@ -247,16 +260,16 @@ struct BotPlayLayer : Modify<BotPlayLayer, PlayLayer> {
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
         if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
 
-        this->m_clickBetweenSteps = true;
+        this->m_clickBetweenSteps = false;
 
-        bot::levelTime = 0.0;
-        bot::currentFrameTime = 0.0;
+        bot::currentStep = 0;
         bot::macroIndex = 0;
         bot::checkpoints.clear();
         bot::p1State.reset();
         bot::p2State.reset();
         bot::isSubStepping = false;
         bot::dualUpdatedInP1 = false;
+        bot::isBotPlayback = false;
         bot::recSpeed = Mod::get()->getSettingValue<double>("record-speed");
         if (bot::recSpeed < 0.01) bot::recSpeed = 1.0;
         if (bot::recSpeed > 2.0) bot::recSpeed = 2.0;
@@ -273,15 +286,15 @@ struct BotPlayLayer : Modify<BotPlayLayer, PlayLayer> {
     void resetLevel() {
         PlayLayer::resetLevel();
 
-        this->m_clickBetweenSteps = true;
+        this->m_clickBetweenSteps = false;
 
-        bot::levelTime = 0.0;
-        bot::currentFrameTime = 0.0;
+        bot::currentStep = 0;
         bot::macroIndex = 0;
         bot::p1State.reset();
         bot::p2State.reset();
         bot::isSubStepping = false;
         bot::dualUpdatedInP1 = false;
+        bot::isBotPlayback = false;
         bot::resetTimingBaseline();
 
         if (this->m_player1) {
@@ -307,7 +320,7 @@ struct BotPlayLayer : Modify<BotPlayLayer, PlayLayer> {
         if (!cp) return cp;
 
         bot::CheckpointData data;
-        data.time = bot::levelTime;
+        data.step = bot::currentStep;
         data.macroSize = bot::currentMacro.size();
 
         if (this->m_player1) {
@@ -339,8 +352,7 @@ struct BotPlayLayer : Modify<BotPlayLayer, PlayLayer> {
         if (it == bot::checkpoints.end()) return;
 
         const auto& data = it->second;
-        bot::levelTime = data.time;
-        bot::currentFrameTime = data.time;
+        bot::currentStep = data.step;
 
         if (bot::mode == bot::Mode::Record) {
             if (data.macroSize <= bot::currentMacro.size()) {
@@ -374,6 +386,7 @@ struct BotPlayLayer : Modify<BotPlayLayer, PlayLayer> {
         bot::p2State.reset();
         bot::isSubStepping = false;
         bot::dualUpdatedInP1 = false;
+        bot::isBotPlayback = false;
         bot::resetTimingBaseline();
     }
 };
@@ -396,33 +409,30 @@ struct BotPlayerObject : Modify<BotPlayerObject, PlayerObject> {
             return;
         }
 
-        // Единственная точка истины для таймлинии уровня.
-        bot::currentFrameTime = bot::levelTime;
-        bot::currentFrameDt = dt;
-        bot::frameRealStart = std::chrono::steady_clock::now();
+        bot::stepStartTime = std::chrono::steady_clock::now();
+        bot::currentStepDt = dt;
 
         bool isDual = (pl->m_player2 != nullptr && pl->m_player2->isVisible());
         bot::dualUpdatedInP1 = isDual;
 
         if (bot::mode == bot::Mode::Play) {
-            double frameStart = bot::currentFrameTime;
-            double frameEnd = frameStart + static_cast<double>(dt);
             double currentFrac = 0.0;
-
             bot::isSubStepping = true;
 
             while (bot::macroIndex < bot::currentMacro.size()) {
                 const auto& act = bot::currentMacro[bot::macroIndex];
-                if (act.time >= frameEnd) {
+                if (act.step != bot::currentStep) {
+                    if (act.step < bot::currentStep) {
+                        bot::isBotPlayback = true;
+                        pl->handleButton(act.down, act.btn, act.p1);
+                        bot::isBotPlayback = false;
+                        bot::macroIndex++;
+                        continue;
+                    }
                     break;
                 }
 
-                double targetFrac = 0.0;
-                if (dt > 1e-7) {
-                    targetFrac = (act.time - frameStart) / static_cast<double>(dt);
-                }
-                targetFrac = std::clamp(targetFrac, 0.0, 0.999);
-
+                double targetFrac = std::clamp(act.frac, 0.0, 0.999999);
                 if (targetFrac > currentFrac) {
                     float subDelta = static_cast<float>((targetFrac - currentFrac) * dt);
                     PlayerObject::update(subDelta);
@@ -432,7 +442,10 @@ struct BotPlayerObject : Modify<BotPlayerObject, PlayerObject> {
                     currentFrac = targetFrac;
                 }
 
-                bot::applyAction(act, pl);
+                bot::isBotPlayback = true;
+                pl->handleButton(act.down, act.btn, act.p1);
+                bot::isBotPlayback = false;
+
                 bot::macroIndex++;
             }
 
@@ -443,7 +456,7 @@ struct BotPlayerObject : Modify<BotPlayerObject, PlayerObject> {
             }
 
             bot::isSubStepping = false;
-            bot::levelTime += static_cast<double>(dt);
+            bot::currentStep++;
             return;
         }
 
@@ -451,7 +464,7 @@ struct BotPlayerObject : Modify<BotPlayerObject, PlayerObject> {
         if (isDual) {
             pl->m_player2->update(dt);
         }
-        bot::levelTime += static_cast<double>(dt);
+        bot::currentStep++;
     }
 };
 
@@ -501,23 +514,21 @@ struct BotPauseLayer : Modify<BotPauseLayer, PauseLayer> {
         auto spdLabel = CCLabelBMFont::create("SPD:", "goldFont.fnt");
         spdLabel->setScale(0.5f);
 
-        m_fields->speedInput = TextInput::create(55.0f, "1.0", "bigFont.fnt");
+        m_fields->speedInput = TextInput::create(60.0f, "1.0", "bigFont.fnt");
         m_fields->speedInput->setScale(0.55f);
-        m_fields->speedInput->setFilter("0123456789.");
-        m_fields->speedInput->setMaxCharCount(4);
+        m_fields->speedInput->setFilter("0123456789.,");
+        m_fields->speedInput->setMaxCharCount(6);
         m_fields->speedInput->setString(fmt::format("{:.2f}", bot::recSpeed));
         m_fields->speedInput->setCallback([this](std::string const& str) {
-            if (str.empty()) return;
-            try {
-                double val = std::stod(str);
-                val = std::clamp(val, 0.01, 2.0);
+            double val = bot::parseSpeedString(str);
+            if (val >= 0.01 && val <= 2.0) {
                 bot::recSpeed = val;
                 Mod::get()->setSettingValue<double>("record-speed", bot::recSpeed);
                 if (bot::mode == bot::Mode::Record) {
                     CCScheduler::get()->setTimeScale(static_cast<float>(bot::recSpeed));
                 }
                 this->updateLabels();
-            } catch (...) {}
+            }
         });
 
         m_fields->botMenu->addChild(recBtn);
@@ -553,8 +564,8 @@ struct BotPauseLayer : Modify<BotPauseLayer, PauseLayer> {
         }
 
         m_fields->statusLabel->setString(
-            fmt::format("MODE: {} | ACTS: {} | TIME: {:.2f}s | FILE: {}",
-                modeStr, bot::currentMacro.size(), bot::levelTime, bot::currentMacroName).c_str()
+            fmt::format("MODE: {} | ACTS: {} | STEP: {} | FILE: {}",
+                modeStr, bot::currentMacro.size(), bot::currentStep, bot::currentMacroName).c_str()
         );
         m_fields->statusLabel->setColor(col);
     }
@@ -562,7 +573,7 @@ struct BotPauseLayer : Modify<BotPauseLayer, PauseLayer> {
     void onRecord(CCObject*) {
         bot::mode = bot::Mode::Record;
         bot::currentMacro.clear();
-        bot::levelTime = 0.0;
+        bot::currentStep = 0;
         bot::macroIndex = 0;
         bot::p1State.reset();
         bot::p2State.reset();
@@ -574,7 +585,7 @@ struct BotPauseLayer : Modify<BotPauseLayer, PauseLayer> {
     void onPlay(CCObject*) {
         bot::mode = bot::Mode::Play;
         bot::macroIndex = 0;
-        bot::levelTime = 0.0;
+        bot::currentStep = 0;
         bot::p1State.reset();
         bot::p2State.reset();
         CCScheduler::get()->setTimeScale(1.0f);
@@ -590,7 +601,7 @@ struct BotPauseLayer : Modify<BotPauseLayer, PauseLayer> {
     void onClear(CCObject*) {
         bot::currentMacro.clear();
         bot::macroIndex = 0;
-        bot::levelTime = 0.0;
+        bot::currentStep = 0;
         updateLabels();
     }
 
