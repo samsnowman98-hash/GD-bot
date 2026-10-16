@@ -7,7 +7,6 @@
 #include <Geode/modify/PlayerObject.hpp>
 #include <Geode/modify/PauseLayer.hpp>
 #include <Geode/modify/CCScheduler.hpp>
-#include <Geode/ui/Popup.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -97,7 +96,6 @@ namespace bot {
     inline double recSpeed = 1.0;
     inline float appliedScale = 1.0f;
 
-    // Кроссплатформенный таймер наносекундной точности
     inline double getCurrentTimestamp() {
         using namespace std::chrono;
         return duration_cast<duration<double>>(steady_clock::now().time_since_epoch()).count();
@@ -108,7 +106,7 @@ namespace bot {
         return pl && static_cast<GJBaseGameLayer*>(pl) == l;
     }
 
-    // Мгновенная инициализация физики на 1-м кадре после респавна
+    // Мгновенный запуск физики без задержек при респавне
     inline void primeEngineAfterRespawn(double expectedDelta) {
         stepQueue.clear();
         inputVector.clear();
@@ -137,7 +135,7 @@ namespace bot {
     inline void applyClickFlags(PlayLayer* pl) {
         if (!pl) return;
         if (g.mode != Mode::Off) {
-            pl->m_clickBetweenSteps = true; // Сбор высокоточных аппаратных нажатий
+            pl->m_clickBetweenSteps = true;
             pl->m_clickOnSteps = false;
         } else {
             auto gm = GameManager::get();
@@ -162,7 +160,7 @@ namespace bot {
         Notification::create(text, icon, 1.f)->show();
     }
 
-    // ---- Файловая система (.gdbot) ----
+    // ---- Работа с файлами (.gdbot) ----
     inline std::filesystem::path macroPath() {
         if (g.levelID != 0) {
             return Mod::get()->getSaveDir() / fmt::format("level_{}{}", g.levelID, kMacroExt);
@@ -259,7 +257,6 @@ namespace bot {
         double timeScaleFactor = (g.mode == Mode::Record) ? recSpeed : 1.0;
         double deltaTime = (currentFrameTime - lastFrameTime) * timeScaleFactor;
 
-        // Защита от резких лагов системы (максимум 40 мс)
         double maxAllowedDelta = (1.0 / 25.0) * timeScaleFactor;
         if (deltaTime > maxAllowedDelta) {
             deltaTime = maxAllowedDelta;
@@ -317,7 +314,6 @@ namespace bot {
         }
         if (modifiedDelta <= 0.0) return;
 
-        // При возрождении не пропускаем кадр, а сразу инициализируем время
         if (firstFrame) {
             primeEngineAfterRespawn(modifiedDelta);
         }
@@ -365,161 +361,6 @@ namespace bot {
         p->m_lastCollisionTop = -1;
     }
 }
-
-// ---------------------------------------------------------------------------
-// МЕНЮ МАКРОСОВ (Macro Manager Popup)
-// ---------------------------------------------------------------------------
-class MacroManagerPopup : public geode::Popup<> {
-protected:
-    ScrollLayer* m_scroll = nullptr;
-    CCMenu* m_listMenu = nullptr;
-
-    bool setup() override {
-        this->setTitle("Macro Manager");
-
-        auto winSize = m_mainLayer->getContentSize();
-
-        m_scroll = ScrollLayer::create({ 310.f, 130.f });
-        m_scroll->setPosition({ (winSize.width - 310.f) / 2.f, 50.f });
-        m_mainLayer->addChild(m_scroll);
-
-        auto btmMenu = CCMenu::create();
-        btmMenu->setPosition({ winSize.width / 2.f, 25.f });
-
-        auto saveSpr = ButtonSprite::create("SAVE CURRENT", "goldFont.fnt", "GJ_button_01.png", 0.7f);
-        saveSpr->setScale(0.6f);
-        auto saveBtn = CCMenuItemSpriteExtra::create(saveSpr, this, menu_selector(MacroManagerPopup::onSaveNew));
-        btmMenu->addChild(saveBtn);
-        m_mainLayer->addChild(btmMenu);
-
-        this->loadFileList();
-        return true;
-    }
-
-    void loadFileList() {
-        if (m_listMenu) m_listMenu->removeFromParent();
-
-        std::vector<std::filesystem::path> files;
-        auto dir = Mod::get()->getSaveDir();
-        if (std::filesystem::exists(dir)) {
-            for (auto const& entry : std::filesystem::directory_iterator(dir)) {
-                if (entry.path().extension() == bot::kMacroExt) {
-                    files.push_back(entry.path());
-                }
-            }
-        }
-
-        std::sort(files.begin(), files.end());
-
-        float rowHeight = 28.f;
-        float totalHeight = std::max(130.f, static_cast<float>(files.size()) * rowHeight);
-
-        m_scroll->m_contentLayer->setContentSize({ 310.f, totalHeight });
-
-        m_listMenu = CCMenu::create();
-        m_listMenu->setPosition({ 0.f, 0.f });
-        m_scroll->m_contentLayer->addChild(m_listMenu);
-
-        if (files.empty()) {
-            auto emptyLabel = CCLabelBMFont::create("No saved macros yet", "chatFont.fnt");
-            emptyLabel->setScale(0.6f);
-            emptyLabel->setPosition({ 155.f, totalHeight / 2.f });
-            m_scroll->m_contentLayer->addChild(emptyLabel);
-            return;
-        }
-
-        for (size_t i = 0; i < files.size(); ++i) {
-            auto const& path = files[i];
-            float y = totalHeight - (static_cast<float>(i) * rowHeight) - (rowHeight / 2.f);
-
-            std::string nameStr = path.stem().string();
-            if (nameStr.length() > 22) {
-                nameStr = nameStr.substr(0, 20) + "..";
-            }
-
-            auto nameLabel = CCLabelBMFont::create(nameStr.c_str(), "chatFont.fnt");
-            nameLabel->setScale(0.48f);
-            nameLabel->setAnchorPoint({ 0.f, 0.5f });
-            nameLabel->setPosition({ 10.f, y });
-            m_listMenu->addChild(nameLabel);
-
-            // Кнопка LOAD
-            auto loadSpr = ButtonSprite::create("LOAD");
-            loadSpr->setScale(0.42f);
-            auto loadBtn = CCMenuItemSpriteExtra::create(loadSpr, this, menu_selector(MacroManagerPopup::onLoadFile));
-            loadBtn->setUserObject(CCString::create(path.string()));
-            loadBtn->setPosition({ 220.f, y });
-            m_listMenu->addChild(loadBtn);
-
-            // Кнопка DELETE
-            auto delSpr = ButtonSprite::create("X", "bigFont.fnt", "GJ_button_06.png", 0.6f);
-            delSpr->setScale(0.42f);
-            auto delBtn = CCMenuItemSpriteExtra::create(delSpr, this, menu_selector(MacroManagerPopup::onDeleteFile));
-            delBtn->setUserObject(CCString::create(path.string()));
-            delBtn->setPosition({ 275.f, y });
-            m_listMenu->addChild(delBtn);
-        }
-
-        m_scroll->moveToTop();
-    }
-
-    void onSaveNew(CCObject*) {
-        if (bot::g.macro.empty()) {
-            bot::notify("Macro is empty!", NotificationIcon::Warning);
-            return;
-        }
-        auto now = std::time(nullptr);
-        auto ltm = std::localtime(&now);
-        char timeBuf[32];
-        std::strftime(timeBuf, sizeof(timeBuf), "%m%d_%H%M%S", ltm);
-
-        std::string filename = fmt::format("{}_{}{}", bot::g.levelName, timeBuf, bot::kMacroExt);
-        auto target = Mod::get()->getSaveDir() / filename;
-
-        if (bot::writeMacroToFile(target, bot::g.macro)) {
-            bot::notify("Saved successfully!", NotificationIcon::Success);
-            this->loadFileList();
-        } else {
-            bot::notify("Failed to save!", NotificationIcon::Error);
-        }
-    }
-
-    void onLoadFile(CCObject* sender) {
-        auto item = static_cast<CCMenuItemSpriteExtra*>(sender);
-        auto strObj = static_cast<CCString*>(item->getUserObject());
-        std::filesystem::path p(strObj->getCString());
-
-        std::vector<bot::Action> tmp;
-        if (bot::readMacroFromFile(p, tmp)) {
-            bot::g.macro = std::move(tmp);
-            bot::g.index = 0;
-            bot::notify(fmt::format("Loaded: {} actions", bot::g.macro.size()).c_str(), NotificationIcon::Success);
-            this->onClose(nullptr);
-        } else {
-            bot::notify("Corrupted file!", NotificationIcon::Error);
-        }
-    }
-
-    void onDeleteFile(CCObject* sender) {
-        auto item = static_cast<CCMenuItemSpriteExtra*>(sender);
-        auto strObj = static_cast<CCString*>(item->getUserObject());
-        std::error_code ec;
-        std::filesystem::remove(strObj->getCString(), ec);
-        bot::notify("Macro deleted", NotificationIcon::Info);
-        this->loadFileList();
-    }
-
-public:
-    static MacroManagerPopup* create() {
-        auto ret = new MacroManagerPopup();
-        if (ret && ret->initAnchored(350.f, 210.f)) {
-            ret->autorelease();
-            return ret;
-        }
-        CC_SAFE_DELETE(ret);
-        return nullptr;
-    }
-};
 
 // ---------------------------------------------------------------------------
 // ХУКИ
@@ -611,7 +452,7 @@ class $modify(BotPlayerObject, PlayerObject) {
             }
         } else {
             bool front = !bot::stepQueue.empty() && !bot::stepQueue.front().endStep;
-            if (!bot::stepQueue.empty() && !front) bot::stepQueue.pop_front();
+            if (!bot::stepQueue.empty() && !bot::stepQueue.front().endStep) bot::stepQueue.pop_front();
             if (front && !bot::skipUpdate) {
                 double sum = 0.0;
                 bot::Sub s;
@@ -667,7 +508,6 @@ class $modify(BotPlayerObject, PlayerObject) {
         bool firstLoop = true;
         double acc = 0.0;
 
-        // Ликвидация погрешности float: точный учет уже пройденных долей шага
         float consumedDeltaP1 = 0.0f;
         float consumedDeltaP2 = 0.0f;
         bot::Sub pending;
@@ -817,7 +657,6 @@ class $modify(BotPlayLayer, PlayLayer) {
         auto const& data = it->second;
         bot::g.step = data.step;
 
-        // Восстановление микро-координат и векторов скорости
         if (m_player1) {
             m_player1->setPosition(data.p1Pos);
             m_player1->m_yVelocity = data.p1YVel;
@@ -857,25 +696,37 @@ class $modify(BotPlayLayer, PlayLayer) {
 };
 
 // ---------------------------------------------------------------------------
-// МЕНЮ ПАУЗЫ
+// МЕНЮ ПАУЗЫ (Со встроенным менеджером макросов)
 // ---------------------------------------------------------------------------
 class $modify(BotPauseLayer, PauseLayer) {
+    struct Fields {
+        CCNode* m_mainBotMenu = nullptr;
+        CCNode* m_macroPanel = nullptr;
+        ScrollLayer* m_scroll = nullptr;
+        CCMenu* m_listMenu = nullptr;
+    };
+
     void customSetup() {
         PauseLayer::customSetup();
         if (!PlayLayer::get()) return;
 
         auto win = CCDirector::get()->getWinSize();
 
+        // 1. Главный контейнер управления ботом
+        m_fields->m_mainBotMenu = CCNode::create();
+        this->addChild(m_fields->m_mainBotMenu);
+
         auto menu = CCMenu::create();
         menu->setID("bot-menu");
         menu->setPosition({ 0.f, 0.f });
+        m_fields->m_mainBotMenu->addChild(menu);
 
         auto label = CCLabelBMFont::create(bot::statusText().c_str(), "chatFont.fnt");
         label->setID("bot-status");
         label->setScale(0.55f);
         label->setAnchorPoint({ 0.f, 0.5f });
         label->setPosition({ 10.f, win.height / 2.f + 85.f });
-        this->addChild(label);
+        m_fields->m_mainBotMenu->addChild(label);
 
         auto makeBtn = [this](char const* text, float scale, SEL_MenuHandler cb) {
             auto spr = ButtonSprite::create(text);
@@ -886,7 +737,7 @@ class $modify(BotPauseLayer, PauseLayer) {
         float col1X = 42.f;
         float startY = win.height / 2.f + 55.f;
 
-        // Колонка 1: Управление записью
+        // Левая колонка: REC, PLAY, STOP, CLEAR
         auto btnRec = makeBtn("REC", 0.55f, menu_selector(BotPauseLayer::onBotRec));
         btnRec->setPosition({ col1X, startY });
         menu->addChild(btnRec);
@@ -903,12 +754,12 @@ class $modify(BotPauseLayer, PauseLayer) {
         btnClear->setPosition({ col1X, startY - 78.f });
         menu->addChild(btnClear);
 
-        // Колонка 2: Меню макросов и скорость
+        // Правая колонка: Кнопка менеджера макросов и скорость
         float col2X = 125.f;
 
         auto btnManagerSpr = ButtonSprite::create("MACROS", "goldFont.fnt", "GJ_button_04.png", 0.8f);
         btnManagerSpr->setScale(0.52f);
-        auto btnManager = CCMenuItemSpriteExtra::create(btnManagerSpr, this, menu_selector(BotPauseLayer::onOpenMacroManager));
+        auto btnManager = CCMenuItemSpriteExtra::create(btnManagerSpr, this, menu_selector(BotPauseLayer::onOpenMacroPanel));
         btnManager->setPosition({ col2X, startY });
         menu->addChild(btnManager);
 
@@ -920,17 +771,172 @@ class $modify(BotPauseLayer, PauseLayer) {
         btnSpdUp->setPosition({ col2X + 24.f, startY - 30.f });
         menu->addChild(btnSpdUp);
 
-        this->addChild(menu);
+        // 2. Панель менеджера макросов (скрыта по умолчанию)
+        m_fields->m_macroPanel = CCNode::create();
+        m_fields->m_macroPanel->setVisible(false);
+        this->addChild(m_fields->m_macroPanel, 100);
+
+        auto bg = CCScale9Sprite::create("GJ_square01.png", { 0, 0, 80, 80 });
+        bg->setContentSize({ 350.f, 210.f });
+        bg->setPosition(win.width / 2.f, win.height / 2.f);
+        m_fields->m_macroPanel->addChild(bg);
+
+        auto title = CCLabelBMFont::create("Saved Macros", "goldFont.fnt");
+        title->setScale(0.7f);
+        title->setPosition(win.width / 2.f, win.height / 2.f + 85.f);
+        m_fields->m_macroPanel->addChild(title);
+
+        m_fields->m_scroll = ScrollLayer::create({ 310.f, 120.f });
+        m_fields->m_scroll->setPosition(win.width / 2.f - 155.f, win.height / 2.f - 55.f);
+        m_fields->m_macroPanel->addChild(m_fields->m_scroll);
+
+        auto panelMenu = CCMenu::create();
+        panelMenu->setPosition({ 0.f, 0.f });
+
+        auto saveSpr = ButtonSprite::create("SAVE CURRENT", "goldFont.fnt", "GJ_button_01.png", 0.7f);
+        saveSpr->setScale(0.55f);
+        auto saveBtn = CCMenuItemSpriteExtra::create(saveSpr, this, menu_selector(BotPauseLayer::onSaveCurrentMacro));
+        saveBtn->setPosition({ win.width / 2.f - 60.f, win.height / 2.f - 80.f });
+        panelMenu->addChild(saveBtn);
+
+        auto backSpr = ButtonSprite::create("BACK", "goldFont.fnt", "GJ_button_06.png", 0.7f);
+        backSpr->setScale(0.55f);
+        auto backBtn = CCMenuItemSpriteExtra::create(backSpr, this, menu_selector(BotPauseLayer::onCloseMacroPanel));
+        backBtn->setPosition({ win.width / 2.f + 70.f, win.height / 2.f - 80.f });
+        panelMenu->addChild(backBtn);
+
+        m_fields->m_macroPanel->addChild(panelMenu);
     }
 
-    void updateBotLabel() {
-        if (auto l = typeinfo_cast<CCLabelBMFont*>(this->getChildByID("bot-status"))) {
-            l->setString(bot::statusText().c_str());
+    void refreshMacroList() {
+        if (m_fields->m_listMenu) {
+            m_fields->m_listMenu->removeFromParent();
+            m_fields->m_listMenu = nullptr;
+        }
+
+        std::vector<std::filesystem::path> files;
+        auto dir = Mod::get()->getSaveDir();
+        if (std::filesystem::exists(dir)) {
+            for (auto const& entry : std::filesystem::directory_iterator(dir)) {
+                if (entry.path().extension() == bot::kMacroExt) {
+                    files.push_back(entry.path());
+                }
+            }
+        }
+        std::sort(files.begin(), files.end());
+
+        float rowHeight = 28.f;
+        float totalHeight = std::max(120.f, static_cast<float>(files.size()) * rowHeight);
+
+        m_fields->m_scroll->m_contentLayer->setContentSize({ 310.f, totalHeight });
+
+        m_fields->m_listMenu = CCMenu::create();
+        m_fields->m_listMenu->setPosition({ 0.f, 0.f });
+        m_fields->m_scroll->m_contentLayer->addChild(m_fields->m_listMenu);
+
+        if (files.empty()) {
+            auto emptyLabel = CCLabelBMFont::create("No saved macros yet", "chatFont.fnt");
+            emptyLabel->setScale(0.6f);
+            emptyLabel->setPosition({ 155.f, totalHeight / 2.f });
+            m_fields->m_scroll->m_contentLayer->addChild(emptyLabel);
+            return;
+        }
+
+        for (size_t i = 0; i < files.size(); ++i) {
+            auto const& path = files[i];
+            float y = totalHeight - (static_cast<float>(i) * rowHeight) - (rowHeight / 2.f);
+
+            std::string nameStr = path.stem().string();
+            if (nameStr.length() > 20) {
+                nameStr = nameStr.substr(0, 18) + "..";
+            }
+
+            auto nameLabel = CCLabelBMFont::create(nameStr.c_str(), "chatFont.fnt");
+            nameLabel->setScale(0.48f);
+            nameLabel->setAnchorPoint({ 0.f, 0.5f });
+            nameLabel->setPosition({ 10.f, y });
+            m_fields->m_listMenu->addChild(nameLabel);
+
+            auto loadSpr = ButtonSprite::create("LOAD");
+            loadSpr->setScale(0.42f);
+            auto loadBtn = CCMenuItemSpriteExtra::create(loadSpr, this, menu_selector(BotPauseLayer::onLoadFile));
+            loadBtn->setUserObject(CCString::create(path.string()));
+            loadBtn->setPosition({ 220.f, y });
+            m_fields->m_listMenu->addChild(loadBtn);
+
+            auto delSpr = ButtonSprite::create("X", "bigFont.fnt", "GJ_button_06.png", 0.6f);
+            delSpr->setScale(0.42f);
+            auto delBtn = CCMenuItemSpriteExtra::create(delSpr, this, menu_selector(BotPauseLayer::onDeleteFile));
+            delBtn->setUserObject(CCString::create(path.string()));
+            delBtn->setPosition({ 275.f, y });
+            m_fields->m_listMenu->addChild(delBtn);
+        }
+
+        m_fields->m_scroll->moveToTop();
+    }
+
+    void onOpenMacroPanel(CCObject*) {
+        m_fields->m_mainBotMenu->setVisible(false);
+        m_fields->m_macroPanel->setVisible(true);
+        this->refreshMacroList();
+    }
+
+    void onCloseMacroPanel(CCObject*) {
+        m_fields->m_macroPanel->setVisible(false);
+        m_fields->m_mainBotMenu->setVisible(true);
+        this->updateBotLabel();
+    }
+
+    void onSaveCurrentMacro(CCObject*) {
+        if (bot::g.macro.empty()) {
+            bot::notify("Macro is empty!", NotificationIcon::Warning);
+            return;
+        }
+        auto now = std::time(nullptr);
+        auto ltm = std::localtime(&now);
+        char timeBuf[32];
+        std::strftime(timeBuf, sizeof(timeBuf), "%m%d_%H%M%S", ltm);
+
+        std::string filename = fmt::format("{}_{}{}", bot::g.levelName, timeBuf, bot::kMacroExt);
+        auto target = Mod::get()->getSaveDir() / filename;
+
+        if (bot::writeMacroToFile(target, bot::g.macro)) {
+            bot::notify("Saved successfully!", NotificationIcon::Success);
+            this->refreshMacroList();
+        } else {
+            bot::notify("Save failed!", NotificationIcon::Error);
         }
     }
 
-    void onOpenMacroManager(CCObject*) {
-        MacroManagerPopup::create()->show();
+    void onLoadFile(CCObject* sender) {
+        auto item = static_cast<CCMenuItemSpriteExtra*>(sender);
+        auto strObj = static_cast<CCString*>(item->getUserObject());
+        std::filesystem::path p(strObj->getCString());
+
+        std::vector<bot::Action> tmp;
+        if (bot::readMacroFromFile(p, tmp)) {
+            bot::g.macro = std::move(tmp);
+            bot::g.index = 0;
+            bot::notify(fmt::format("Loaded {} actions!", bot::g.macro.size()).c_str(), NotificationIcon::Success);
+            this->onCloseMacroPanel(nullptr);
+        } else {
+            bot::notify("Corrupted file!", NotificationIcon::Error);
+        }
+    }
+
+    void onDeleteFile(CCObject* sender) {
+        auto item = static_cast<CCMenuItemSpriteExtra*>(sender);
+        auto strObj = static_cast<CCString*>(item->getUserObject());
+        std::error_code ec;
+        std::filesystem::remove(strObj->getCString(), ec);
+        bot::notify("Macro deleted", NotificationIcon::Info);
+        this->refreshMacroList();
+    }
+
+    void updateBotLabel() {
+        if (auto l = typeinfo_cast<CCLabelBMFont*>(m_fields->m_mainBotMenu->getChildByID("bot-status"))) {
+            l->setString(bot::statusText().c_str());
+        }
     }
 
     void onSpeedDown(CCObject*) {
