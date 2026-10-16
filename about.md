@@ -1,3 +1,3 @@
-# Template Mod
+# FermBot
 
-Edit about.md to change this
+Test bot based on the idea of a mod that clicks between frames. In beta.
