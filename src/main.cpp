@@ -77,7 +77,6 @@ namespace bot {
     inline std::vector<PlayerButtonCommand> inputVector;
     inline double lastFrameTime = 0.0;
     inline double currentFrameTime = 0.0;
-    inline bool firstFrame = true;
     inline bool skipUpdate = true;
     inline bool inputThisStep = false;
     inline bool p1Split = false;
@@ -101,7 +100,8 @@ namespace bot {
     inline void resetEngine() {
         stepQueue.clear();
         inputVector.clear();
-        firstFrame = true;
+        // Якорь времени: следующий кадр сразу режется по времени кликов (без потерянного кадра после респавна)
+        lastFrameTime = currentFrameTime;
         skipUpdate = true;
         inputThisStep = false;
         p1Split = false;
@@ -253,14 +253,6 @@ namespace bot {
         stepQueue.clear();
         skipUpdate = false;
 
-        if (firstFrame) {
-            skipUpdate = true;
-            firstFrame = false;
-            lastFrameTime = currentFrameTime;
-            inputVector.clear();
-            return;
-        }
-
         double deltaTime = currentFrameTime - lastFrameTime;
         if (!(deltaTime > 0.0) || stepCount < 1) {
             skipUpdate = true;
@@ -320,7 +312,7 @@ namespace bot {
 
         if (pl->m_playerDied) {
             skipUpdate = true;
-            firstFrame = true;
+            lastFrameTime = currentFrameTime;
             return;
         }
         // Кадр без физических шагов (при замедлении): клики остаются в очереди игры
@@ -353,7 +345,8 @@ namespace bot {
         if (mode == Mode::Off) return;
 
         if (idle) {
-            firstFrame = true;
+            // пауза/конец уровня: держим якорь на текущем кадре, после возврата в игру первый кадр уже режется
+            lastFrameTime = currentFrameTime;
             skipUpdate = true;
             inputVector.clear();
         }
