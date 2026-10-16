@@ -426,7 +426,10 @@ class $modify(BotBaseGameLayer, GJBaseGameLayer) {
             std::vector<PlayerButtonCommand> saved(this->m_queuedButtons.begin(), this->m_queuedButtons.end());
             this->m_queuedButtons.clear();
             GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
-            this->m_queuedButtons.insert(this->m_queuedButtons.begin(), saved.begin(), saved.end());
+            std::vector<PlayerButtonCommand> added(this->m_queuedButtons.begin(), this->m_queuedButtons.end());
+            this->m_queuedButtons.clear();
+            for (auto const& c : saved) this->m_queuedButtons.push_back(c);
+            for (auto const& c : added) this->m_queuedButtons.push_back(c);
             return;
         }
         GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
