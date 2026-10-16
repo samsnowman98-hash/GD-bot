@@ -10,9 +10,13 @@ jobs:
       fail-fast: false
       matrix:
         config:
+          - name: Windows
+            os: windows-latest
+
           - name: Android32
             os: ubuntu-latest
             target: Android32
+
           - name: Android64
             os: ubuntu-latest
             target: Android64
@@ -40,5 +44,5 @@ jobs:
 
       - uses: actions/upload-artifact@v4
         with:
-          name: MyGDBot-Android
+          name: CBF-TAS-Bot-Universal
           path: ${{ steps.build.outputs.build-output }}
