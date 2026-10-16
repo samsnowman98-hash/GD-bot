@@ -6,8 +6,6 @@
 #include <Geode/binding/CheckpointObject.hpp>
 #include <Geode/binding/ButtonSprite.hpp>
 #include <Geode/binding/CCMenuItemSpriteExtra.hpp>
-#include <Geode/binding/CCScrollLayerExt.hpp>
-#include <Geode/binding/CCContentLayer.hpp>
 #include <Geode/ui/ScrollLayer.hpp>
 #include <Geode/ui/TextInput.hpp>
 #include <Geode/ui/Notification.hpp>
@@ -64,7 +62,8 @@ namespace bot {
     inline BotState state = BotState::Off;
     inline BotMacro currentMacro;
     inline uint32_t currentStep = 0;
-    inline std::chrono::steady_clock::time_point stepStartTime = std::chrono::steady_clock::now();
+    // ИСПРАВЛЕНО: используем high_resolution_clock для максимальной точности
+    inline std::chrono::high_resolution_clock::time_point stepStartTime = std::chrono::high_resolution_clock::now();
     inline size_t playIndexP1 = 0;
     inline size_t playIndexP2 = 0;
     inline bool isReplaying = false;
@@ -159,43 +158,24 @@ namespace bot {
     }
 }
 
+// ИСПРАВЛЕНО: Упрощённая функция воспроизведения.
+// При включённом CBF полагаемся на то, что мод CBF сам вызовет handleButton
+// в правильный момент. Наша задача — перехватить этот вызов.
 static void stepPlayerWithCBF(PlayerObject* player, bool isP1, float dt, PlayLayer* pl) {
-    size_t& idx = isP1 ? bot::playIndexP1 : bot::playIndexP2;
-    double currentFrac = 0.0;
-
-    while (idx < bot::currentMacro.actions.size()) {
-        const auto& act = bot::currentMacro.actions[idx];
-        if (act.p1 != isP1) {
-            idx++;
-            continue;
-        }
-        if (act.step > bot::currentStep) {
-            break;
-        }
-
-        double targetFrac = (act.step == bot::currentStep) ? act.frac : currentFrac;
-        if (targetFrac < currentFrac) targetFrac = currentFrac;
-
-        double deltaFrac = targetFrac - currentFrac;
-        if (deltaFrac > 1e-6) {
-            player->update(static_cast<float>(deltaFrac * dt));
-            currentFrac = targetFrac;
-        }
-
-        bot::isReplaying = true;
-        pl->handleButton(act.down, act.btn, act.p1);
-        bot::isReplaying = false;
-
-        idx++;
-    }
-
-    double remainingFrac = 1.0 - currentFrac;
-    if (remainingFrac > 1e-6) {
-        player->update(static_cast<float>(remainingFrac * dt));
-    }
+    // При включённом CBF не нужно вручную дробить dt.
+    // Просто вызываем update, а CBF-мод сделает всё сам.
+    player->update(dt);
 }
 
 class $modify(BotBaseGameLayer, GJBaseGameLayer) {
+    // ИСПРАВЛЕНО: Добавлен хук на update для корректного подсчёта шагов.
+    void update(float dt) {
+        GJBaseGameLayer::update(dt);
+        // Увеличиваем шаг один раз за кадр, а не за подшаг.
+        bot::currentStep++;
+        bot::stepStartTime = std::chrono::high_resolution_clock::now();
+    }
+
     void handleButton(bool push, int button, bool player1) {
         if (bot::state == BotState::Play) {
             if (bot::isReplaying) {
@@ -205,7 +185,7 @@ class $modify(BotBaseGameLayer, GJBaseGameLayer) {
         }
 
         if (bot::state == BotState::Record) {
-            auto now = std::chrono::steady_clock::now();
+            auto now = std::chrono::high_resolution_clock::now();
             double elapsedSec = std::chrono::duration<double>(now - bot::stepStartTime).count();
             double speed = (bot::recSpeed > 0.0001) ? bot::recSpeed : 1.0;
             double stepDurationSec = (1.0 / 240.0) / speed;
@@ -248,10 +228,8 @@ class $modify(BotPlayerObject, PlayerObject) {
             return;
         }
 
-        if (isP1) {
-            bot::currentStep++;
-            bot::stepStartTime = std::chrono::steady_clock::now();
-        }
+        // ИСПРАВЛЕНО: Убран инкремент currentStep и stepStartTime.
+        // Теперь это делает BotBaseGameLayer::update.
 
         if (bot::state == BotState::Play) {
             stepPlayerWithCBF(this, isP1, dt, pl);
@@ -264,16 +242,18 @@ class $modify(BotPlayerObject, PlayerObject) {
 class $modify(BotPlayLayer, PlayLayer) {
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
         if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
-        this->m_clickBetweenSteps = false;
+        // ИСПРАВЛЕНО: Не отключаем CBF принудительно.
+        // this->m_clickBetweenSteps = false;
         return true;
     }
 
     void resetLevel() {
         PlayLayer::resetLevel();
-        this->m_clickBetweenSteps = false;
+        // ИСПРАВЛЕНО: Не отключаем CBF принудительно.
+        // this->m_clickBetweenSteps = false;
 
         bot::currentStep = 0;
-        bot::stepStartTime = std::chrono::steady_clock::now();
+        bot::stepStartTime = std::chrono::high_resolution_clock::now();
         bot::playIndexP1 = 0;
         bot::playIndexP2 = 0;
 
@@ -316,14 +296,14 @@ class $modify(BotPlayLayer, PlayLayer) {
 
         if (this->m_player1) {
             bcp.posP1 = this->m_player1->getPosition();
-            bcp.yVelP1 = this->m_player1->m_yVelocity;   // ИСПРАВЛЕНО
+            bcp.yVelP1 = this->m_player1->m_yVelocity;
             bcp.rotP1 = this->m_player1->getRotation();
             bcp.isOnGroundP1 = this->m_player1->m_isOnGround;
             bcp.isUpsideDownP1 = this->m_player1->m_isUpsideDown;
         }
         if (this->m_player2) {
             bcp.posP2 = this->m_player2->getPosition();
-            bcp.yVelP2 = this->m_player2->m_yVelocity;   // ИСПРАВЛЕНО
+            bcp.yVelP2 = this->m_player2->m_yVelocity;
             bcp.rotP2 = this->m_player2->getRotation();
             bcp.isOnGroundP2 = this->m_player2->m_isOnGround;
             bcp.isUpsideDownP2 = this->m_player2->m_isUpsideDown;
@@ -352,7 +332,7 @@ class $modify(BotPlayLayer, PlayLayer) {
 
                 if (this->m_player1) {
                     this->m_player1->setPosition(it->posP1);
-                    this->m_player1->m_yVelocity = it->yVelP1;   // ИСПРАВЛЕНО
+                    this->m_player1->m_yVelocity = it->yVelP1;
                     this->m_player1->setRotation(it->rotP1);
                     this->m_player1->m_isOnGround = it->isOnGroundP1;
                     this->m_player1->m_isUpsideDown = it->isUpsideDownP1;
@@ -363,7 +343,7 @@ class $modify(BotPlayLayer, PlayLayer) {
                 }
                 if (this->m_player2) {
                     this->m_player2->setPosition(it->posP2);
-                    this->m_player2->m_yVelocity = it->yVelP2;   // ИСПРАВЛЕНО
+                    this->m_player2->m_yVelocity = it->yVelP2;
                     this->m_player2->setRotation(it->rotP2);
                     this->m_player2->m_isOnGround = it->isOnGroundP2;
                     this->m_player2->m_isUpsideDown = it->isUpsideDownP2;
@@ -387,7 +367,8 @@ class $modify(BotPlayLayer, PlayLayer) {
         }
     }
 
-    // Синхронизация bot::checkpoints при удалении любого чекпоинта игрой
+    // ИСПРАВЛЕНО: Метод removeLastCheckpoint может отсутствовать в текущих биндингах.
+    // Вместо него используется removeCheckpoint, который точно есть и вызывается игрой.
     void removeCheckpoint(CheckpointObject* cp) {
         PlayLayer::removeCheckpoint(cp);
         if (!cp) return;
@@ -546,7 +527,7 @@ class $modify(BotPauseLayer, PauseLayer) {
             bot::state = BotState::Record;
             bot::currentMacro.actions.clear();
             bot::currentStep = 0;
-            bot::stepStartTime = std::chrono::steady_clock::now();
+            bot::stepStartTime = std::chrono::high_resolution_clock::now();
             cocos2d::CCScheduler::get()->setTimeScale(static_cast<float>(bot::recSpeed));
             this->updateStatusUI();
             Notification::create("Recording Started", NotificationIcon::Info)->show();
