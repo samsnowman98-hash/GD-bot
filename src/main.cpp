@@ -33,6 +33,10 @@ namespace bot {
 
     constexpr uint32_t kMagic = 0x32544F42; // "BOT2"
 
+    // Поставь false, когда закончишь диагностику рассинхрона часов —
+    // уберёт debug-спам из лога.
+    constexpr bool kDebugTimestamps = true;
+
     enum class Mode { Off, Record, Play };
 
     struct Action {
@@ -80,6 +84,14 @@ namespace bot {
     inline CCPoint p2Pos = { 0.f, 0.f };
     inline float rotationDelta = 0.f;
 
+    // ---- калибровка часов движка GD относительно steady_clock бота ----
+    // m_timestamp у PlayerButtonCommand может идти из другой системы отсчёта
+    // (не steady_clock), из-за чего прямое вычитание (rel = ts - lastFrameTime)
+    // даёт неверные значения, и вся пропорциональная нарезка клика внутри
+    // шага ломается (клик "доезжает" до 100% шага вместо честной доли).
+    inline double tsOffset = 0.0;
+    inline bool tsOffsetValid = false;
+
     inline double getCurrentTimestamp() {
         auto const now = std::chrono::steady_clock::now().time_since_epoch();
         return std::chrono::duration<double>(now).count();
@@ -99,6 +111,9 @@ namespace bot {
         p1Split = false;
         p2Split = false;
         midStep = false;
+        // Сбрасываем калибровку при каждом ресете сцены/режима — часы GD
+        // могут "поплыть" после паузы/рестарта, лучше откалиброваться заново.
+        tsOffsetValid = false;
     }
 
     inline void applyClickFlags() {
@@ -236,22 +251,67 @@ namespace bot {
         --silent;
     }
 
-    // Забирает нажатия из очереди GJBaseGameLayer в буфер бота
+    // Приводит таймстемп к секундам, если GD вдруг отдал его в миллисекундах.
+    inline double normalizeUnits(double raw, double now) {
+        double t = raw;
+        if (t > now * 2.0 && t > 1.0e5) t /= 1000.0;
+        return t;
+    }
+
     inline void drainQueuedButtons(GJBaseGameLayer* gl) {
         if (!gl) return;
         if (mode == Mode::Play) {
             gl->m_queuedButtons.clear();
             return;
         }
+        if (gl->m_queuedButtons.empty()) return;
 
         double const now = getCurrentTimestamp();
+
+        // Шаг 1: нормализуем единицы измерения (сек vs мс) и находим самое
+        // свежее событие в пачке — считаем, что оно произошло практически
+        // "прямо сейчас" (клики в очередь попадают почти мгновенно).
+        double newest = -std::numeric_limits<double>::infinity();
+        for (auto& cmd : gl->m_queuedButtons) {
+            cmd.m_timestamp = normalizeUnits(cmd.m_timestamp, now);
+            newest = std::max(newest, cmd.m_timestamp);
+        }
+
+        double const rawOffsetSample = now - newest;
+
+        // Шаг 2: калибруем смещение между часами GD и нашим steady_clock.
+        // Сглаживаем (а не берём мгновенное значение), чтобы джиттер в один
+        // кадр не дёргал всю временную шкалу между шагами.
+        if (!tsOffsetValid) {
+            tsOffset = rawOffsetSample;
+            tsOffsetValid = true;
+        }
+        else {
+            tsOffset = tsOffset * 0.9 + rawOffsetSample * 0.1;
+        }
+
+        if constexpr (kDebugTimestamps) {
+            static int dbgCounter = 0;
+            if (++dbgCounter % 10 == 0) { // не спамим лог на каждый кадр
+                geode::log::debug(
+                    "[TAS BOT] now={:.6f} newest_raw={:.6f} rawOffset={:.6f} smoothedOffset={:.6f} lastFrameTime={:.6f} rel_after_fix={:.6f}",
+                    now, newest, rawOffsetSample, tsOffset, lastFrameTime,
+                    (newest + tsOffset) - lastFrameTime
+                );
+            }
+        }
+
         for (auto cmd : gl->m_queuedButtons) {
-            if (cmd.m_timestamp > now + 5.0) cmd.m_timestamp /= 1000.0;
+            cmd.m_timestamp += tsOffset;
             inputVector.push_back(cmd);
         }
         gl->m_queuedButtons.clear();
     }
 
+    // Нарезка одного кадра на физические шаги с учётом реального времени
+    // кликов. Push и release внутри одного и того же шага ОБА получают свою
+    // честную долю (deltaFactor) — никакого растягивания клика до целого
+    // шага быть не должно.
     inline void buildStepQueue(PlayLayer* pl, int stepCount) {
         stepQueue.clear();
 
@@ -289,6 +349,13 @@ namespace bot {
                     s.deltaFactor = std::max(0.0, t - elapsed);
                     s.endStep = false;
                     stepQueue.push_back(s);
+
+                    if constexpr (kDebugTimestamps) {
+                        geode::log::debug(
+                            "[TAS BOT] step={} btn={} push={} rel={:.6f} stepStart={:.6f} stepEnd={:.6f} t={:.6f} deltaFactor={:.6f}",
+                            i, s.button, s.push, rel, stepStart, stepEnd, t, s.deltaFactor
+                        );
+                    }
 
                     elapsed = t;
                     ++inputIdx;
@@ -354,10 +421,10 @@ namespace bot {
             lastFrameTime = currentFrameTime;
             inputVector.clear();
             stepAccumulator = 0.0;
+            tsOffsetValid = false;
         }
     }
 
-    // Очистка коллизий без конфликта с нативным PlayerObject::resetCollisionLog
     inline void clearCollisionLog(PlayerObject* p) {
         if (!p) return;
         p->m_collisionLogTop->removeAllObjects();
@@ -423,8 +490,9 @@ class $modify(BotBaseGameLayer, GJBaseGameLayer) {
 
     void processCommands(float dt, bool isHalfTick, bool isLastTick) {
         if (bot::mode != bot::Mode::Off && bot::isPlayLayer(this)) {
-            // Забираем клики в буфер до вызова vanilla-очистки (без опасных кастов)
             bot::drainQueuedButtons(this);
+            // Вызываем оригинальный метод, чтобы не блокировать обработку внутренних событий
+            GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
             return;
         }
         GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
@@ -675,6 +743,8 @@ class $modify(BotPlayLayer, PlayLayer) {
                 std::remove_if(m.begin(), m.end(), [s](bot::Action const& a) { return a.step >= s; }),
                 m.end()
             );
+            // При откате чекпоинта восстанавливаем зажатые кнопки, чтобы волна не залипала
+            bot::syncPlayback(this);
         }
         else if (bot::mode == bot::Mode::Play) {
             bot::syncPlayback(this);
