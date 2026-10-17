@@ -95,10 +95,10 @@ namespace bot {
             if (inStep) {
                 double t = (cmd.m_timestamp - stepStart) / stepDur;
                 t = std::clamp(t, 0.0, 1.0);
-                stepEvents.push_back({cmd.m_button, cmd.m_push, t});
+                stepEvents.push_back({cmd.m_button, cmd.m_isPush, t});
 
                 if (bot::mode == bot::Mode::Record) {
-                    bot::macro.push_back({bot::currentStep, cmd.m_button, cmd.m_push, isPlayer2, t});
+                    bot::macro.push_back({bot::currentStep, cmd.m_button, cmd.m_isPush, isPlayer2, t});
                 }
             }
         }
