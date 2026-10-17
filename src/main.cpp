@@ -236,20 +236,20 @@ namespace bot {
         --silent;
     }
 
-    // Забирает нажатия из очереди игры в наш постоянный буфер
-    inline void drainQueuedButtons(PlayLayer* pl) {
-        if (!pl) return;
+    // Забирает нажатия из очереди GJBaseGameLayer в буфер бота
+    inline void drainQueuedButtons(GJBaseGameLayer* gl) {
+        if (!gl) return;
         if (mode == Mode::Play) {
-            pl->m_queuedButtons.clear();
+            gl->m_queuedButtons.clear();
             return;
         }
 
         double const now = getCurrentTimestamp();
-        for (auto cmd : pl->m_queuedButtons) {
+        for (auto cmd : gl->m_queuedButtons) {
             if (cmd.m_timestamp > now + 5.0) cmd.m_timestamp /= 1000.0;
             inputVector.push_back(cmd);
         }
-        pl->m_queuedButtons.clear();
+        gl->m_queuedButtons.clear();
     }
 
     inline void buildStepQueue(PlayLayer* pl, int stepCount) {
@@ -321,17 +321,15 @@ namespace bot {
 
         int stepCount = 0;
         if (appliedScale >= 0.2f) {
-            // Обычная скорость: формула совпадает с циклом RobTop'а
             stepCount = static_cast<int>(std::round(std::max(1.0, stepsFraction)));
         }
         else {
-            // Замедление (0.01x): накапливаем шаги до момента срабатывания физики
             stepAccumulator += stepsFraction;
             stepCount = static_cast<int>(stepAccumulator);
             if (stepCount >= 1) {
                 stepAccumulator -= stepCount;
             } else {
-                return; // Ждём шаг физики, клики остаются в inputVector
+                return;
             }
         }
 
@@ -359,7 +357,9 @@ namespace bot {
         }
     }
 
-    inline void resetCollisionLog(PlayerObject* p) {
+    // Очистка коллизий без конфликта с нативным PlayerObject::resetCollisionLog
+    inline void clearCollisionLog(PlayerObject* p) {
+        if (!p) return;
         p->m_collisionLogTop->removeAllObjects();
         p->m_collisionLogBottom->removeAllObjects();
         p->m_collisionLogLeft->removeAllObjects();
@@ -397,7 +397,6 @@ class $modify(BotBaseGameLayer, GJBaseGameLayer) {
             return;
         }
 
-        // Запись: клик сохраняется ТОЛЬКО в момент применения ботом с точным frac!
         if (applying > 0) {
             Action a;
             a.step = applyStep;
@@ -424,8 +423,8 @@ class $modify(BotBaseGameLayer, GJBaseGameLayer) {
 
     void processCommands(float dt, bool isHalfTick, bool isLastTick) {
         if (bot::mode != bot::Mode::Off && bot::isPlayLayer(this)) {
-            // Забираем клики в буфер бота ПЕРЕД тем, как их очистит движок
-            bot::drainQueuedButtons(static_cast<PlayLayer*>(this));
+            // Забираем клики в буфер до вызова vanilla-очистки (без опасных кастов)
+            bot::drainQueuedButtons(this);
             return;
         }
         GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
@@ -563,7 +562,7 @@ class $modify(BotPlayerObject, PlayerObject) {
                     if (!this->m_isOnSlope || this->m_isDart) pl->checkCollisions(this, 0.0f, true);
                     else pl->checkCollisions(this, stepDelta, true);
                     PlayerObject::updateRotation(substepDelta);
-                    resetCollisionLog(this);
+                    bot::clearCollisionLog(this);
                 }
             }
             else if (s.endStep) PlayerObject::update(stepDelta);
@@ -577,7 +576,7 @@ class $modify(BotPlayerObject, PlayerObject) {
                     if (!p2->m_isOnSlope || p2->m_isDart) pl->checkCollisions(p2, 0.0f, true);
                     else pl->checkCollisions(p2, stepDelta, true);
                     p2->updateRotation(substepDelta);
-                    resetCollisionLog(p2);
+                    bot::clearCollisionLog(p2);
                 }
             }
             else if (s.endStep && p2 && isDual) p2->update(stepDelta);
