@@ -1,5 +1,6 @@
 // CBF-style TAS bot for Geometry Dash 2.2081 / Geode 5.x (Android & Windows)
 // True Real-Time Sub-Tick Engine — Zero TPS Snapping / Infinite Temporal Resolution
+// v2: resolve-on-execute scheduling (fixes clicks never firing / jump not working)
 
 #ifdef GEODE_IS_WINDOWS
     #define NOMINMAX
@@ -82,7 +83,6 @@ namespace bot {
     inline std::vector<Action> macro;
     inline uint64_t actionCounter = 0;
     inline uint32_t step = 0;
-    inline int silent = 0;
     inline bool isSubstepping = false;
 
     inline double recSpeed = 1.0;
@@ -91,11 +91,18 @@ namespace bot {
     // Очередь сырых аппаратных кликов из queueButton
     inline std::deque<RawInput> rawInputQueue;
     // Клики, распределенные по физическим шагам для суб-тиковой нарезки
+    // (заполняется В МОМЕНТ исполнения шага, а не заранее — см. resolve-on-execute)
     inline std::unordered_map<uint32_t, std::vector<Action>> liveStepActions;
 
+    // Таймлайн текущего render-кадра: нужен, чтобы связать реальные (wall-clock)
+    // таймстампы кликов ОС с реальным количеством физических шагов, которые
+    // движок выполнит ИМЕННО в этом кадре (а не с выдуманной частотой).
     inline double lastFrameTimestamp = 0.0;
     inline double currentFrameTimestamp = 0.0;
-    inline double physicsAccumulator = 0.0;
+    inline double frameWallStart = 0.0;     // wall-clock время начала текущего кадра
+    inline double frameWallDuration = 1.0 / 60.0; // реальная длительность предыдущего кадра
+    inline double frameDtTotal = 0.0;       // суммарный dt, переданный в PlayLayer::update в этом кадре
+    inline double frameDtConsumed = 0.0;    // сколько из frameDtTotal уже "прожито" физикой в этом кадре
 
     inline bool currentHeld[4][2] = {};
     inline std::unordered_map<CheckpointObject*, CheckpointData> checkpoints;
@@ -137,7 +144,6 @@ namespace bot {
 
     inline void forceReleaseEverything(PlayLayer* pl) {
         if (!pl) return;
-        ++silent;
         for (int b = 1; b <= 3; ++b) {
             pl->handleButton(false, b, true);
             pl->handleButton(false, b, false);
@@ -145,7 +151,25 @@ namespace bot {
             currentHeld[b][1] = false;
         }
         pl->m_queuedButtons.clear();
-        --silent;
+    }
+
+    // ---- Безопасное хранение чекпоинтов ----
+    // ВАЖНО: GJBaseGameLayer может удалить CheckpointObject из своего внутреннего
+    // массива (refcount -> 0 -> delete), и новый CheckpointObject может быть
+    // выделен аллокатором ровно по тому же адресу. Чтобы наш unordered_map не
+    // схватил "чужие" данные по переиспользованному указателю, мы сами держим
+    // retain() на каждый сохраненный чекпоинт, пока не удалим его из карты.
+    inline void storeCheckpoint(CheckpointObject* cp, CheckpointData const& data) {
+        if (!cp) return;
+        cp->retain();
+        checkpoints[cp] = data;
+    }
+
+    inline void clearCheckpoints() {
+        for (auto& kv : checkpoints) {
+            kv.first->release();
+        }
+        checkpoints.clear();
     }
 
     inline bool saveMacro(std::filesystem::path const& path, std::vector<Action> const& actions) {
@@ -187,6 +211,9 @@ namespace bot {
             if (!in) return false;
             a.down = (flags & 1) != 0;
             a.p1 = (flags & 2) != 0;
+            // Защита от повреждённых/мусорных файлов
+            a.frac = std::clamp(a.frac, 0.0, 0.999999999);
+            if (a.button < 1 || a.button > 3) a.button = 1;
             if (a.id > maxId) maxId = a.id;
             tmp.push_back(a);
         }
@@ -230,7 +257,8 @@ namespace bot {
         mode = m;
         rawInputQueue.clear();
         liveStepActions.clear();
-        physicsAccumulator = 0.0;
+        frameDtConsumed = 0.0;
+        frameDtTotal = 0.0;
         if (mode == Mode::Off) {
             setTimeScale(1.0f);
         }
@@ -287,7 +315,10 @@ class $modify(BotBaseGameLayer, GJBaseGameLayer) {
 };
 
 // ---------------------------------------------------------------------------
-// Истинный Sub-Tick: нарезка шага физики и во время записи, и во время игры
+// Истинный Sub-Tick: resolve-on-execute — клик привязывается к шагу РОВНО
+// в момент, когда этот шаг реально выполняется движком. Никаких предсказаний
+// "сколько шагов будет в кадре" — поэтому номер шага никогда не "уезжает"
+// в будущее, которое физически не наступит в ожидаемой форме.
 // ---------------------------------------------------------------------------
 class $modify(BotPlayerObject, PlayerObject) {
     void update(float dt) {
@@ -308,6 +339,49 @@ class $modify(BotPlayerObject, PlayerObject) {
 
         if (isP1) {
             ++step;
+
+            if (mode == Mode::Record) {
+                // Реальное wall-clock окно, которое занимает ЭТОТ физический шаг
+                // внутри текущего render-кадра. Поскольку dt всегда суммируется
+                // в frameDtTotal движком заранее (PlayLayer::update получает
+                // полный dt кадра), пропорциональное распределение этого dt
+                // внутри реального времени кадра — точное отражение того, как
+                // движок сам режет кадр на физические подшаги (half-tick и т.п.).
+                double const ratioStart = (frameDtTotal > 1e-12)
+                    ? (frameDtConsumed / frameDtTotal) : 0.0;
+                double const wStart = frameWallStart + ratioStart * frameWallDuration;
+
+                frameDtConsumed += static_cast<double>(dt);
+
+                double const ratioEnd = (frameDtTotal > 1e-12)
+                    ? (frameDtConsumed / frameDtTotal) : 1.0;
+                double const wEnd = frameWallStart + ratioEnd * frameWallDuration;
+
+                // Забираем из очереди ВСЕ клики, которые реально произошли
+                // в пределах этого окна — они гарантированно принадлежат
+                // именно этому, реально исполняемому прямо сейчас шагу.
+                while (!rawInputQueue.empty() && rawInputQueue.front().timestamp < wEnd) {
+                    RawInput in = rawInputQueue.front();
+                    rawInputQueue.pop_front();
+
+                    double frac = 0.0;
+                    if (wEnd > wStart + 1e-12) {
+                        frac = (in.timestamp - wStart) / (wEnd - wStart);
+                    }
+                    frac = std::clamp(frac, 0.0, 0.999999);
+
+                    Action a;
+                    a.id = ++actionCounter;
+                    a.step = step;
+                    a.frac = frac;
+                    a.button = static_cast<uint8_t>(in.button);
+                    a.down = in.push;
+                    a.p1 = !in.isPlayer2;
+
+                    macro.push_back(a);
+                    liveStepActions[step].push_back(a);
+                }
+            }
         }
 
         uint32_t const curStep = step;
@@ -326,7 +400,7 @@ class $modify(BotPlayerObject, PlayerObject) {
                 ++it;
             }
         } else if (mode == Mode::Record) {
-            // Режим RECORD: достаем действия, рассчитанные для этого суб-шага
+            // Режим RECORD: достаем действия, уже разрешенные для этого шага выше
             auto it = liveStepActions.find(curStep);
             if (it != liveStepActions.end()) {
                 for (auto const& act : it->second) {
@@ -380,7 +454,7 @@ class $modify(BotPlayerObject, PlayerObject) {
 };
 
 // ---------------------------------------------------------------------------
-// Планировщик суб-тиков кадра и управление записью
+// Планировщик кадрового таймлайна и управление записью
 // ---------------------------------------------------------------------------
 class $modify(BotPlayLayer, PlayLayer) {
     void update(float dt) {
@@ -392,91 +466,27 @@ class $modify(BotPlayLayer, PlayLayer) {
             lastFrameTimestamp = currentFrameTimestamp - (1.0 / 60.0);
         }
 
-        // Если идет запись, распределяем накопленные клики ОС по грядущим тикам физики
-        if (mode == Mode::Record && !rawInputQueue.empty()) {
-            float timewarp = this->m_gameState.m_timeWarp <= 0.0001f ? 1.0f : this->m_gameState.m_timeWarp;
-            double const stepDuration = (1.0 / 240.0) * timewarp;
-
-            double frameTime = currentFrameTimestamp - lastFrameTimestamp;
-            if (frameTime <= 1e-9) frameTime = 1.0 / 60.0;
-
-            physicsAccumulator += static_cast<double>(dt);
-            int stepsCount = static_cast<int>(physicsAccumulator / stepDuration);
-
-            if (stepsCount > 0) {
-                physicsAccumulator -= static_cast<double>(stepsCount) * stepDuration;
-
-                while (!rawInputQueue.empty()) {
-                    auto in = rawInputQueue.front();
-                    rawInputQueue.pop_front();
-
-                    // Непрерывная позиция клика внутри времени кадра
-                    double rel = in.timestamp - lastFrameTimestamp;
-                    double progress = std::clamp(rel / frameTime, 0.0, 0.999999);
-
-                    // Проекция в суб-тик (абсолютная CBF точность!)
-                    double continuous = static_cast<double>(step + 1) + progress * static_cast<double>(stepsCount);
-                    uint32_t targetStep = static_cast<uint32_t>(continuous);
-                    double targetFrac = continuous - static_cast<double>(targetStep);
-                    targetFrac = std::clamp(targetFrac, 0.0, 0.999999999);
-
-                    Action a;
-                    a.id = ++actionCounter;
-                    a.step = targetStep;
-                    a.frac = targetFrac; // Плавное математическое значение без TPS-округления!
-                    a.button = static_cast<uint8_t>(in.button);
-                    a.down = in.push;
-                    a.p1 = !in.isPlayer2;
-
-                    macro.push_back(a);
-                    liveStepActions[targetStep].push_back(a);
-                }
-            }
-        }
+        // Фиксируем реальный таймлайн ЭТОГО кадра. BotPlayerObject::update
+        // использует эти значения, чтобы сопоставить wall-clock таймстампы
+        // кликов с реально исполняемыми физическими шагами — без каких-либо
+        // предположений о "фиксированной частоте" движка.
+        frameWallStart = lastFrameTimestamp;
+        frameWallDuration = currentFrameTimestamp - lastFrameTimestamp;
+        if (frameWallDuration <= 1e-9) frameWallDuration = 1.0 / 60.0;
+        frameDtTotal = static_cast<double>(dt) > 1e-9 ? static_cast<double>(dt) : (1.0 / 60.0);
+        frameDtConsumed = 0.0;
 
         PlayLayer::update(dt);
-    }
-
-    void visit() {
-        // Визуальная интерполяция на замедлении
-        if (bot::mode == bot::Mode::Record && bot::recSpeed < 0.95 && this->m_player1 && !this->m_playerDied && !this->m_isPaused) {
-            double now = bot::getHighPrecisionTimestamp();
-            double frameDuration = bot::currentFrameTimestamp - bot::lastFrameTimestamp;
-            if (frameDuration <= 1e-9) frameDuration = (1.0 / 60.0);
-            float alpha = std::clamp(static_cast<float>((now - bot::currentFrameTimestamp) / frameDuration), 0.0f, 1.0f);
-
-            auto p1 = this->m_player1;
-            CCPoint orig1 = p1->getPosition();
-            CCPoint d1 = orig1 - p1->m_lastPosition;
-            p1->setPosition(orig1 + d1 * alpha);
-
-            CCPoint orig2 = { 0.f, 0.f };
-            auto p2 = this->m_player2;
-            if (p2) {
-                orig2 = p2->getPosition();
-                CCPoint d2 = orig2 - p2->m_lastPosition;
-                p2->setPosition(orig2 + d2 * alpha);
-            }
-
-            PlayLayer::visit();
-
-            p1->setPosition(orig1);
-            if (p2) p2->setPosition(orig2);
-            return;
-        }
-
-        PlayLayer::visit();
     }
 
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
         bot::setMode(bot::Mode::Off);
         bot::step = 0;
         bot::actionCounter = 0;
-        bot::checkpoints.clear();
+        bot::clearCheckpoints();
         bot::macro.clear();
         bot::lastFrameTimestamp = 0.0;
         bot::currentFrameTimestamp = bot::getHighPrecisionTimestamp();
-        srand(1337);
 
         if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
 
@@ -488,24 +498,46 @@ class $modify(BotPlayLayer, PlayLayer) {
 
     void resetLevel() {
         PlayLayer::resetLevel();
-        srand(1337);
+
+        // Детерминированный RNG нужен ТОЛЬКО когда бот активен (запись/плейбэк).
+        // В обычной игре трогать rand() нельзя — это ломает случайные триггеры
+        // для всех, кто даже не использует бота.
+        if (bot::mode != bot::Mode::Off) {
+            srand(1337);
+        }
+
         bot::forceReleaseEverything(this);
 
         if (!this->m_checkpointArray || this->m_checkpointArray->count() == 0) {
             bot::step = 0;
-            bot::checkpoints.clear();
+            bot::clearCheckpoints();
             if (bot::mode == bot::Mode::Record) bot::macro.clear();
         }
+
         bot::lastFrameTimestamp = bot::getHighPrecisionTimestamp();
         bot::currentFrameTimestamp = bot::lastFrameTimestamp;
+        bot::frameWallStart = bot::lastFrameTimestamp;
+        bot::frameWallDuration = 1.0 / 60.0;
+        bot::frameDtTotal = 0.0;
+        bot::frameDtConsumed = 0.0;
         bot::rawInputQueue.clear();
         bot::liveStepActions.clear();
-        bot::physicsAccumulator = 0.0;
     }
 
     CheckpointObject* createCheckpoint() {
         auto cp = PlayLayer::createCheckpoint();
         if (cp && this->m_player1) {
+            // Чистим чекпоинты, которые GD уже выкинул из своего внутреннего
+            // массива — чтобы наша карта (и наши retain()'ы) не росли вечно.
+            for (auto it = bot::checkpoints.begin(); it != bot::checkpoints.end();) {
+                if (!this->m_checkpointArray || !this->m_checkpointArray->containsObject(it->first)) {
+                    it->first->release();
+                    it = bot::checkpoints.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+
             bot::CheckpointData data;
             data.step = bot::step;
             data.macroSize = bot::macro.size();
@@ -530,7 +562,7 @@ class $modify(BotPlayLayer, PlayLayer) {
             if (this->m_player2) {
                 saveState(this->m_player2, data.p2State);
             }
-            bot::checkpoints[cp] = data;
+            bot::storeCheckpoint(cp, data);
         }
         return cp;
     }
@@ -580,23 +612,27 @@ class $modify(BotPlayLayer, PlayLayer) {
         if (bot::mode == bot::Mode::Record) {
             bot::forceReleaseEverything(this);
         } else if (bot::mode == bot::Mode::Play) {
-            ++bot::silent;
             for (int b = 1; b <= 3; ++b) {
                 bot::currentHeld[b][0] = data.held[b][0];
                 bot::currentHeld[b][1] = data.held[b][1];
                 this->handleButton(data.held[b][0], b, true);
                 this->handleButton(data.held[b][1], b, false);
             }
-            --bot::silent;
+        }
+
+        if (bot::mode != bot::Mode::Off) {
+            srand(1337 + data.step);
         }
 
         bot::lastFrameTimestamp = bot::getHighPrecisionTimestamp();
         bot::currentFrameTimestamp = bot::lastFrameTimestamp;
+        bot::frameWallStart = bot::lastFrameTimestamp;
+        bot::frameWallDuration = 1.0 / 60.0;
+        bot::frameDtTotal = 0.0;
+        bot::frameDtConsumed = 0.0;
         bot::rawInputQueue.clear();
         bot::liveStepActions.clear();
-        bot::physicsAccumulator = 0.0;
         this->m_queuedButtons.clear();
-        srand(1337 + data.step);
     }
 };
 
@@ -681,6 +717,9 @@ class $modify(BotPauseLayer, PauseLayer) {
             auto loadBtn = CCMenuItemExt::createSpriteExtra(loadSpr, [this, path](CCObject*) {
                 if (bot::loadMacro(path, bot::macro)) {
                     bot::setMode(bot::Mode::Off);
+                    // Старые чекпоинты ссылались на индексы ДРУГОГО макроса —
+                    // после загрузки нового макроса они невалидны.
+                    bot::clearCheckpoints();
                     this->updateStatusUI();
                     Notification::create("Loaded successfully", NotificationIcon::Success)->show();
                 } else {
@@ -747,6 +786,7 @@ class $modify(BotPauseLayer, PauseLayer) {
         auto recBtn = CCMenuItemExt::createSpriteExtra(m_fields->m_recSpr, [this](CCObject*) {
             bot::macro.clear();
             bot::actionCounter = 0;
+            bot::clearCheckpoints();
             bot::setMode(bot::Mode::Record);
             bot::setTimeScale(static_cast<float>(bot::recSpeed));
             this->updateStatusUI();
@@ -764,6 +804,7 @@ class $modify(BotPauseLayer, PauseLayer) {
             bot::recSpeed = 1.0;
             bot::setTimeScale(1.0f);
             if (m_fields->m_speedInput) m_fields->m_speedInput->setString("1.00");
+            bot::clearCheckpoints();
             bot::setMode(bot::Mode::Play);
             this->updateStatusUI();
             this->onRestart(nullptr);
