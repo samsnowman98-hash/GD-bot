@@ -1,4 +1,4 @@
-// CBF-style TAS bot for Geometry Dash 2.2081 / Geode 5.x (Android)
+// CBF-style TAS bot for Geometry Dash 2.2081 / Geode 5.x (Android / Windows)
 //
 // Макрос хранится как {step, frac}: номер физического шага + доля шага (double).
 // Запись берёт реальное время нажатия (m_queuedButtons[i].m_timestamp), раскладывает его по шагам кадра
@@ -94,9 +94,8 @@ namespace bot {
     inline float rotationDelta = 0.f;
 
     inline double getCurrentTimestamp() {
-        struct timespec now;
-        clock_gettime(CLOCK_MONOTONIC, &now);
-        return static_cast<double>(now.tv_sec) + static_cast<double>(now.tv_nsec) / 1'000'000'000.0;
+        using namespace std::chrono;
+        return duration<double>(steady_clock::now().time_since_epoch()).count();
     }
 
     inline bool isPlayLayer(GJBaseGameLayer* l) {
@@ -542,6 +541,10 @@ class $modify(BotBaseGameLayer, GJBaseGameLayer) {
 // Нарезка шага (схема Click Between Frames)
 // ---------------------------------------------------------------------------
 class $modify(BotPlayerObject, PlayerObject) {
+#if defined(__clang__)
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wundefined-bool-conversion"
+#endif
     void update(float stepDelta) {
         using namespace bot;
         auto pl = PlayLayer::get();
@@ -723,6 +726,9 @@ class $modify(BotPlayerObject, PlayerObject) {
         }
         PlayerObject::updateRotation(t);
     }
+#if defined(__clang__)
+#pragma clang diagnostic pop
+#endif
 };
 
 // ---------------------------------------------------------------------------
