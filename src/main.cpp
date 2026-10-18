@@ -2,10 +2,9 @@
 //
 // Макрос хранится как {step, frac}: номер физического шага + точная доля шага (double 0..1).
 // Честная подтиковая нарезка (Sub-tick CBF): позволяет спамить волной быстрее 240 TPS
-// и поддерживает сверхкороткие клики при замедлении (0.01x). Любое количество
-// кликов внутри одного физического шага обрабатывается событийно — каждый клик
-// получает свой честный под-отрезок времени и применяется ровно в момент своего
-// события, без переноса на следующий шаг и без усреднения.
+// и поддерживает сверхкороткие клики при замедлении (0.01x). Таймстемпы кликов
+// проставляются нашим же getCurrentTimestamp() сразу в queueButton — единый
+// домен времени для сортировки и нарезки, без эвристик на единицы измерения.
 
 #include <Geode/Geode.hpp>
 #include <Geode/modify/PlayLayer.hpp>
@@ -68,6 +67,10 @@ namespace bot {
     inline std::unordered_map<CheckpointObject*, uint32_t> checkpoints;
     inline double recSpeed = 1.0;
     inline float appliedScale = 1.0f;
+
+    // Отключение визуальных эффектов смерти (взрыв/тряска камеры), чтобы не
+    // мешали смотреть на запись. Персистится между сессиями.
+    inline bool disableDeathEffects = Mod::get()->getSavedValue<bool>("disableDeathEffects", true);
 
     // ---- CBF подсистема нарезки ----
     inline std::deque<Sub> stepQueue;
@@ -160,6 +163,46 @@ namespace bot {
         return dir;
     }
 
+    // Генерирует имя по умолчанию вида macro_ГГГГММДД_ЧЧММСС (без расширения).
+    // Используется как запасной вариант, если пользователь не ввёл своё имя,
+    // и как значение-подсказка в поле ввода.
+    inline std::string generateTimestampName() {
+        auto now = std::chrono::system_clock::now();
+        auto timeT = std::chrono::system_clock::to_time_t(now);
+        std::tm tmStruct{};
+#ifdef GEODE_IS_WINDOWS
+        localtime_s(&tmStruct, &timeT);
+#else
+        localtime_r(&timeT, &tmStruct);
+#endif
+        return fmt::format(
+            "macro_{:04d}{:02d}{:02d}_{:02d}{:02d}{:02d}",
+            tmStruct.tm_year + 1900, tmStruct.tm_mon + 1, tmStruct.tm_mday,
+            tmStruct.tm_hour, tmStruct.tm_min, tmStruct.tm_sec
+        );
+    }
+
+    // Убирает из имени файла символы, недопустимые в путях Windows/обычных ФС,
+    // а также обрезает пробелы по краям и ограничивает длину. Юникод (кириллица
+    // и т.д.) сохраняется как есть — он валиден в именах файлов.
+    inline std::string sanitizeFileName(std::string const& raw) {
+        std::string out;
+        out.reserve(raw.size());
+        for (char c : raw) {
+            unsigned char uc = static_cast<unsigned char>(c);
+            bool invalid = uc < 0x20
+                || c == '\\' || c == '/' || c == ':' || c == '*'
+                || c == '?' || c == '"' || c == '<' || c == '>' || c == '|';
+            out.push_back(invalid ? '_' : c);
+        }
+        size_t start = out.find_first_not_of(' ');
+        if (start == std::string::npos) return "";
+        size_t end = out.find_last_not_of(' ');
+        out = out.substr(start, end - start + 1);
+        if (out.size() > 80) out.resize(80);
+        return out;
+    }
+
     inline bool saveMacro(std::filesystem::path const& path, std::vector<Action> const& actions) {
         std::ofstream out(path, std::ios::binary | std::ios::trunc);
         if (!out) return false;
@@ -246,20 +289,14 @@ namespace bot {
             return;
         }
 
-        double const now = getCurrentTimestamp();
-        for (auto cmd : gl->m_queuedButtons) {
-            if (cmd.m_timestamp > now + 5.0) cmd.m_timestamp /= 1000.0;
+        // Таймстемпы уже честно проставлены нашим хуком queueButton в домене
+        // getCurrentTimestamp() — никакой коррекции единиц/эпох больше не нужно.
+        for (auto const& cmd : gl->m_queuedButtons) {
             inputVector.push_back(cmd);
         }
         gl->m_queuedButtons.clear();
     }
 
-    // Нарезает каждый физический шаг на подотрезки по количеству входящих
-    // событий (кликов) внутри него. Количество кликов внутри одного шага не
-    // ограничено: while-цикл обрабатывает их все подряд, каждому выделяя
-    // точный deltaFactor относительно предыдущего события. Никакого переноса
-    // между шагами нет — всё, что произошло внутри шага i, остаётся внутри
-    // шага i.
     inline void buildStepQueue(PlayLayer* pl, int stepCount) {
         stepQueue.clear();
 
@@ -394,6 +431,22 @@ class $modify(BotScheduler, CCScheduler) {
 // Перехват кнопок
 // ---------------------------------------------------------------------------
 class $modify(BotBaseGameLayer, GJBaseGameLayer) {
+    // Подменяем timestamp на наш собственный getCurrentTimestamp() сразу в
+    // момент постановки клика в очередь. Это гарантирует, что таймстемп
+    // клика лежит в ТОМ ЖЕ домене времени (std::chrono::steady_clock), что и
+    // lastFrameTime/currentFrameTime, которыми buildStepQueue режет шаг на
+    // подотрезки. Работает для любого количества кликов в пределах одного
+    // физического шага — каждый получает свой честный, хронологически верный
+    // штамп, без переноса между шагами и без искажения порядка при спаме.
+    void queueButton(int button, bool push, bool isPlayer2, double timestamp) {
+        using namespace bot;
+        double ts = timestamp;
+        if (mode != Mode::Off && isPlayLayer(this)) {
+            ts = getCurrentTimestamp();
+        }
+        GJBaseGameLayer::queueButton(button, push, isPlayer2, ts);
+    }
+
     void handleButton(bool down, int button, bool isPlayer1) {
         using namespace bot;
         if (mode == Mode::Off || silent > 0 || !isPlayLayer(this)) {
@@ -558,8 +611,7 @@ class $modify(BotPlayerObject, PlayerObject) {
         Sub pending;
 
         // Проходим по всем под-отрезкам внутри ОДНОГО физического шага.
-        // Их количество не ограничено — сколько кликов попало в шаг, столько
-        // Sub здесь и будет, каждый отрабатывает свой честный кусок времени.
+        // Их количество не ограничено.
         for (auto const& s : subs) {
             if (pending.has) {
                 applyInput(pl, pending, cur, acc);
@@ -698,6 +750,72 @@ class $modify(BotPlayLayer, PlayLayer) {
             bot::syncPlayback(this);
         }
     }
+
+    // === ПУНКТ 1 ===
+    // После успешного завершения уровня, если шла запись — выключаем бота
+    // (переводим в Off), сам макрос при этом не трогаем и не очищаем.
+    void levelComplete() {
+        PlayLayer::levelComplete();
+        if (bot::mode == bot::Mode::Record) {
+            bot::setMode(bot::Mode::Off);
+            Notification::create("Recording stopped: level complete", NotificationIcon::Info)->show();
+        }
+    }
+
+    // === ПУНКТ 2 ===
+    // Если включено "без эффектов смерти" — вызываем оригинальный
+    // PlayLayer::destroyPlayer как есть (чтобы не сломать логику смерти,
+    // рестарта, чекпоинтов, счётчика попыток и т.д.), но сразу после него
+    // вычищаем всё, что игра добавила нового в виде систем частиц (взрыв
+    // смерти), и отменяем сдвиг камеры от тряски, вернув позицию слоя.
+    // Это работает независимо от конкретных внутренних имён функций GD и не
+    // ломает основной игровой цикл.
+    void destroyPlayer(PlayerObject* player, GameObject* object) {
+        if (!bot::disableDeathEffects || bot::mode == bot::Mode::Off) {
+            PlayLayer::destroyPlayer(player, object);
+            return;
+        }
+
+        auto snapshotChildren = [](CCNode* node) {
+            std::vector<CCNode*> out;
+            if (node && node->getChildren()) {
+                CCObject* obj;
+                CCARRAY_FOREACH(node->getChildren(), obj) {
+                    if (auto n = typeinfo_cast<CCNode*>(obj)) out.push_back(n);
+                }
+            }
+            return out;
+        };
+
+        auto layerBefore = snapshotChildren(this);
+        auto objLayerBefore = snapshotChildren(this->m_objectLayer);
+
+        auto myPos = this->getPosition();
+        this->stopAllActions();
+
+        PlayLayer::destroyPlayer(player, object);
+
+        // Отменяем тряску камеры: сбрасываем экшены и возвращаем позицию
+        this->stopAllActions();
+        this->setPosition(myPos);
+
+        auto cleanup = [](CCNode* node, std::vector<CCNode*> const& before) {
+            if (!node || !node->getChildren()) return;
+            std::vector<CCNode*> toRemove;
+            CCObject* obj;
+            CCARRAY_FOREACH(node->getChildren(), obj) {
+                auto n = typeinfo_cast<CCNode*>(obj);
+                if (!n) continue;
+                bool wasThere = std::find(before.begin(), before.end(), n) != before.end();
+                bool isParticle = typeinfo_cast<CCParticleSystem*>(n) != nullptr;
+                if (!wasThere && isParticle) toRemove.push_back(n);
+            }
+            for (auto n : toRemove) node->removeChild(n, true);
+        };
+
+        cleanup(this, layerBefore);
+        cleanup(this->m_objectLayer, objLayerBefore);
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -710,6 +828,8 @@ class $modify(BotPauseLayer, PauseLayer) {
         ButtonSprite* m_offSprite = nullptr;
         ButtonSprite* m_recSprite = nullptr;
         ButtonSprite* m_playSprite = nullptr;
+        ButtonSprite* m_fxSprite = nullptr;
+        TextInput* m_nameInput = nullptr;
     };
 
     void updateStatusUI() {
@@ -728,6 +848,9 @@ class $modify(BotPauseLayer, PauseLayer) {
         }
         if (m_fields->m_playSprite) {
             m_fields->m_playSprite->setColor(bot::mode == bot::Mode::Play ? ccColor3B{ 80, 200, 255 } : ccColor3B{ 255, 255, 255 });
+        }
+        if (m_fields->m_fxSprite) {
+            m_fields->m_fxSprite->setColor(bot::disableDeathEffects ? ccColor3B{ 255, 180, 80 } : ccColor3B{ 255, 255, 255 });
         }
     }
 
@@ -811,7 +934,8 @@ class $modify(BotPauseLayer, PauseLayer) {
 
         auto winSize = CCDirector::sharedDirector()->getWinSize();
         float panelW = 170.0f;
-        float panelH = 260.0f;
+        // === ПУНКТ 3 === панель увеличена под поле ввода имени файла
+        float panelH = 282.0f;
         float panelX = winSize.width - panelW - 8.0f;
         float panelY = (winSize.height - panelH) / 2.0f;
 
@@ -883,6 +1007,35 @@ class $modify(BotPauseLayer, PauseLayer) {
         speedInput->setString(fmt::format("{:.2f}", bot::recSpeed));
         panelBg->addChild(speedInput);
 
+        // === ПУНКТ 2 === переключатель эффектов смерти
+        auto fxMenu = CCMenu::create();
+        fxMenu->setPosition(0.0f, 0.0f);
+        m_fields->m_fxSprite = ButtonSprite::create("FX", 24, true, "goldFont.fnt", "GJ_button_01.png", 20.0f, 0.4f);
+        auto fxBtn = CCMenuItemExt::createSpriteExtra(m_fields->m_fxSprite, [this](CCObject*) {
+            bot::disableDeathEffects = !bot::disableDeathEffects;
+            Mod::get()->setSavedValue("disableDeathEffects", bot::disableDeathEffects);
+            this->updateStatusUI();
+            Notification::create(
+                bot::disableDeathEffects ? "Death effects: OFF" : "Death effects: ON",
+                NotificationIcon::Info
+            )->show();
+        });
+        fxBtn->setPosition(145.0f, panelH - 84.0f);
+        fxMenu->addChild(fxBtn);
+        panelBg->addChild(fxMenu);
+
+        // === ПУНКТ 3 === поле ввода имени файла перед сохранением
+        auto nameLbl = CCLabelBMFont::create("Name:", "chatFont.fnt");
+        nameLbl->setScale(0.45f);
+        nameLbl->setAnchorPoint(CCPoint{ 0.0f, 0.5f });
+        nameLbl->setPosition(10.0f, panelH - 108.0f);
+        panelBg->addChild(nameLbl);
+
+        m_fields->m_nameInput = TextInput::create(110.0f, bot::generateTimestampName().c_str(), "chatFont.fnt");
+        m_fields->m_nameInput->setScale(0.7f);
+        m_fields->m_nameInput->setPosition(105.0f, panelH - 108.0f);
+        panelBg->addChild(m_fields->m_nameInput);
+
         auto saveMenu = CCMenu::create();
         saveMenu->setPosition(0.0f, 0.0f);
         auto saveSpr = ButtonSprite::create("SAVE CURRENT", 80, true, "goldFont.fnt", "GJ_button_01.png", 20.0f, 0.4f);
@@ -891,28 +1044,27 @@ class $modify(BotPauseLayer, PauseLayer) {
                 Notification::create("Macro is empty", NotificationIcon::Warning)->show();
                 return;
             }
-            auto now = std::chrono::system_clock::now();
-            auto timeT = std::chrono::system_clock::to_time_t(now);
-            std::tm tmStruct{};
-#ifdef GEODE_IS_WINDOWS
-            localtime_s(&tmStruct, &timeT);
-#else
-            localtime_r(&timeT, &tmStruct);
-#endif
-            std::string filename = fmt::format(
-                "macro_{:04d}{:02d}{:02d}_{:02d}{:02d}{:02d}.gdbot",
-                tmStruct.tm_year + 1900, tmStruct.tm_mon + 1, tmStruct.tm_mday,
-                tmStruct.tm_hour, tmStruct.tm_min, tmStruct.tm_sec
-            );
-            if (bot::saveMacro(bot::getMacroDir() / filename, bot::macro)) {
+
+            std::string raw = m_fields->m_nameInput ? m_fields->m_nameInput->getString() : std::string();
+            std::string clean = bot::sanitizeFileName(raw);
+            std::string stem = clean.empty() ? bot::generateTimestampName() : clean;
+            std::string filename = stem + ".gdbot";
+
+            auto path = bot::getMacroDir() / filename;
+            bool existed = std::filesystem::exists(path);
+
+            if (bot::saveMacro(path, bot::macro)) {
                 this->refreshMacroList();
-                Notification::create("Saved macro", NotificationIcon::Success)->show();
+                Notification::create(
+                    existed ? "Macro overwritten" : "Saved macro",
+                    NotificationIcon::Success
+                )->show();
             }
             else {
                 Notification::create("Save failed", NotificationIcon::Error)->show();
             }
         });
-        saveBtn->setPosition(panelW / 2.0f, panelH - 110.0f);
+        saveBtn->setPosition(panelW / 2.0f, panelH - 134.0f);
         saveMenu->addChild(saveBtn);
         panelBg->addChild(saveMenu);
 
