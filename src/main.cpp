@@ -2,9 +2,15 @@
 //
 // Макрос хранится как {step, frac}: номер физического шага + точная доля шага (double 0..1).
 // Честная подтиковая нарезка (Sub-tick CBF): позволяет спамить волной быстрее 240 TPS
-// и поддерживает сверхкороткие клики при замедлении (0.01x). Таймстемпы кликов
-// проставляются нашим же getCurrentTimestamp() сразу в queueButton — единый
-// домен времени для сортировки и нарезки, без эвристик на единицы измерения.
+// и поддерживает сверхкороткие клики при замедлении (0.01x).
+//
+// Таймстемпы кликов (PlayerButtonCommand::m_timestamp), приходящие из
+// GJBaseGameLayer::queueButton, могут быть в произвольном домене/единицах
+// (эта функция на некоторых платформах инлайнится компилятором GD и её
+// нельзя захукать, чтобы подменить timestamp напрямую). Поэтому вместо
+// хука мы честно ремапим пачку нативных таймстемпов на наше собственное
+// окно времени (steady_clock) в drainQueuedButtons — сохраняя их
+// относительный порядок и пропорции, независимо от исходных единиц.
 
 #include <Geode/Geode.hpp>
 #include <Geode/modify/PlayLayer.hpp>
@@ -282,19 +288,64 @@ namespace bot {
         --silent;
     }
 
+    // Разбирает накопившиеся с прошлого кадра клики (gl->m_queuedButtons) и
+    // кладёт их в общий inputVector в НАШЕМ домене времени.
+    //
+    // Нативный PlayerButtonCommand::m_timestamp может быть в произвольных
+    // единицах/эпохе (зависит от платформы/версии GD), и захукать функцию,
+    // которая его проставляет (queueButton), нельзя — на части платформ она
+    // инлайнится компилятором и у Geode нет символа для хука. Поэтому мы не
+    // трогаем нативные таймстемпы "в лоб", а честно ремапим всю пачку на
+    // наше собственное окно времени [lastFrameTime, currentFrameTime]
+    // (посчитанное через std::chrono::steady_clock), сохраняя относительный
+    // порядок и пропорции кликов внутри пачки. Это устраняет рассинхрон
+    // единиц измерения, из-за которого при быстром спаме клики могли
+    // записываться "зигзагом" вместо честной линии.
     inline void drainQueuedButtons(GJBaseGameLayer* gl) {
         if (!gl) return;
         if (mode == Mode::Play) {
             gl->m_queuedButtons.clear();
             return;
         }
+        if (gl->m_queuedButtons.empty()) return;
 
-        // Таймстемпы уже честно проставлены нашим хуком queueButton в домене
-        // getCurrentTimestamp() — никакой коррекции единиц/эпох больше не нужно.
-        for (auto const& cmd : gl->m_queuedButtons) {
-            inputVector.push_back(cmd);
-        }
+        std::vector<PlayerButtonCommand> batch(gl->m_queuedButtons.begin(), gl->m_queuedButtons.end());
         gl->m_queuedButtons.clear();
+
+        // Сортируем по нативному таймстемпу — он монотонно возрастает в
+        // пределах одного источника событий, даже если единицы измерения нам
+        // неизвестны.
+        std::stable_sort(batch.begin(), batch.end(), [](auto const& a, auto const& b) {
+            return a.m_timestamp < b.m_timestamp;
+        });
+
+        double const nativeMin = batch.front().m_timestamp;
+        double const nativeMax = batch.back().m_timestamp;
+        double const nativeSpan = nativeMax - nativeMin;
+
+        double const windowStart = lastFrameTime;
+        double const windowEnd = currentFrameTime;
+        double const windowSpan = std::max(0.0, windowEnd - windowStart);
+
+        size_t const n = batch.size();
+        for (size_t i = 0; i < n; ++i) {
+            double remapped;
+            if (nativeSpan > 1e-12 && windowSpan > 1e-12) {
+                double const t = (batch[i].m_timestamp - nativeMin) / nativeSpan;
+                remapped = windowStart + t * windowSpan;
+            }
+            else {
+                // Нативные таймстемпы неразличимы (например, система их
+                // квантует при очень частом спаме) или окно нулевое —
+                // равномерно раскладываем клики по доступному окну, чтобы
+                // сохранить хотя бы честный порядок и не схлопнуть их в одну
+                // точку.
+                double const t = (n > 1) ? static_cast<double>(i) / static_cast<double>(n - 1) : 0.0;
+                remapped = windowStart + t * windowSpan;
+            }
+            batch[i].m_timestamp = remapped;
+            inputVector.push_back(batch[i]);
+        }
     }
 
     inline void buildStepQueue(PlayLayer* pl, int stepCount) {
@@ -431,22 +482,6 @@ class $modify(BotScheduler, CCScheduler) {
 // Перехват кнопок
 // ---------------------------------------------------------------------------
 class $modify(BotBaseGameLayer, GJBaseGameLayer) {
-    // Подменяем timestamp на наш собственный getCurrentTimestamp() сразу в
-    // момент постановки клика в очередь. Это гарантирует, что таймстемп
-    // клика лежит в ТОМ ЖЕ домене времени (std::chrono::steady_clock), что и
-    // lastFrameTime/currentFrameTime, которыми buildStepQueue режет шаг на
-    // подотрезки. Работает для любого количества кликов в пределах одного
-    // физического шага — каждый получает свой честный, хронологически верный
-    // штамп, без переноса между шагами и без искажения порядка при спаме.
-    void queueButton(int button, bool push, bool isPlayer2, double timestamp) {
-        using namespace bot;
-        double ts = timestamp;
-        if (mode != Mode::Off && isPlayLayer(this)) {
-            ts = getCurrentTimestamp();
-        }
-        GJBaseGameLayer::queueButton(button, push, isPlayer2, ts);
-    }
-
     void handleButton(bool down, int button, bool isPlayer1) {
         using namespace bot;
         if (mode == Mode::Off || silent > 0 || !isPlayLayer(this)) {
@@ -766,8 +801,6 @@ class $modify(BotPlayLayer, PlayLayer) {
     // рестарта, чекпоинтов, счётчика попыток и т.д.), но сразу после него
     // вычищаем всё, что игра добавила нового в виде систем частиц (взрыв
     // смерти), и отменяем сдвиг камеры от тряски, вернув позицию слоя.
-    // Это работает независимо от конкретных внутренних имён функций GD и не
-    // ломает основной игровой цикл.
     void destroyPlayer(PlayerObject* player, GameObject* object) {
         if (!bot::disableDeathEffects || bot::mode == bot::Mode::Off) {
             PlayLayer::destroyPlayer(player, object);
