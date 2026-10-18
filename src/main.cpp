@@ -751,7 +751,6 @@ class $modify(BotPlayLayer, PlayLayer) {
         }
     }
 
-    // === ПУНКТ 1 ===
     // После успешного завершения уровня, если шла запись — выключаем бота
     // (переводим в Off), сам макрос при этом не трогаем и не очищаем.
     void levelComplete() {
@@ -762,7 +761,6 @@ class $modify(BotPlayLayer, PlayLayer) {
         }
     }
 
-    // === ПУНКТ 2 ===
     // Если включено "без эффектов смерти" — вызываем оригинальный
     // PlayLayer::destroyPlayer как есть (чтобы не сломать логику смерти,
     // рестарта, чекпоинтов, счётчика попыток и т.д.), но сразу после него
@@ -778,11 +776,9 @@ class $modify(BotPlayLayer, PlayLayer) {
 
         auto snapshotChildren = [](CCNode* node) {
             std::vector<CCNode*> out;
-            if (node && node->getChildren()) {
-                CCObject* obj;
-                CCARRAY_FOREACH(node->getChildren(), obj) {
-                    if (auto n = typeinfo_cast<CCNode*>(obj)) out.push_back(n);
-                }
+            if (!node) return out;
+            for (auto n : node->getChildrenExt<CCNode*>()) {
+                out.push_back(n);
             }
             return out;
         };
@@ -800,12 +796,9 @@ class $modify(BotPlayLayer, PlayLayer) {
         this->setPosition(myPos);
 
         auto cleanup = [](CCNode* node, std::vector<CCNode*> const& before) {
-            if (!node || !node->getChildren()) return;
+            if (!node) return;
             std::vector<CCNode*> toRemove;
-            CCObject* obj;
-            CCARRAY_FOREACH(node->getChildren(), obj) {
-                auto n = typeinfo_cast<CCNode*>(obj);
-                if (!n) continue;
+            for (auto n : node->getChildrenExt<CCNode*>()) {
                 bool wasThere = std::find(before.begin(), before.end(), n) != before.end();
                 bool isParticle = typeinfo_cast<CCParticleSystem*>(n) != nullptr;
                 if (!wasThere && isParticle) toRemove.push_back(n);
@@ -934,7 +927,6 @@ class $modify(BotPauseLayer, PauseLayer) {
 
         auto winSize = CCDirector::sharedDirector()->getWinSize();
         float panelW = 170.0f;
-        // === ПУНКТ 3 === панель увеличена под поле ввода имени файла
         float panelH = 282.0f;
         float panelX = winSize.width - panelW - 8.0f;
         float panelY = (winSize.height - panelH) / 2.0f;
@@ -1007,7 +999,7 @@ class $modify(BotPauseLayer, PauseLayer) {
         speedInput->setString(fmt::format("{:.2f}", bot::recSpeed));
         panelBg->addChild(speedInput);
 
-        // === ПУНКТ 2 === переключатель эффектов смерти
+        // Переключатель эффектов смерти
         auto fxMenu = CCMenu::create();
         fxMenu->setPosition(0.0f, 0.0f);
         m_fields->m_fxSprite = ButtonSprite::create("FX", 24, true, "goldFont.fnt", "GJ_button_01.png", 20.0f, 0.4f);
@@ -1024,7 +1016,7 @@ class $modify(BotPauseLayer, PauseLayer) {
         fxMenu->addChild(fxBtn);
         panelBg->addChild(fxMenu);
 
-        // === ПУНКТ 3 === поле ввода имени файла перед сохранением
+        // Поле ввода имени файла перед сохранением
         auto nameLbl = CCLabelBMFont::create("Name:", "chatFont.fnt");
         nameLbl->setScale(0.45f);
         nameLbl->setAnchorPoint(CCPoint{ 0.0f, 0.5f });
@@ -1045,7 +1037,9 @@ class $modify(BotPauseLayer, PauseLayer) {
                 return;
             }
 
-            std::string raw = m_fields->m_nameInput ? m_fields->m_nameInput->getString() : std::string();
+            std::string raw = m_fields->m_nameInput
+                ? std::string(m_fields->m_nameInput->getString())
+                : std::string();
             std::string clean = bot::sanitizeFileName(raw);
             std::string stem = clean.empty() ? bot::generateTimestampName() : clean;
             std::string filename = stem + ".gdbot";
