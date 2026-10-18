@@ -4,13 +4,8 @@
 // Честная подтиковая нарезка (Sub-tick CBF): позволяет спамить волной быстрее 240 TPS
 // и поддерживает сверхкороткие клики при замедлении (0.01x).
 //
-// Таймстемпы кликов (PlayerButtonCommand::m_timestamp), приходящие из
-// GJBaseGameLayer::queueButton, могут быть в произвольном домене/единицах
-// (эта функция на некоторых платформах инлайнится компилятором GD и её
-// нельзя захукать, чтобы подменить timestamp напрямую). Поэтому вместо
-// хука мы честно ремапим пачку нативных таймстемпов на наше собственное
-// окно времени (steady_clock) в drainQueuedButtons — сохраняя их
-// относительный порядок и пропорции, независимо от исходных единиц.
+// Музыка синхронизируется через FMOD Audio Engine под точную скорость спидхака.
+// Эффекты смерти, ударная волна (круг) и эффект возрождения полностью блокируются при включении режима No-FX.
 
 #include <Geode/Geode.hpp>
 #include <Geode/modify/PlayLayer.hpp>
@@ -21,6 +16,7 @@
 #include <Geode/ui/ScrollLayer.hpp>
 #include <Geode/ui/TextInput.hpp>
 #include <Geode/ui/Notification.hpp>
+#include <fmod.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -74,8 +70,7 @@ namespace bot {
     inline double recSpeed = 1.0;
     inline float appliedScale = 1.0f;
 
-    // Отключение визуальных эффектов смерти (взрыв/тряска камеры), чтобы не
-    // мешали смотреть на запись. Персистится между сессиями.
+    // Отключение эффектов смерти (взрыв, круг/волна, тряска камеры) и эффекта возрождения
     inline bool disableDeathEffects = Mod::get()->getSavedValue<bool>("disableDeathEffects", true);
 
     // ---- CBF подсистема нарезки ----
@@ -100,6 +95,30 @@ namespace bot {
     inline bool isPlayLayer(GJBaseGameLayer* l) {
         auto pl = PlayLayer::get();
         return pl && static_cast<GJBaseGameLayer*>(pl) == l;
+    }
+
+    // Восстановление оригинальной скорости музыки
+    inline void restoreAudioPitch() {
+        auto fae = FMODAudioEngine::sharedEngine();
+        if (!fae || !fae->m_backgroundMusicChannel) return;
+        fae->m_backgroundMusicChannel->setPitch(1.0f);
+    }
+
+    // Синхронизированное замедление музыки под текущий таймскейл спидхака
+    inline void updateAudioPitch() {
+        auto fae = FMODAudioEngine::sharedEngine();
+        if (!fae || !fae->m_backgroundMusicChannel) return;
+
+        auto pl = PlayLayer::get();
+        bool shouldSlow = (mode == Mode::Record) && pl && !pl->m_playerDied && (appliedScale > 0.001f);
+        float target = shouldSlow ? appliedScale : 1.0f;
+        target = std::clamp(target, 0.01f, 2.0f);
+
+        float cur = 1.0f;
+        fae->m_backgroundMusicChannel->getPitch(&cur);
+        if (std::abs(cur - target) > 1e-4f) {
+            fae->m_backgroundMusicChannel->setPitch(target);
+        }
     }
 
     inline void resetEngine() {
@@ -131,16 +150,23 @@ namespace bot {
         }
     }
 
-    inline void setMode(Mode m) {
-        mode = m;
-        applyClickFlags();
-        resetEngine();
-    }
-
     inline void setTimeScale(float s) {
         if (std::fabs(s - appliedScale) < 1e-6f) return;
         appliedScale = s;
         CCDirector::sharedDirector()->getScheduler()->setTimeScale(s);
+        updateAudioPitch();
+    }
+
+    inline void setMode(Mode m) {
+        mode = m;
+        applyClickFlags();
+        resetEngine();
+        if (mode == Mode::Off) {
+            setTimeScale(1.0f);
+            restoreAudioPitch();
+        } else {
+            updateAudioPitch();
+        }
     }
 
     inline double parseSpeedString(std::string const& str) {
@@ -169,9 +195,6 @@ namespace bot {
         return dir;
     }
 
-    // Генерирует имя по умолчанию вида macro_ГГГГММДД_ЧЧММСС (без расширения).
-    // Используется как запасной вариант, если пользователь не ввёл своё имя,
-    // и как значение-подсказка в поле ввода.
     inline std::string generateTimestampName() {
         auto now = std::chrono::system_clock::now();
         auto timeT = std::chrono::system_clock::to_time_t(now);
@@ -188,9 +211,6 @@ namespace bot {
         );
     }
 
-    // Убирает из имени файла символы, недопустимые в путях Windows/обычных ФС,
-    // а также обрезает пробелы по краям и ограничивает длину. Юникод (кириллица
-    // и т.д.) сохраняется как есть — он валиден в именах файлов.
     inline std::string sanitizeFileName(std::string const& raw) {
         std::string out;
         out.reserve(raw.size());
@@ -288,19 +308,6 @@ namespace bot {
         --silent;
     }
 
-    // Разбирает накопившиеся с прошлого кадра клики (gl->m_queuedButtons) и
-    // кладёт их в общий inputVector в НАШЕМ домене времени.
-    //
-    // Нативный PlayerButtonCommand::m_timestamp может быть в произвольных
-    // единицах/эпохе (зависит от платформы/версии GD), и захукать функцию,
-    // которая его проставляет (queueButton), нельзя — на части платформ она
-    // инлайнится компилятором и у Geode нет символа для хука. Поэтому мы не
-    // трогаем нативные таймстемпы "в лоб", а честно ремапим всю пачку на
-    // наше собственное окно времени [lastFrameTime, currentFrameTime]
-    // (посчитанное через std::chrono::steady_clock), сохраняя относительный
-    // порядок и пропорции кликов внутри пачки. Это устраняет рассинхрон
-    // единиц измерения, из-за которого при быстром спаме клики могли
-    // записываться "зигзагом" вместо честной линии.
     inline void drainQueuedButtons(GJBaseGameLayer* gl) {
         if (!gl) return;
         if (mode == Mode::Play) {
@@ -312,9 +319,6 @@ namespace bot {
         std::vector<PlayerButtonCommand> batch(gl->m_queuedButtons.begin(), gl->m_queuedButtons.end());
         gl->m_queuedButtons.clear();
 
-        // Сортируем по нативному таймстемпу — он монотонно возрастает в
-        // пределах одного источника событий, даже если единицы измерения нам
-        // неизвестны.
         std::stable_sort(batch.begin(), batch.end(), [](auto const& a, auto const& b) {
             return a.m_timestamp < b.m_timestamp;
         });
@@ -335,11 +339,6 @@ namespace bot {
                 remapped = windowStart + t * windowSpan;
             }
             else {
-                // Нативные таймстемпы неразличимы (например, система их
-                // квантует при очень частом спаме) или окно нулевое —
-                // равномерно раскладываем клики по доступному окну, чтобы
-                // сохранить хотя бы честный порядок и не схлопнуть их в одну
-                // точку.
                 double const t = (n > 1) ? static_cast<double>(i) / static_cast<double>(n - 1) : 0.0;
                 remapped = windowStart + t * windowSpan;
             }
@@ -369,8 +368,6 @@ namespace bot {
             double stepStart = i * stepDelta;
             double stepEnd = (i + 1) * stepDelta;
 
-            // Собираем ВСЕ события, попавшие в этот шаг — без ограничения по
-            // количеству. Каждое получает свой честный Sub.
             while (inputIdx < inputVector.size()) {
                 auto const& in = inputVector[inputIdx];
                 double rel = in.m_timestamp - lastFrameTime;
@@ -469,12 +466,13 @@ namespace bot {
 }
 
 // ---------------------------------------------------------------------------
-// Контроллер времени кадра
+// Контроллер времени кадра и аудио-синхронизации
 // ---------------------------------------------------------------------------
 class $modify(BotScheduler, CCScheduler) {
     void update(float dt) {
         bot::onFrameStart();
         CCScheduler::update(dt);
+        bot::updateAudioPitch();
     }
 };
 
@@ -521,7 +519,6 @@ class $modify(BotBaseGameLayer, GJBaseGameLayer) {
     void processCommands(float dt, bool isHalfTick, bool isLastTick) {
         if (bot::mode != bot::Mode::Off && bot::isPlayLayer(this)) {
             bot::drainQueuedButtons(this);
-            // Вызываем оригинальный метод, чтобы не блокировать обработку внутренних событий
             GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
             return;
         }
@@ -530,9 +527,26 @@ class $modify(BotBaseGameLayer, GJBaseGameLayer) {
 };
 
 // ---------------------------------------------------------------------------
-// Честная подтиковая нарезка (CBF Sub-tick Engine)
+// Подтиковая нарезка и подавление эффектов игрока
 // ---------------------------------------------------------------------------
 class $modify(BotPlayerObject, PlayerObject) {
+    // Отключение анимации/эффекта возрождения (спавн-круг и всплеск)
+    void playSpawnEffect() {
+        if (bot::disableDeathEffects && bot::mode != bot::Mode::Off) {
+            return;
+        }
+        PlayerObject::playSpawnEffect();
+    }
+
+    // Отключение спавна частиц и кругов смерти изнутри PlayerObject
+    void playDeathEffect() {
+        if (bot::disableDeathEffects && bot::mode != bot::Mode::Off) {
+            this->setVisible(false);
+            return;
+        }
+        PlayerObject::playDeathEffect();
+    }
+
     void update(float stepDelta) {
         using namespace bot;
         auto pl = PlayLayer::get();
@@ -561,9 +575,6 @@ class $modify(BotPlayerObject, PlayerObject) {
         std::vector<Sub> subs;
 
         if (mode == Mode::Play) {
-            // В пределах одного шага может быть сколько угодно действий из
-            // макроса — цикл не ограничивает их число, каждому даётся
-            // честный deltaFactor относительно предыдущего.
             double elapsed = 0.0;
             while (playIndex < macro.size() && macro[playIndex].step <= cur) {
                 auto const& a = macro[playIndex++];
@@ -645,8 +656,6 @@ class $modify(BotPlayerObject, PlayerObject) {
         double acc = 0.0;
         Sub pending;
 
-        // Проходим по всем под-отрезкам внутри ОДНОГО физического шага.
-        // Их количество не ограничено.
         for (auto const& s : subs) {
             if (pending.has) {
                 applyInput(pl, pending, cur, acc);
@@ -715,7 +724,7 @@ class $modify(BotPlayerObject, PlayerObject) {
 };
 
 // ---------------------------------------------------------------------------
-// Уровень, чекпоинты, рестарты
+// Уровень, чекпоинты, рестарты, эффекты смерти
 // ---------------------------------------------------------------------------
 class $modify(BotPlayLayer, PlayLayer) {
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
@@ -724,6 +733,8 @@ class $modify(BotPlayLayer, PlayLayer) {
         bot::playIndex = 0;
         bot::checkpoints.clear();
         bot::resetEngine();
+        bot::restoreAudioPitch();
+
         if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
 
         bot::applyClickFlags();
@@ -734,10 +745,17 @@ class $modify(BotPlayLayer, PlayLayer) {
         return true;
     }
 
+    void onQuit() {
+        bot::setTimeScale(1.0f);
+        bot::restoreAudioPitch();
+        PlayLayer::onQuit();
+    }
+
     void resetLevel() {
         bot::cpLoaded = false;
         PlayLayer::resetLevel();
         bot::resetEngine();
+        bot::updateAudioPitch();
         if (bot::cpLoaded) return;
 
         bot::step = 0;
@@ -757,6 +775,7 @@ class $modify(BotPlayLayer, PlayLayer) {
         PlayLayer::loadFromCheckpoint(cp);
         bot::cpLoaded = true;
         bot::resetEngine();
+        bot::updateAudioPitch();
 
         auto it = bot::checkpoints.find(cp);
         if (it == bot::checkpoints.end()) {
@@ -778,7 +797,6 @@ class $modify(BotPlayLayer, PlayLayer) {
                 std::remove_if(m.begin(), m.end(), [s](bot::Action const& a) { return a.step >= s; }),
                 m.end()
             );
-            // При откате чекпоинта восстанавливаем зажатые кнопки, чтобы волна не залипала
             bot::syncPlayback(this);
         }
         else if (bot::mode == bot::Mode::Play) {
@@ -786,21 +804,17 @@ class $modify(BotPlayLayer, PlayLayer) {
         }
     }
 
-    // После успешного завершения уровня, если шла запись — выключаем бота
-    // (переводим в Off), сам макрос при этом не трогаем и не очищаем.
     void levelComplete() {
         PlayLayer::levelComplete();
+        bot::setTimeScale(1.0f);
+        bot::restoreAudioPitch();
         if (bot::mode == bot::Mode::Record) {
             bot::setMode(bot::Mode::Off);
             Notification::create("Recording stopped: level complete", NotificationIcon::Info)->show();
         }
     }
 
-    // Если включено "без эффектов смерти" — вызываем оригинальный
-    // PlayLayer::destroyPlayer как есть (чтобы не сломать логику смерти,
-    // рестарта, чекпоинтов, счётчика попыток и т.д.), но сразу после него
-    // вычищаем всё, что игра добавила нового в виде систем частиц (взрыв
-    // смерти), и отменяем сдвиг камеры от тряски, вернув позицию слоя.
+    // Полное удаление взрыва смерти, шокового круга смерти (CCCircleWave) и тряски экрана
     void destroyPlayer(PlayerObject* player, GameObject* object) {
         if (!bot::disableDeathEffects || bot::mode == bot::Mode::Off) {
             PlayLayer::destroyPlayer(player, object);
@@ -818,29 +832,31 @@ class $modify(BotPlayLayer, PlayLayer) {
 
         auto layerBefore = snapshotChildren(this);
         auto objLayerBefore = snapshotChildren(this->m_objectLayer);
+        auto playerBefore = snapshotChildren(player);
 
         auto myPos = this->getPosition();
-        this->stopAllActions();
 
         PlayLayer::destroyPlayer(player, object);
 
-        // Отменяем тряску камеры: сбрасываем экшены и возвращаем позицию
+        // Отменяем тряску экрана
         this->stopAllActions();
         this->setPosition(myPos);
 
+        // Удаляем ВСЕ созданные при смерти ноды (частицы, волновой круг CCCircleWave, вспышки)
         auto cleanup = [](CCNode* node, std::vector<CCNode*> const& before) {
             if (!node) return;
             std::vector<CCNode*> toRemove;
             for (auto n : node->getChildrenExt<CCNode*>()) {
-                bool wasThere = std::find(before.begin(), before.end(), n) != before.end();
-                bool isParticle = typeinfo_cast<CCParticleSystem*>(n) != nullptr;
-                if (!wasThere && isParticle) toRemove.push_back(n);
+                if (std::find(before.begin(), before.end(), n) == before.end()) {
+                    toRemove.push_back(n);
+                }
             }
             for (auto n : toRemove) node->removeChild(n, true);
         };
 
         cleanup(this, layerBefore);
         cleanup(this->m_objectLayer, objLayerBefore);
+        cleanup(player, playerBefore);
     }
 };
 
@@ -1032,7 +1048,7 @@ class $modify(BotPauseLayer, PauseLayer) {
         speedInput->setString(fmt::format("{:.2f}", bot::recSpeed));
         panelBg->addChild(speedInput);
 
-        // Переключатель эффектов смерти
+        // Переключатель No-FX: взрыв смерти + круг (волна) + эффект возрождения
         auto fxMenu = CCMenu::create();
         fxMenu->setPosition(0.0f, 0.0f);
         m_fields->m_fxSprite = ButtonSprite::create("FX", 24, true, "goldFont.fnt", "GJ_button_01.png", 20.0f, 0.4f);
@@ -1041,7 +1057,7 @@ class $modify(BotPauseLayer, PauseLayer) {
             Mod::get()->setSavedValue("disableDeathEffects", bot::disableDeathEffects);
             this->updateStatusUI();
             Notification::create(
-                bot::disableDeathEffects ? "Death effects: OFF" : "Death effects: ON",
+                bot::disableDeathEffects ? "Death, Wave & Respawn FX: OFF" : "Death, Wave & Respawn FX: ON",
                 NotificationIcon::Info
             )->show();
         });
@@ -1049,7 +1065,6 @@ class $modify(BotPauseLayer, PauseLayer) {
         fxMenu->addChild(fxBtn);
         panelBg->addChild(fxMenu);
 
-        // Поле ввода имени файла перед сохранением
         auto nameLbl = CCLabelBMFont::create("Name:", "chatFont.fnt");
         nameLbl->setScale(0.45f);
         nameLbl->setAnchorPoint(CCPoint{ 0.0f, 0.5f });
