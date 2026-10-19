@@ -1,5 +1,5 @@
 // CBF-style TAS bot for Geometry Dash 2.2081 / Geode 5.x (Android & PC)
-// Исправлены: перехват queueButton (вместо push/releaseButton), 100k+ TPS саб-тики на любых скоростях (включая 0.01x), сброс иконок и чекпоинты.
+// Исправлены: сигнатура queueButton (4 аргумента), 100k+ TPS саб-тики на любых скоростях (включая 0.01x), сброс иконок и чекпоинты.
 
 #include <Geode/Geode.hpp>
 #include <Geode/modify/PlayLayer.hpp>
@@ -573,16 +573,16 @@ class $modify(BotScheduler, CCScheduler) {
 // Прямой высокоточный перехват аппаратного ввода в GD 2.2081 (Windows / Android)
 // ---------------------------------------------------------------------------
 class $modify(BotBaseGameLayer, GJBaseGameLayer) {
-    void queueButton(int button, bool push, bool isPlayer2) {
+    void queueButton(int button, bool push, bool isPlayer2, double timestamp) {
         if (bot::mode == bot::Mode::Record && bot::isPlayLayer(this)) {
-            double const now = bot::getCurrentTimestamp();
+            double const now = (timestamp > 1.0) ? timestamp : bot::getCurrentTimestamp();
             bot::recordRawInput(button, push, !isPlayer2, now);
             return;
         }
         if (bot::mode == bot::Mode::Play && bot::isPlayLayer(this)) {
             return;
         }
-        GJBaseGameLayer::queueButton(button, push, isPlayer2);
+        GJBaseGameLayer::queueButton(button, push, isPlayer2, timestamp);
     }
 
     void handleButton(bool down, int button, bool isPlayer1) {
