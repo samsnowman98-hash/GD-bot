@@ -12,10 +12,10 @@ set(CMAKE_CXX_VISIBILITY_PRESET hidden)
 
 project(Template VERSION 1.0.0)
 
-# Добавляем все исходники из src рекурсивно
+# Рекурсивно собираем исходники
 file(GLOB_RECURSE SOURCES CONFIGURE_DEPENDS src/*.cpp)
 
-# Создаем библиотеку мода
+# Создаем библиотеку
 add_library(${PROJECT_NAME} SHARED ${SOURCES})
 
 if (NOT DEFINED ENV{GEODE_SDK})
@@ -26,27 +26,34 @@ endif()
 
 add_subdirectory($ENV{GEODE_SDK} ${CMAKE_CURRENT_BINARY_DIR}/geode)
 
-# Настройка зависимостей и линковка с Geode
+# Настройка зависимостей и Geode
 setup_geode_mod(${PROJECT_NAME})
 
 # ==============================================================================
-# ФИКС ОШИБКИ: "field has incomplete type 'SequenceTriggerState'"
-# В GD 2.2081 генератор биндингов Geode не инклудит SequenceTriggerState.hpp
-# перед SequenceTriggerGameObject.hpp в unity-сборке.
-# Данные флаги принудительно подключают объявление типа перед компиляцией.
+# ФИКС БАГА БИНДИНГОВ GEODE 2.2081:
+# Создаем фикс-хедер: подключаем DefaultInclude (пространство gd), затем SequenceTriggerState
 # ==============================================================================
-if (TARGET GeodeBindings)
-    if (MSVC)
-        target_compile_options(GeodeBindings PRIVATE /FI"Geode/binding/SequenceTriggerState.hpp")
-    else()
-        target_compile_options(GeodeBindings PRIVATE -include Geode/binding/SequenceTriggerState.hpp)
-    endif()
-endif()
+set(GEODE_FIX_HEADER "${CMAKE_CURRENT_BINARY_DIR}/geode_fix.hpp")
+file(WRITE "${GEODE_FIX_HEADER}"
+    "// Fix for Geode bindings codegen bug in GD 2.2081\n"
+    "#pragma once\n"
+    "#include <Geode/DefaultInclude.hpp>\n"
+    "#include <Geode/binding/SequenceTriggerState.hpp>\n"
+)
 
-if (TARGET ${PROJECT_NAME})
-    if (MSVC)
-        target_compile_options(${PROJECT_NAME} PRIVATE /FI"Geode/binding/SequenceTriggerState.hpp")
-    else()
-        target_compile_options(${PROJECT_NAME} PRIVATE -include Geode/binding/SequenceTriggerState.hpp)
+if (MSVC)
+    file(TO_NATIVE_PATH "${GEODE_FIX_HEADER}" GEODE_FIX_HEADER_NATIVE)
+    if (TARGET GeodeBindings)
+        target_compile_options(GeodeBindings PRIVATE "/FI${GEODE_FIX_HEADER_NATIVE}")
+    endif()
+    if (TARGET ${PROJECT_NAME})
+        target_compile_options(${PROJECT_NAME} PRIVATE "/FI${GEODE_FIX_HEADER_NATIVE}")
+    endif()
+else()
+    if (TARGET GeodeBindings)
+        target_compile_options(GeodeBindings PRIVATE "-include" "${GEODE_FIX_HEADER}")
+    endif()
+    if (TARGET ${PROJECT_NAME})
+        target_compile_options(${PROJECT_NAME} PRIVATE "-include" "${GEODE_FIX_HEADER}")
     endif()
 endif()
