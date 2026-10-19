@@ -1,5 +1,5 @@
 // CBF-style TAS bot for Geometry Dash 2.2081 / Geode 5.x (Android & PC)
-// Исправлены: исчезновение кликов на малых скоростях, рассинхрон чекпоинтов, сброс иконок и цветов.
+// Исправлены: ошибки компиляции Clang/NDK, исчезновение кликов на малых скоростях, рассинхрон чекпоинтов, сброс иконок и цветов.
 
 #include <Geode/Geode.hpp>
 #include <Geode/modify/PlayLayer.hpp>
@@ -33,6 +33,52 @@
 using namespace geode::prelude;
 
 // ---------------------------------------------------------------------------
+// Безопасное сохранение и восстановление третьего цвета и свечения через C++20/23 concepts
+// ---------------------------------------------------------------------------
+template <typename GM>
+inline void saveColor3IfAvailable(GM* gm, Mod* mod) {
+    if constexpr (requires { gm->m_playerColor3; }) {
+        if (gm->m_playerColor3 >= 0) mod->setSavedValue("saved_color3", static_cast<int>(gm->m_playerColor3));
+    }
+    else if constexpr (requires { gm->m_playerGlowColor; }) {
+        if (gm->m_playerGlowColor >= 0) mod->setSavedValue("saved_color3", static_cast<int>(gm->m_playerGlowColor));
+    }
+    else if constexpr (requires { gm->m_playerColorGlow; }) {
+        if (gm->m_playerColorGlow >= 0) mod->setSavedValue("saved_color3", static_cast<int>(gm->m_playerColorGlow));
+    }
+}
+
+template <typename GM>
+inline void restoreColor3IfAvailable(GM* gm, int col3) {
+    if (col3 < 0) return;
+    if constexpr (requires { gm->m_playerColor3 = col3; }) {
+        gm->m_playerColor3 = col3;
+    }
+    else if constexpr (requires { gm->m_playerGlowColor = col3; }) {
+        gm->m_playerGlowColor = col3;
+    }
+    else if constexpr (requires { gm->m_playerColorGlow = col3; }) {
+        gm->m_playerColorGlow = col3;
+    }
+}
+
+template <typename GM>
+inline void saveGlowIfAvailable(GM* gm, Mod* mod) {
+    if constexpr (requires { gm->m_playerGlow; }) {
+        mod->setSavedValue("saved_glow", static_cast<bool>(gm->m_playerGlow));
+    }
+}
+
+template <typename GM>
+inline void restoreGlowIfAvailable(GM* gm, Mod* mod) {
+    if constexpr (requires { gm->m_playerGlow; }) {
+        if (mod->hasSavedValue("saved_glow")) {
+            gm->m_playerGlow = mod->getSavedValue<bool>("saved_glow");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Сохранение и восстановление иконок/цветов (обход сброса GD 2.2 verifyLoadedDatabase)
 // ---------------------------------------------------------------------------
 inline void saveCustomIcons() {
@@ -52,7 +98,8 @@ inline void saveCustomIcons() {
     if (gm->m_playerStreak > 0) mod->setSavedValue("saved_streak", static_cast<int>(gm->m_playerStreak));
     if (gm->m_playerColor >= 0) mod->setSavedValue("saved_color1", static_cast<int>(gm->m_playerColor));
     if (gm->m_playerColor2 >= 0) mod->setSavedValue("saved_color2", static_cast<int>(gm->m_playerColor2));
-    if (gm->m_playerColor3 >= 0) mod->setSavedValue("saved_color3", static_cast<int>(gm->m_playerColor3));
+    saveColor3IfAvailable(gm, mod);
+    saveGlowIfAvailable(gm, mod);
 }
 
 inline void restoreCustomIcons() {
@@ -100,7 +147,8 @@ inline void restoreCustomIcons() {
     if (col2 >= 0) gm->m_playerColor2 = col2;
 
     int col3 = mod->getSavedValue<int>("saved_color3", -1);
-    if (col3 >= 0) gm->m_playerColor3 = col3;
+    restoreColor3IfAvailable(gm, col3);
+    restoreGlowIfAvailable(gm, mod);
 }
 
 // ---------------------------------------------------------------------------
@@ -602,7 +650,6 @@ class $modify(BotPlayerObject, PlayerObject) {
         }
 
         if (this != pl->m_player1) {
-            // В режиме dual второй игрок обновляется синхронно в цикле первого игрока
             if (!inputThisStep || this != pl->m_player2) {
                 PlayerObject::update(stepDelta);
             }
