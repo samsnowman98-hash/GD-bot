@@ -1,5 +1,5 @@
 // CBF-style TAS bot for Geometry Dash 2.2081 / Geode 5.x (Android & PC)
-// Оптимизированная версия: исправлен баг невидимости и убраны лаги смерти.
+// Диагностическая версия: добавлены логи субтиков и сохранения гаража.
 
 #include <Geode/Geode.hpp>
 #include <Geode/modify/PlayLayer.hpp>
@@ -10,6 +10,7 @@
 #include <Geode/modify/CCCircleWave.hpp>
 #include <Geode/modify/GameManager.hpp>
 #include <Geode/modify/GameStatsManager.hpp>
+#include <Geode/modify/GJGarageLayer.hpp>
 #include <Geode/ui/ScrollLayer.hpp>
 #include <Geode/ui/TextInput.hpp>
 #include <Geode/ui/Notification.hpp>
@@ -31,7 +32,7 @@
 using namespace geode::prelude;
 
 // ---------------------------------------------------------------------------
-// Разблокировка всех иконок, всех цветов и Practice Music Sync
+// Разблокировка всех иконок, всех цветов и Practice Music Sync + Диагностика
 // ---------------------------------------------------------------------------
 class $modify(BotGameManager, GameManager) {
     bool isIconUnlocked(int id, IconType type) {
@@ -45,15 +46,25 @@ class $modify(BotGameManager, GameManager) {
 
 class $modify(BotGameStatsManager, GameStatsManager) {
     bool isItemUnlocked(UnlockType type, int id) {
-        // Разблокировка Practice Music Sync (17) и Music Customizer (16)
         if (type == UnlockType::GJItem) {
             if (id == 17 || id == 16) {
                 return true;
             }
-            return GameStatsManager::isItemUnlocked(type, id);
+            bool const orig = GameStatsManager::isItemUnlocked(type, id);
+            if (!orig) {
+                geode::log::warn("[IconDiag] GameStatsManager::isItemUnlocked(GJItem, id={}) is FALSE in vanilla!", id);
+            }
+            return orig;
         }
-        // Разблокировка любых иконок, скинов и цветов через статистику
         return true;
+    }
+};
+
+class $modify(BotGarageLayer, GJGarageLayer) {
+    void onBack(cocos2d::CCObject* sender) {
+        geode::log::info("[IconDiag] GJGarageLayer::onBack: forcing GameManager::sharedState()->save()");
+        GameManager::sharedState()->save();
+        GJGarageLayer::onBack(sender);
     }
 };
 
@@ -352,18 +363,27 @@ namespace bot {
         double const windowStart = lastFrameTime;
         double const windowEnd = currentFrameTime;
         double const windowSpan = std::max(0.0, windowEnd - windowStart);
+        double const steadyNow = getCurrentTimestamp();
 
         size_t const n = batch.size();
+        geode::log::info("[TASDiag] drainQueuedButtons: n={}, steadyNow={:.6f}, win=[{:.6f} .. {:.6f}] span={:.6f}, natSpan={:.6f}",
+            n, steadyNow, windowStart, windowEnd, windowSpan, nativeSpan);
+
         for (size_t i = 0; i < n; ++i) {
             double remapped;
+            double tVal = 0.0;
             if (nativeSpan > 1e-6 && windowSpan > 1e-6) {
-                double const t = std::clamp((batch[i].m_timestamp - nativeMin) / nativeSpan, 0.0, 1.0);
-                remapped = windowStart + t * windowSpan;
+                tVal = std::clamp((batch[i].m_timestamp - nativeMin) / nativeSpan, 0.0, 1.0);
+                remapped = windowStart + tVal * windowSpan;
             }
             else {
-                double const t = (n > 1) ? static_cast<double>(i) / static_cast<double>(n - 1) : 0.0;
-                remapped = windowStart + t * windowSpan;
+                tVal = (n > 1) ? static_cast<double>(i) / static_cast<double>(n - 1) : 0.0;
+                remapped = windowStart + tVal * windowSpan;
             }
+
+            geode::log::info("[TASDiag]   cmd[{}]: raw_ts={:.6f}, tVal={:.6f}, remapped={:.6f}, btn={}, push={}",
+                i, batch[i].m_timestamp, tVal, remapped, (int)batch[i].m_button, batch[i].m_isPush);
+
             batch[i].m_timestamp = remapped;
             inputVector.push_back(batch[i]);
         }
@@ -384,6 +404,11 @@ namespace bot {
 
         double stepDelta = deltaTime / stepCount;
         size_t inputIdx = 0;
+
+        if (!inputVector.empty()) {
+            geode::log::info("[TASDiag] buildStepQueue: dt={:.6f}, stepCount={}, stepDelta={:.6f}, inputVecSize={}",
+                deltaTime, stepCount, stepDelta, inputVector.size());
+        }
 
         for (int i = 0; i < stepCount; ++i) {
             double elapsed = 0.0;
@@ -406,6 +431,9 @@ namespace bot {
                     s.deltaFactor = std::max(0.0, t - elapsed);
                     s.endStep = false;
                     stepQueue.push_back(s);
+
+                    geode::log::info("[TASDiag]   Sub: stepIdx={}, rel={:.6f}, t={:.6f}, deltaFactor={:.6f}, btn={}",
+                        i, rel, t, s.deltaFactor, s.button);
 
                     elapsed = t;
                     ++inputIdx;
@@ -488,7 +516,7 @@ namespace bot {
 }
 
 // ---------------------------------------------------------------------------
-// Глушение ударной волны смерти (Без лагов и сканирования нод!)
+// Глушение ударной волны смерти
 // ---------------------------------------------------------------------------
 class $modify(BotCircleWave, CCCircleWave) {
     void update(float dt) {
@@ -535,6 +563,9 @@ class $modify(BotBaseGameLayer, GJBaseGameLayer) {
             a.down = down;
             a.p1 = isPlayer1;
             macro.push_back(a);
+
+            geode::log::info("[TASDiag] RECORDED ACTION: step={}, frac={:.6f}, btn={}, down={}, p1={}",
+                a.step, a.frac, (int)a.button, a.down, a.p1);
 
             GJBaseGameLayer::handleButton(down, button, isPlayer1);
             return;
