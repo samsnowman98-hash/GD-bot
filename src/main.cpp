@@ -1,5 +1,5 @@
 // CBF-style TAS bot for Geometry Dash 2.2081 / Geode 5.x (Android & PC)
-// Исправлены: ошибки компиляции Clang/NDK, исчезновение кликов на малых скоростях, рассинхрон чекпоинтов, сброс иконок и цветов.
+// Исправлены: Clang/NDK компиляция, 100k+ TPS саб-тики на любых скоростях (включая 0.01x), сброс иконок и чекпоинты.
 
 #include <Geode/Geode.hpp>
 #include <Geode/modify/PlayLayer.hpp>
@@ -253,9 +253,10 @@ namespace bot {
 
     inline bool disableDeathEffects = Mod::get()->getSavedValue<bool>("disableDeathEffects", true);
 
-    // ---- подсистема ввода и таймингов ----
+    // ---- непрерывная физическая шкала времени CBF ----
     inline std::vector<PlayerButtonCommand> inputVector;
-    inline double stepStartTime = 0.0;
+    inline double stepTimeAnchor = 0.0;
+    inline uint32_t anchorStep = 0;
     inline bool inputThisStep = false;
     inline bool p1Split = false;
     inline bool p2Split = false;
@@ -298,7 +299,8 @@ namespace bot {
 
     inline void resetEngine() {
         inputVector.clear();
-        stepStartTime = 0.0;
+        stepTimeAnchor = getCurrentTimestamp();
+        anchorStep = step;
         inputThisStep = false;
         p1Split = false;
         p2Split = false;
@@ -325,6 +327,9 @@ namespace bot {
 
     inline void setTimeScale(float s) {
         if (std::fabs(s - appliedScale) < 1e-6f) return;
+        // Перепривязка якоря при смене скорости
+        stepTimeAnchor = getCurrentTimestamp();
+        anchorStep = step;
         appliedScale = s;
         CCDirector::sharedDirector()->getScheduler()->setTimeScale(s);
         updateAudioPitch();
@@ -507,7 +512,7 @@ namespace bot {
         double const now = getCurrentTimestamp();
         for (auto const& cmd : gl->m_queuedButtons) {
             PlayerButtonCommand c = cmd;
-            if (c.m_timestamp <= 1.0 || c.m_timestamp > now + 1.0) {
+            if (c.m_timestamp <= 1.0) {
                 c.m_timestamp = now;
             }
             inputVector.push_back(c);
@@ -529,7 +534,8 @@ namespace bot {
 
         if (idle) {
             inputVector.clear();
-            stepStartTime = 0.0;
+            stepTimeAnchor = getCurrentTimestamp();
+            anchorStep = step;
         }
     }
 
@@ -612,7 +618,7 @@ class $modify(BotBaseGameLayer, GJBaseGameLayer) {
 };
 
 // ---------------------------------------------------------------------------
-// Потоковая подтиковая нарезка шагов с мульти-сплитом
+// Потоковая подтиковая нарезка шагов с мульти-сплитом (100k+ TPS)
 // ---------------------------------------------------------------------------
 class $modify(BotPlayerObject, PlayerObject) {
     void playSpawnEffect() {
@@ -675,9 +681,13 @@ class $modify(BotPlayerObject, PlayerObject) {
             double const stepDuration = static_cast<double>(stepDelta) / scale;
 
             double const now = getCurrentTimestamp();
-            if (stepStartTime <= 0.0 || (now - stepStartTime) > 1.0) {
-                stepStartTime = now;
+            if (stepTimeAnchor <= 0.0 || std::abs(now - stepTimeAnchor) > 3.0) {
+                stepTimeAnchor = now;
+                anchorStep = cur;
             }
+
+            // Математически точные границы шага cur в реальном времени
+            double const stepStartTime = stepTimeAnchor + (static_cast<double>(cur) - static_cast<double>(anchorStep)) * stepDuration;
             double const stepEndTime = stepStartTime + stepDuration;
 
             std::stable_sort(inputVector.begin(), inputVector.end(), [](auto const& a, auto const& b) {
@@ -703,7 +713,6 @@ class $modify(BotPlayerObject, PlayerObject) {
             if (consumed > 0) {
                 inputVector.erase(inputVector.begin(), inputVector.begin() + consumed);
             }
-            stepStartTime = stepEndTime;
         }
 
         inputThisStep = !subs.empty();
@@ -716,12 +725,12 @@ class $modify(BotPlayerObject, PlayerObject) {
             return;
         }
 
-        // Сортировка субтиков по времени внутри шага
+        // Сортировка действий внутри шага по субтиковому времени
         std::stable_sort(subs.begin(), subs.end(), [](auto const& a, auto const& b) {
             return a.frac < b.frac;
         });
 
-        // Гарантируем ненулевую дельту физики между последовательными действиями
+        // Гарантируем положительную дельту между кликами внутри одного тика (100k+ TPS)
         for (size_t i = 1; i < subs.size(); ++i) {
             if (subs[i].frac < subs[i - 1].frac + 1e-5) {
                 subs[i].frac = std::min(1.0, subs[i - 1].frac + 1e-5);
@@ -770,7 +779,7 @@ class $modify(BotPlayerObject, PlayerObject) {
             lastFrac = s.frac;
         }
 
-        // Оставшаяся часть шага после последнего действия
+        // Оставшаяся часть шага после последнего саб-клика
         double remainingFactor = std::max(0.0, 1.0 - lastFrac);
         float remainingDelta = static_cast<float>(stepDelta * remainingFactor);
         rotationDelta = remainingDelta;
@@ -888,6 +897,8 @@ class $modify(BotPlayLayer, PlayLayer) {
         }
 
         bot::step = it->second;
+        bot::stepTimeAnchor = bot::getCurrentTimestamp();
+        bot::anchorStep = bot::step;
 
         if (bot::mode == bot::Mode::Record) {
             uint32_t s = bot::step;
