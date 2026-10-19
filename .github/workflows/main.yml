@@ -27,7 +27,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Фиксируем NDK r26d (на NDK 29 Geode падает с ошибками STL gnustl)
+      # Фиксируем NDK r26d для таргетов Android (на NDK 29 падает STL gnustl)
       - name: Set up NDK
         if: startsWith(matrix.config.target, 'Android')
         uses: nttld/setup-ndk@v1
@@ -46,6 +46,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # Упаковывает Windows (.dll), Android32 (.so) и Android64 (.so) в один файл .geode
       - uses: geode-sdk/build-geode-mod/combine@main
         id: build
 
