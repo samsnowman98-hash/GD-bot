@@ -1,5 +1,5 @@
 // CBF-style TAS bot for Geometry Dash 2.2081 / Geode 5.x (Android & PC)
-// Финальная версия: исправлен сброс иконок/цветов и сохранение по вкладкам гаража.
+// Исправлены: исчезновение кликов на малых скоростях, рассинхрон чекпоинтов, сброс иконок и цветов.
 
 #include <Geode/Geode.hpp>
 #include <Geode/modify/PlayLayer.hpp>
@@ -11,6 +11,7 @@
 #include <Geode/modify/GameManager.hpp>
 #include <Geode/modify/GameStatsManager.hpp>
 #include <Geode/modify/GJGarageLayer.hpp>
+#include <Geode/modify/MenuLayer.hpp>
 #include <Geode/ui/ScrollLayer.hpp>
 #include <Geode/ui/TextInput.hpp>
 #include <Geode/ui/Notification.hpp>
@@ -32,7 +33,78 @@
 using namespace geode::prelude;
 
 // ---------------------------------------------------------------------------
-// Разблокировка всех иконок, всех цветов и Practice Music Sync
+// Сохранение и восстановление иконок/цветов (обход сброса GD 2.2 verifyLoadedDatabase)
+// ---------------------------------------------------------------------------
+inline void saveCustomIcons() {
+    auto gm = GameManager::sharedState();
+    if (!gm) return;
+    auto mod = Mod::get();
+    if (gm->m_playerFrame > 0) mod->setSavedValue("saved_frame", static_cast<int>(gm->m_playerFrame));
+    if (gm->m_playerShip > 0) mod->setSavedValue("saved_ship", static_cast<int>(gm->m_playerShip));
+    if (gm->m_playerBall > 0) mod->setSavedValue("saved_ball", static_cast<int>(gm->m_playerBall));
+    if (gm->m_playerBird > 0) mod->setSavedValue("saved_bird", static_cast<int>(gm->m_playerBird));
+    if (gm->m_playerDart > 0) mod->setSavedValue("saved_dart", static_cast<int>(gm->m_playerDart));
+    if (gm->m_playerRobot > 0) mod->setSavedValue("saved_robot", static_cast<int>(gm->m_playerRobot));
+    if (gm->m_playerSpider > 0) mod->setSavedValue("saved_spider", static_cast<int>(gm->m_playerSpider));
+    if (gm->m_playerSwing > 0) mod->setSavedValue("saved_swing", static_cast<int>(gm->m_playerSwing));
+    if (gm->m_playerJetpack > 0) mod->setSavedValue("saved_jetpack", static_cast<int>(gm->m_playerJetpack));
+    if (gm->m_playerDeathEffect > 0) mod->setSavedValue("saved_deathEffect", static_cast<int>(gm->m_playerDeathEffect));
+    if (gm->m_playerStreak > 0) mod->setSavedValue("saved_streak", static_cast<int>(gm->m_playerStreak));
+    if (gm->m_playerColor >= 0) mod->setSavedValue("saved_color1", static_cast<int>(gm->m_playerColor));
+    if (gm->m_playerColor2 >= 0) mod->setSavedValue("saved_color2", static_cast<int>(gm->m_playerColor2));
+    if (gm->m_playerColor3 >= 0) mod->setSavedValue("saved_color3", static_cast<int>(gm->m_playerColor3));
+}
+
+inline void restoreCustomIcons() {
+    auto gm = GameManager::sharedState();
+    if (!gm) return;
+    auto mod = Mod::get();
+
+    int frame = mod->getSavedValue<int>("saved_frame", -1);
+    if (frame > 0) gm->m_playerFrame = frame;
+
+    int ship = mod->getSavedValue<int>("saved_ship", -1);
+    if (ship > 0) gm->m_playerShip = ship;
+
+    int ball = mod->getSavedValue<int>("saved_ball", -1);
+    if (ball > 0) gm->m_playerBall = ball;
+
+    int bird = mod->getSavedValue<int>("saved_bird", -1);
+    if (bird > 0) gm->m_playerBird = bird;
+
+    int dart = mod->getSavedValue<int>("saved_dart", -1);
+    if (dart > 0) gm->m_playerDart = dart;
+
+    int robot = mod->getSavedValue<int>("saved_robot", -1);
+    if (robot > 0) gm->m_playerRobot = robot;
+
+    int spider = mod->getSavedValue<int>("saved_spider", -1);
+    if (spider > 0) gm->m_playerSpider = spider;
+
+    int swing = mod->getSavedValue<int>("saved_swing", -1);
+    if (swing > 0) gm->m_playerSwing = swing;
+
+    int jetpack = mod->getSavedValue<int>("saved_jetpack", -1);
+    if (jetpack > 0) gm->m_playerJetpack = jetpack;
+
+    int death = mod->getSavedValue<int>("saved_deathEffect", -1);
+    if (death > 0) gm->m_playerDeathEffect = death;
+
+    int streak = mod->getSavedValue<int>("saved_streak", -1);
+    if (streak > 0) gm->m_playerStreak = streak;
+
+    int col1 = mod->getSavedValue<int>("saved_color1", -1);
+    if (col1 >= 0) gm->m_playerColor = col1;
+
+    int col2 = mod->getSavedValue<int>("saved_color2", -1);
+    if (col2 >= 0) gm->m_playerColor2 = col2;
+
+    int col3 = mod->getSavedValue<int>("saved_color3", -1);
+    if (col3 >= 0) gm->m_playerColor3 = col3;
+}
+
+// ---------------------------------------------------------------------------
+// Разблокировка всех предметов и сохранение
 // ---------------------------------------------------------------------------
 class $modify(BotGameManager, GameManager) {
     bool isIconUnlocked(int id, IconType type) {
@@ -42,31 +114,57 @@ class $modify(BotGameManager, GameManager) {
     bool isColorUnlocked(int id, UnlockType type) {
         return true;
     }
+
+    void dataLoaded(DS_Dictionary* dict) {
+        GameManager::dataLoaded(dict);
+        restoreCustomIcons();
+    }
+
+    void firstLoad() {
+        GameManager::firstLoad();
+        restoreCustomIcons();
+    }
+
+    void save() {
+        saveCustomIcons();
+        GameManager::save();
+    }
 };
 
 class $modify(BotGameStatsManager, GameStatsManager) {
     bool isItemUnlocked(UnlockType type, int id) {
-        // Разблокировка всех предметов, путей, магазинов и цветов 2.2
         return true;
     }
 };
 
 class $modify(BotGarageLayer, GJGarageLayer) {
-    // Сохранение при переключении между вкладками (куб, корабль, цвета и т.д.)
+    bool init() {
+        restoreCustomIcons();
+        return GJGarageLayer::init();
+    }
+
     void onSelectTab(cocos2d::CCObject* sender) {
+        saveCustomIcons();
         GameManager::sharedState()->save();
         GJGarageLayer::onSelectTab(sender);
     }
 
-    // Сохранение при выходе по кнопке «Назад»
     void onBack(cocos2d::CCObject* sender) {
+        saveCustomIcons();
         GameManager::sharedState()->save();
         GJGarageLayer::onBack(sender);
     }
 
-    // Гарантированное сохранение при закрытии слоя гаража любым способом
     ~BotGarageLayer() {
+        saveCustomIcons();
         GameManager::sharedState()->save();
+    }
+};
+
+class $modify(BotMenuLayer, MenuLayer) {
+    bool init() {
+        restoreCustomIcons();
+        return MenuLayer::init();
     }
 };
 
@@ -77,20 +175,18 @@ namespace bot {
     enum class Mode { Off, Record, Play };
 
     struct Action {
-        uint32_t step = 0;   // номер физического шага от начала попытки
-        double frac = 0.0;   // доля шага 0..1
+        uint32_t step = 0;   // номер физического шага от старта попытки
+        double frac = 0.0;   // субтиковая доля внутри шага [0..1]
         uint8_t button = 1;
         bool down = false;
         bool p1 = true;
     };
 
-    struct Sub {
-        bool has = false;
+    struct StepSub {
         int button = 1;
         bool push = false;
         bool p1 = true;
-        double deltaFactor = 1.0;
-        bool endStep = true;
+        double frac = 0.0;
     };
 
     // ---- состояние бота ----
@@ -107,15 +203,11 @@ namespace bot {
     inline double recSpeed = 1.0;
     inline float appliedScale = 1.0f;
 
-    // Режим No-FX (убирает анимацию смерти, шоковую волну и анимацию респавна)
     inline bool disableDeathEffects = Mod::get()->getSavedValue<bool>("disableDeathEffects", true);
 
-    // ---- CBF подсистема нарезки ----
-    inline std::deque<Sub> stepQueue;
+    // ---- подсистема ввода и таймингов ----
     inline std::vector<PlayerButtonCommand> inputVector;
-    inline double stepAccumulator = 0.0;
-    inline double lastFrameTime = 0.0;
-    inline double currentFrameTime = 0.0;
+    inline double stepStartTime = 0.0;
     inline bool inputThisStep = false;
     inline bool p1Split = false;
     inline bool p2Split = false;
@@ -157,10 +249,8 @@ namespace bot {
     }
 
     inline void resetEngine() {
-        stepQueue.clear();
         inputVector.clear();
-        stepAccumulator = 0.0;
-        lastFrameTime = currentFrameTime;
+        stepStartTime = 0.0;
         inputThisStep = false;
         p1Split = false;
         p2Split = false;
@@ -306,7 +396,7 @@ namespace bot {
         return true;
     }
 
-    inline void applyInput(PlayLayer* pl, Sub const& s, uint32_t st, double frac) {
+    inline void applyInput(PlayLayer* pl, StepSub const& s, uint32_t st, double frac) {
         ++applying;
         applyStep = st;
         applyFrac = std::clamp(frac, 0.0, 1.0);
@@ -315,6 +405,7 @@ namespace bot {
     }
 
     inline void silentReleaseAll(PlayLayer* pl) {
+        if (!pl) return;
         ++silent;
         for (int b = 1; b <= 3; ++b) {
             pl->handleButton(false, b, true);
@@ -324,6 +415,7 @@ namespace bot {
     }
 
     inline void syncPlayback(PlayLayer* pl) {
+        if (!pl) return;
         auto it = std::lower_bound(
             macro.begin(), macro.end(), step,
             [](Action const& a, uint32_t s) { return a.step < s; }
@@ -335,12 +427,25 @@ namespace bot {
             auto const& a = macro[i];
             if (a.button < 4) held[a.button][a.p1 ? 0 : 1] = a.down;
         }
+
+        silentReleaseAll(pl);
+
         ++silent;
         for (int b = 1; b <= 3; ++b) {
-            pl->handleButton(held[b][0], b, true);
-            pl->handleButton(held[b][1], b, false);
+            if (held[b][0]) pl->handleButton(true, b, true);
+            if (held[b][1]) pl->handleButton(true, b, false);
         }
         --silent;
+
+        // Убираем ложный буфер прыжка куба/робота/паука при загрузке чекпоинта в воздухе
+        if (pl->m_player1 && !pl->m_player1->m_isOnGround &&
+            !pl->m_player1->m_isShip && !pl->m_player1->m_isBird && !pl->m_player1->m_isDart && !pl->m_player1->m_isSwing) {
+            pl->m_player1->m_jumpBuffered = false;
+        }
+        if (pl->m_player2 && !pl->m_player2->m_isOnGround &&
+            !pl->m_player2->m_isShip && !pl->m_player2->m_isBird && !pl->m_player2->m_isDart && !pl->m_player2->m_isSwing) {
+            pl->m_player2->m_jumpBuffered = false;
+        }
     }
 
     inline void drainQueuedButtons(GJBaseGameLayer* gl) {
@@ -351,110 +456,18 @@ namespace bot {
         }
         if (gl->m_queuedButtons.empty()) return;
 
-        double const windowStart = lastFrameTime;
-        double const windowEnd = currentFrameTime;
-
+        double const now = getCurrentTimestamp();
         for (auto const& cmd : gl->m_queuedButtons) {
             PlayerButtonCommand c = cmd;
-            // Сохраняем физический субтиковый timestamp без искажений
-            if (c.m_timestamp <= 1.0) {
-                c.m_timestamp = windowStart;
-            } else if (windowEnd > windowStart) {
-                c.m_timestamp = std::clamp(c.m_timestamp, windowStart, windowEnd);
+            if (c.m_timestamp <= 1.0 || c.m_timestamp > now + 1.0) {
+                c.m_timestamp = now;
             }
             inputVector.push_back(c);
         }
         gl->m_queuedButtons.clear();
     }
 
-    inline void buildStepQueue(PlayLayer* pl, int stepCount) {
-        stepQueue.clear();
-
-        double deltaTime = currentFrameTime - lastFrameTime;
-        if (!(deltaTime > 0.0) || stepCount < 1) {
-            lastFrameTime = currentFrameTime;
-            return;
-        }
-
-        std::stable_sort(inputVector.begin(), inputVector.end(), [](auto const& a, auto const& b) {
-            return a.m_timestamp < b.m_timestamp;
-        });
-
-        double stepDelta = deltaTime / stepCount;
-        size_t inputIdx = 0;
-
-        for (int i = 0; i < stepCount; ++i) {
-            double elapsed = 0.0;
-            double stepStart = i * stepDelta;
-            double stepEnd = (i + 1) * stepDelta;
-
-            while (inputIdx < inputVector.size()) {
-                auto const& in = inputVector[inputIdx];
-                double rel = in.m_timestamp - lastFrameTime;
-                if (rel < 0.0) rel = 0.0;
-
-                if (rel < stepEnd || (i == stepCount - 1)) {
-                    double t = std::clamp((rel - stepStart) / stepDelta, 0.0, 1.0);
-                    if (t < elapsed) t = elapsed;
-
-                    Sub s;
-                    s.has = true;
-                    s.button = static_cast<int>(in.m_button);
-                    s.push = in.m_isPush;
-                    s.p1 = !in.m_isPlayer2;
-                    s.deltaFactor = std::max(0.0, t - elapsed);
-                    s.endStep = false;
-                    stepQueue.push_back(s);
-
-                    elapsed = t;
-                    ++inputIdx;
-                }
-                else {
-                    break;
-                }
-            }
-
-            Sub e;
-            e.deltaFactor = std::max(0.0, 1.0 - elapsed);
-            e.endStep = true;
-            stepQueue.push_back(e);
-        }
-
-        lastFrameTime = currentFrameTime;
-        inputVector.erase(inputVector.begin(), inputVector.begin() + inputIdx);
-    }
-
-    inline void onFrame(PlayLayer* pl, double modifiedDelta) {
-        drainQueuedButtons(pl);
-
-        if (mode == Mode::Play || pl->m_playerDied || modifiedDelta <= 0.0) {
-            if (pl->m_playerDied) lastFrameTime = currentFrameTime;
-            return;
-        }
-
-        float timewarp = pl->m_gameState.m_timeWarp;
-        double stepsFraction = ((modifiedDelta * 60.0) / std::min(1.0f, timewarp)) * 4.0;
-
-        int stepCount = 0;
-        if (appliedScale >= 0.2f) {
-            stepCount = static_cast<int>(std::round(std::max(1.0, stepsFraction)));
-        }
-        else {
-            stepAccumulator += stepsFraction;
-            stepCount = static_cast<int>(stepAccumulator);
-            if (stepCount >= 1) {
-                stepAccumulator -= stepCount;
-            } else {
-                return;
-            }
-        }
-
-        buildStepQueue(pl, stepCount);
-    }
-
     inline void onFrameStart() {
-        currentFrameTime = getCurrentTimestamp();
-
         PlayLayer* pl = PlayLayer::get();
         CCNode* par = nullptr;
         bool idle = !pl
@@ -467,9 +480,8 @@ namespace bot {
         if (mode == Mode::Off) return;
 
         if (idle) {
-            lastFrameTime = currentFrameTime;
             inputVector.clear();
-            stepAccumulator = 0.0;
+            stepStartTime = 0.0;
         }
     }
 
@@ -542,18 +554,9 @@ class $modify(BotBaseGameLayer, GJBaseGameLayer) {
         GJBaseGameLayer::handleButton(down, button, isPlayer1);
     }
 
-    double getModifiedDelta(float dt) {
-        double md = GJBaseGameLayer::getModifiedDelta(dt);
-        if (bot::isPlayLayer(this) && bot::mode != bot::Mode::Off) {
-            bot::onFrame(PlayLayer::get(), md);
-        }
-        return md;
-    }
-
     void processCommands(float dt, bool isHalfTick, bool isLastTick) {
         if (bot::mode != bot::Mode::Off && bot::isPlayLayer(this)) {
             bot::drainQueuedButtons(this);
-            this->m_queuedButtons.clear();
             return;
         }
         GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
@@ -561,7 +564,7 @@ class $modify(BotBaseGameLayer, GJBaseGameLayer) {
 };
 
 // ---------------------------------------------------------------------------
-// Подтиковая нарезка и подавление эффектов игрока
+// Потоковая подтиковая нарезка шагов с мульти-сплитом
 // ---------------------------------------------------------------------------
 class $modify(BotPlayerObject, PlayerObject) {
     void playSpawnEffect() {
@@ -599,57 +602,61 @@ class $modify(BotPlayerObject, PlayerObject) {
         }
 
         if (this != pl->m_player1) {
-            if (!inputThisStep || this != pl->m_player2) PlayerObject::update(stepDelta);
+            // В режиме dual второй игрок обновляется синхронно в цикле первого игрока
+            if (!inputThisStep || this != pl->m_player2) {
+                PlayerObject::update(stepDelta);
+            }
             return;
         }
 
         uint32_t const cur = step;
-        std::vector<Sub> subs;
+        std::vector<StepSub> subs;
 
         if (mode == Mode::Play) {
-            double elapsed = 0.0;
             while (playIndex < macro.size() && macro[playIndex].step <= cur) {
                 auto const& a = macro[playIndex++];
-                double f = (a.step < cur) ? 0.0 : std::clamp(a.frac, 0.0, 1.0);
-                if (f < elapsed) f = elapsed;
-
-                Sub s;
-                s.has = true;
+                StepSub s;
                 s.button = a.button;
                 s.push = a.down;
                 s.p1 = a.p1;
-                s.deltaFactor = std::max(0.0, f - elapsed);
-                s.endStep = false;
+                s.frac = (a.step < cur) ? 0.0 : std::clamp(a.frac, 0.0, 1.0);
                 subs.push_back(s);
-                elapsed = f;
-            }
-            if (!subs.empty()) {
-                Sub e;
-                e.deltaFactor = std::max(0.0, 1.0 - elapsed);
-                e.endStep = true;
-                subs.push_back(e);
             }
         }
         else { // Record
-            if (!stepQueue.empty()) {
-                double sum = 0.0;
-                while (!stepQueue.empty()) {
-                    Sub s = stepQueue.front();
-                    stepQueue.pop_front();
+            float const scale = (appliedScale > 0.0001f) ? appliedScale : 1.0f;
+            double const stepDuration = static_cast<double>(stepDelta) / scale;
+
+            double const now = getCurrentTimestamp();
+            if (stepStartTime <= 0.0 || (now - stepStartTime) > 1.0) {
+                stepStartTime = now;
+            }
+            double const stepEndTime = stepStartTime + stepDuration;
+
+            std::stable_sort(inputVector.begin(), inputVector.end(), [](auto const& a, auto const& b) {
+                return a.m_timestamp < b.m_timestamp;
+            });
+
+            size_t consumed = 0;
+            for (auto const& in : inputVector) {
+                if (in.m_timestamp <= stepEndTime || (consumed == 0 && in.m_timestamp < stepStartTime)) {
+                    StepSub s;
+                    s.button = static_cast<int>(in.m_button);
+                    s.push = in.m_isPush;
+                    s.p1 = !in.m_isPlayer2;
+                    double rel = in.m_timestamp - stepStartTime;
+                    s.frac = std::clamp(rel / stepDuration, 0.0, 1.0);
                     subs.push_back(s);
-                    sum += s.deltaFactor;
-                    if (s.endStep) break;
+                    ++consumed;
                 }
-                if (!subs.empty() && !subs.back().endStep) {
-                    Sub e;
-                    e.deltaFactor = std::max(0.0, 1.0 - sum);
-                    e.endStep = true;
-                    subs.push_back(e);
-                }
-                if (subs.size() == 1 && subs[0].endStep && !subs[0].has) {
-                    subs.clear();
+                else {
+                    break;
                 }
             }
+            if (consumed > 0) {
+                inputVector.erase(inputVector.begin(), inputVector.begin() + consumed);
+            }
+            stepStartTime = stepEndTime;
         }
 
         inputThisStep = !subs.empty();
@@ -662,75 +669,79 @@ class $modify(BotPlayerObject, PlayerObject) {
             return;
         }
 
+        // Сортировка субтиков по времени внутри шага
+        std::stable_sort(subs.begin(), subs.end(), [](auto const& a, auto const& b) {
+            return a.frac < b.frac;
+        });
+
+        // Гарантируем ненулевую дельту физики между последовательными действиями
+        for (size_t i = 1; i < subs.size(); ++i) {
+            if (subs[i].frac < subs[i - 1].frac + 1e-5) {
+                subs[i].frac = std::min(1.0, subs[i - 1].frac + 1e-5);
+            }
+        }
+
         PlayerObject* p2 = pl->m_player2;
         bool isDual = pl->m_gameState.m_isDualMode;
         bool p1StartedOnGround = this->m_isOnGround;
         bool p2StartedOnGround = p2 ? p2->m_isOnGround : false;
 
-        bool p1NotBuffering = p1StartedOnGround
-            || this->m_touchingRings->count()
-            || this->m_isDashing
-            || (this->m_isDart || this->m_isBird || this->m_isShip || this->m_isSwing);
-
-        bool p2NotBuffering = p2 && (p2StartedOnGround
-            || p2->m_touchingRings->count()
-            || p2->m_isDashing
-            || (p2->m_isDart || p2->m_isBird || p2->m_isShip || p2->m_isSwing));
-
         p1Pos = PlayerObject::getPosition();
         p2Pos = p2 ? p2->getPosition() : CCPoint{ 0.f, 0.f };
 
-        p1Split = p1NotBuffering;
-        p2Split = p2NotBuffering && isDual;
+        p1Split = true;
+        p2Split = isDual && (p2 != nullptr);
 
         midStep = true;
-        bool firstLoop = true;
-        double acc = 0.0;
-        Sub pending;
+        double lastFrac = 0.0;
 
-        for (auto const& s : subs) {
-            if (pending.has) {
-                applyInput(pl, pending, cur, acc);
-            }
-            pending = s;
-
-            float const substepDelta = static_cast<float>(stepDelta * s.deltaFactor);
+        for (size_t i = 0; i < subs.size(); ++i) {
+            auto const& s = subs[i];
+            double subFactor = std::max(0.0, s.frac - lastFrac);
+            float substepDelta = static_cast<float>(stepDelta * subFactor);
             rotationDelta = substepDelta;
 
-            if (p1Split) {
-                if (substepDelta > 1e-9f) {
-                    PlayerObject::update(substepDelta);
-                }
-                if (!s.endStep) {
-                    if (firstLoop && ((this->m_yVelocity < 0) ^ this->m_isUpsideDown)) this->m_isOnGround = p1StartedOnGround;
-                    if (!this->m_isOnSlope || this->m_isDart) pl->checkCollisions(this, 0.0f, true);
-                    else pl->checkCollisions(this, stepDelta, true);
-                    PlayerObject::updateRotation(substepDelta);
-                    bot::clearCollisionLog(this);
-                }
-            }
-            else if (s.endStep) PlayerObject::update(stepDelta);
+            if (substepDelta > 1e-9f) {
+                PlayerObject::update(substepDelta);
+                if (i == 0 && ((this->m_yVelocity < 0) ^ this->m_isUpsideDown)) this->m_isOnGround = p1StartedOnGround;
+                if (!this->m_isOnSlope || this->m_isDart) pl->checkCollisions(this, 0.0f, true);
+                else pl->checkCollisions(this, stepDelta, true);
+                PlayerObject::updateRotation(substepDelta);
+                bot::clearCollisionLog(this);
 
-            if (p2Split && p2) {
-                if (substepDelta > 1e-9f) {
+                if (p2Split && p2) {
                     p2->update(substepDelta);
-                }
-                if (!s.endStep) {
-                    if (firstLoop && ((p2->m_yVelocity < 0) ^ p2->m_isUpsideDown)) p2->m_isOnGround = p2StartedOnGround;
+                    if (i == 0 && ((p2->m_yVelocity < 0) ^ p2->m_isUpsideDown)) p2->m_isOnGround = p2StartedOnGround;
                     if (!p2->m_isOnSlope || p2->m_isDart) pl->checkCollisions(p2, 0.0f, true);
                     else pl->checkCollisions(p2, stepDelta, true);
                     p2->updateRotation(substepDelta);
                     bot::clearCollisionLog(p2);
                 }
             }
-            else if (s.endStep && p2 && isDual) p2->update(stepDelta);
 
-            acc += s.deltaFactor;
-            firstLoop = false;
+            applyInput(pl, s, cur, s.frac);
+            lastFrac = s.frac;
         }
 
-        if (pending.has) {
-            applyInput(pl, pending, cur, std::min(1.0, acc));
+        // Оставшаяся часть шага после последнего действия
+        double remainingFactor = std::max(0.0, 1.0 - lastFrac);
+        float remainingDelta = static_cast<float>(stepDelta * remainingFactor);
+        rotationDelta = remainingDelta;
+
+        if (remainingDelta > 1e-9f) {
+            PlayerObject::update(remainingDelta);
+            if (!this->m_isOnSlope || this->m_isDart) pl->checkCollisions(this, 0.0f, true);
+            else pl->checkCollisions(this, stepDelta, true);
+            PlayerObject::updateRotation(remainingDelta);
+            bot::clearCollisionLog(this);
+
+            if (p2Split && p2) {
+                p2->update(remainingDelta);
+                if (!p2->m_isOnSlope || p2->m_isDart) pl->checkCollisions(p2, 0.0f, true);
+                else pl->checkCollisions(p2, stepDelta, true);
+                p2->updateRotation(remainingDelta);
+                bot::clearCollisionLog(p2);
+            }
         }
 
         midStep = false;
@@ -760,6 +771,8 @@ class $modify(BotPlayerObject, PlayerObject) {
 // ---------------------------------------------------------------------------
 class $modify(BotPlayLayer, PlayLayer) {
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
+        restoreCustomIcons();
+
         bot::mode = bot::Mode::Off;
         bot::step = 0;
         bot::playIndex = 0;
@@ -860,9 +873,7 @@ class $modify(BotPlayLayer, PlayLayer) {
         }
 
         auto myPos = this->getPosition();
-
         PlayLayer::destroyPlayer(player, object);
-
         this->stopAllActions();
         this->setPosition(myPos);
     }
