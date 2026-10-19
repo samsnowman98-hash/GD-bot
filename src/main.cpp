@@ -8,6 +8,8 @@
 #include <Geode/modify/PauseLayer.hpp>
 #include <Geode/modify/CCScheduler.hpp>
 #include <Geode/modify/CCCircleWave.hpp>
+#include <Geode/modify/GameManager.hpp>
+#include <Geode/modify/GameStatsManager.hpp>
 #include <Geode/ui/ScrollLayer.hpp>
 #include <Geode/ui/TextInput.hpp>
 #include <Geode/ui/Notification.hpp>
@@ -27,6 +29,33 @@
 #include <vector>
 
 using namespace geode::prelude;
+
+// ---------------------------------------------------------------------------
+// Разблокировка всех иконок, всех цветов и Practice Music Sync
+// ---------------------------------------------------------------------------
+class $modify(BotGameManager, GameManager) {
+    bool isIconUnlocked(int id, IconType type) {
+        return true;
+    }
+
+    bool isColorUnlocked(int id, UnlockType type) {
+        return true;
+    }
+};
+
+class $modify(BotGameStatsManager, GameStatsManager) {
+    bool isItemUnlocked(UnlockType type, int id) {
+        // Разблокировка Practice Music Sync (17) и Music Customizer (16)
+        if (type == UnlockType::GJItem) {
+            if (id == 17 || id == 16) {
+                return true;
+            }
+            return GameStatsManager::isItemUnlocked(type, id);
+        }
+        // Разблокировка любых иконок, скинов и цветов через статистику
+        return true;
+    }
+};
 
 namespace bot {
 
@@ -327,7 +356,6 @@ namespace bot {
         size_t const n = batch.size();
         for (size_t i = 0; i < n; ++i) {
             double remapped;
-            // Защита от деления на 0 при мгновенных тапах на смартфонах
             if (nativeSpan > 1e-6 && windowSpan > 1e-6) {
                 double const t = std::clamp((batch[i].m_timestamp - nativeMin) / nativeSpan, 0.0, 1.0);
                 remapped = windowStart + t * windowSpan;
@@ -537,19 +565,17 @@ class $modify(BotBaseGameLayer, GJBaseGameLayer) {
 // Подтиковая нарезка и подавление эффектов игрока
 // ---------------------------------------------------------------------------
 class $modify(BotPlayerObject, PlayerObject) {
-    // Исправление невидимости: всегда восстанавливаем видимость при спавне
     void playSpawnEffect() {
         this->setVisible(true);
         if (bot::disableDeathEffects && bot::mode != bot::Mode::Off) {
-            return; // Не спавним частицы возрождения
+            return;
         }
         PlayerObject::playSpawnEffect();
     }
 
-    // Исправление невидимости: просто отменяем анимацию взрыва, НЕ скрывая скин
     void playDeathEffect() {
         if (bot::disableDeathEffects && bot::mode != bot::Mode::Off) {
-            return; // Не создаем частицы смерти
+            return;
         }
         PlayerObject::playDeathEffect();
     }
@@ -764,7 +790,6 @@ class $modify(BotPlayLayer, PlayLayer) {
         bot::resetEngine();
         bot::updateAudioPitch();
 
-        // Гарантируем, что оба игрока видимы после любого рестарта
         if (this->m_player1) this->m_player1->setVisible(true);
         if (this->m_player2) this->m_player2->setVisible(true);
 
@@ -829,7 +854,6 @@ class $modify(BotPlayLayer, PlayLayer) {
         }
     }
 
-    // Мгновенная очистка смерти БЕЗ зависаний и O(N^2) сканирований
     void destroyPlayer(PlayerObject* player, GameObject* object) {
         if (!bot::disableDeathEffects || bot::mode == bot::Mode::Off) {
             PlayLayer::destroyPlayer(player, object);
@@ -840,7 +864,6 @@ class $modify(BotPlayLayer, PlayLayer) {
 
         PlayLayer::destroyPlayer(player, object);
 
-        // Мгновенно отменяем тряску экрана
         this->stopAllActions();
         this->setPosition(myPos);
     }
