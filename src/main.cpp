@@ -1,11 +1,5 @@
 // CBF-style TAS bot for Geometry Dash 2.2081 / Geode 5.x (Android & PC)
-//
-// Макрос хранится как {step, frac}: номер физического шага + точная доля шага (double 0..1).
-// Честная подтиковая нарезка (Sub-tick CBF): позволяет спамить волной быстрее 240 TPS
-// и поддерживает сверхкороткие клики при замедлении (0.01x).
-//
-// Музыка синхронизируется через FMOD Audio Engine под точную скорость спидхака.
-// Эффекты смерти, ударная волна (круг) и эффект возрождения полностью блокируются при включении режима No-FX.
+// Оптимизированная версия: исправлен баг невидимости и убраны лаги смерти.
 
 #include <Geode/Geode.hpp>
 #include <Geode/modify/PlayLayer.hpp>
@@ -13,6 +7,7 @@
 #include <Geode/modify/GJBaseGameLayer.hpp>
 #include <Geode/modify/PauseLayer.hpp>
 #include <Geode/modify/CCScheduler.hpp>
+#include <Geode/modify/CCCircleWave.hpp>
 #include <Geode/ui/ScrollLayer.hpp>
 #include <Geode/ui/TextInput.hpp>
 #include <Geode/ui/Notification.hpp>
@@ -70,7 +65,7 @@ namespace bot {
     inline double recSpeed = 1.0;
     inline float appliedScale = 1.0f;
 
-    // Отключение эффектов смерти (взрыв, круг/волна, тряска камеры) и эффекта возрождения
+    // Режим No-FX (убирает анимацию смерти, шоковую волну и анимацию респавна)
     inline bool disableDeathEffects = Mod::get()->getSavedValue<bool>("disableDeathEffects", true);
 
     // ---- CBF подсистема нарезки ----
@@ -97,14 +92,12 @@ namespace bot {
         return pl && static_cast<GJBaseGameLayer*>(pl) == l;
     }
 
-    // Восстановление оригинальной скорости музыки
     inline void restoreAudioPitch() {
         auto fae = FMODAudioEngine::sharedEngine();
         if (!fae || !fae->m_backgroundMusicChannel) return;
         fae->m_backgroundMusicChannel->setPitch(1.0f);
     }
 
-    // Синхронизированное замедление музыки под текущий таймскейл спидхака
     inline void updateAudioPitch() {
         auto fae = FMODAudioEngine::sharedEngine();
         if (!fae || !fae->m_backgroundMusicChannel) return;
@@ -334,8 +327,9 @@ namespace bot {
         size_t const n = batch.size();
         for (size_t i = 0; i < n; ++i) {
             double remapped;
-            if (nativeSpan > 1e-12 && windowSpan > 1e-12) {
-                double const t = (batch[i].m_timestamp - nativeMin) / nativeSpan;
+            // Защита от деления на 0 при мгновенных тапах на смартфонах
+            if (nativeSpan > 1e-6 && windowSpan > 1e-6) {
+                double const t = std::clamp((batch[i].m_timestamp - nativeMin) / nativeSpan, 0.0, 1.0);
                 remapped = windowStart + t * windowSpan;
             }
             else {
@@ -466,6 +460,19 @@ namespace bot {
 }
 
 // ---------------------------------------------------------------------------
+// Глушение ударной волны смерти (Без лагов и сканирования нод!)
+// ---------------------------------------------------------------------------
+class $modify(BotCircleWave, CCCircleWave) {
+    void update(float dt) {
+        if (bot::disableDeathEffects && bot::mode != bot::Mode::Off) {
+            this->removeFromParentAndCleanup(true);
+            return;
+        }
+        CCCircleWave::update(dt);
+    }
+};
+
+// ---------------------------------------------------------------------------
 // Контроллер времени кадра и аудио-синхронизации
 // ---------------------------------------------------------------------------
 class $modify(BotScheduler, CCScheduler) {
@@ -530,19 +537,19 @@ class $modify(BotBaseGameLayer, GJBaseGameLayer) {
 // Подтиковая нарезка и подавление эффектов игрока
 // ---------------------------------------------------------------------------
 class $modify(BotPlayerObject, PlayerObject) {
-    // Отключение анимации/эффекта возрождения (спавн-круг и всплеск)
+    // Исправление невидимости: всегда восстанавливаем видимость при спавне
     void playSpawnEffect() {
+        this->setVisible(true);
         if (bot::disableDeathEffects && bot::mode != bot::Mode::Off) {
-            return;
+            return; // Не спавним частицы возрождения
         }
         PlayerObject::playSpawnEffect();
     }
 
-    // Отключение спавна частиц и кругов смерти изнутри PlayerObject
+    // Исправление невидимости: просто отменяем анимацию взрыва, НЕ скрывая скин
     void playDeathEffect() {
         if (bot::disableDeathEffects && bot::mode != bot::Mode::Off) {
-            this->setVisible(false);
-            return;
+            return; // Не создаем частицы смерти
         }
         PlayerObject::playDeathEffect();
     }
@@ -756,6 +763,11 @@ class $modify(BotPlayLayer, PlayLayer) {
         PlayLayer::resetLevel();
         bot::resetEngine();
         bot::updateAudioPitch();
+
+        // Гарантируем, что оба игрока видимы после любого рестарта
+        if (this->m_player1) this->m_player1->setVisible(true);
+        if (this->m_player2) this->m_player2->setVisible(true);
+
         if (bot::cpLoaded) return;
 
         bot::step = 0;
@@ -776,6 +788,9 @@ class $modify(BotPlayLayer, PlayLayer) {
         bot::cpLoaded = true;
         bot::resetEngine();
         bot::updateAudioPitch();
+
+        if (this->m_player1) this->m_player1->setVisible(true);
+        if (this->m_player2) this->m_player2->setVisible(true);
 
         auto it = bot::checkpoints.find(cp);
         if (it == bot::checkpoints.end()) {
@@ -814,49 +829,20 @@ class $modify(BotPlayLayer, PlayLayer) {
         }
     }
 
-    // Полное удаление взрыва смерти, шокового круга смерти (CCCircleWave) и тряски экрана
+    // Мгновенная очистка смерти БЕЗ зависаний и O(N^2) сканирований
     void destroyPlayer(PlayerObject* player, GameObject* object) {
         if (!bot::disableDeathEffects || bot::mode == bot::Mode::Off) {
             PlayLayer::destroyPlayer(player, object);
             return;
         }
 
-        auto snapshotChildren = [](CCNode* node) {
-            std::vector<CCNode*> out;
-            if (!node) return out;
-            for (auto n : node->getChildrenExt<CCNode*>()) {
-                out.push_back(n);
-            }
-            return out;
-        };
-
-        auto layerBefore = snapshotChildren(this);
-        auto objLayerBefore = snapshotChildren(this->m_objectLayer);
-        auto playerBefore = snapshotChildren(player);
-
         auto myPos = this->getPosition();
 
         PlayLayer::destroyPlayer(player, object);
 
-        // Отменяем тряску экрана
+        // Мгновенно отменяем тряску экрана
         this->stopAllActions();
         this->setPosition(myPos);
-
-        // Удаляем ВСЕ созданные при смерти ноды (частицы, волновой круг CCCircleWave, вспышки)
-        auto cleanup = [](CCNode* node, std::vector<CCNode*> const& before) {
-            if (!node) return;
-            std::vector<CCNode*> toRemove;
-            for (auto n : node->getChildrenExt<CCNode*>()) {
-                if (std::find(before.begin(), before.end(), n) == before.end()) {
-                    toRemove.push_back(n);
-                }
-            }
-            for (auto n : toRemove) node->removeChild(n, true);
-        };
-
-        cleanup(this, layerBefore);
-        cleanup(this->m_objectLayer, objLayerBefore);
-        cleanup(player, playerBefore);
     }
 };
 
@@ -1048,7 +1034,6 @@ class $modify(BotPauseLayer, PauseLayer) {
         speedInput->setString(fmt::format("{:.2f}", bot::recSpeed));
         panelBg->addChild(speedInput);
 
-        // Переключатель No-FX: взрыв смерти + круг (волна) + эффект возрождения
         auto fxMenu = CCMenu::create();
         fxMenu->setPosition(0.0f, 0.0f);
         m_fields->m_fxSprite = ButtonSprite::create("FX", 24, true, "goldFont.fnt", "GJ_button_01.png", 20.0f, 0.4f);
