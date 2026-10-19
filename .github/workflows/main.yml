@@ -10,16 +10,18 @@ jobs:
       fail-fast: false
       matrix:
         config:
-          - name: Windows
-            os: windows-latest
-
-          - name: Android32
-            os: ubuntu-latest
-            target: Android32
+          # Для максимальной скорости оставлен только Android.
+          # Если когда-нибудь понадобится Windows, можно просто раскомментировать.
+          # - name: Windows
+          #   os: windows-latest
 
           - name: Android64
             os: ubuntu-latest
             target: Android64
+
+          - name: Android32
+            os: ubuntu-latest
+            target: Android32
 
     name: ${{ matrix.config.name }}
     runs-on: ${{ matrix.config.os }}
@@ -27,6 +29,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Официальный экшен автоматически настроит правильный NDK (r26d),
+      # Ninja, ccache и зависимости Geode SDK под Android.
       - name: Build the mod
         uses: geode-sdk/build-geode-mod@main
         with:
@@ -39,10 +43,11 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # Объединяет Android32 (.so) и Android64 (.so) в один файл .geode
       - uses: geode-sdk/build-geode-mod/combine@main
         id: build
 
       - uses: actions/upload-artifact@v4
         with:
-          name: CBF-TAS-Bot-Universal
+          name: CBF-TAS-Bot-Android
           path: ${{ steps.build.outputs.build-output }}
