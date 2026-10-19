@@ -27,7 +27,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Фиксируем NDK r26d для таргетов Android (на NDK 29 падает STL gnustl)
+      # Фиксируем NDK r26d для Android (защита от багов NDK 29)
       - name: Set up NDK
         if: startsWith(matrix.config.target, 'Android')
         uses: nttld/setup-ndk@v1
