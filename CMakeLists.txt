@@ -27,18 +27,15 @@ endif()
 add_subdirectory($ENV{GEODE_SDK} ${CMAKE_CURRENT_BINARY_DIR}/geode)
 
 # ==============================================================================
-# ПАТЧ TULIPHOOK (Фикс падения Windows-сборки):
-# В AbstractType.hpp тернарный оператор форсирует вычисление sizeof() на типах
-# по ссылке. Заменяем на `if constexpr`, чтобы отсечь неполные типы.
+# ПАТЧ TULIPHOOK (Фикс падения сборки на Windows):
+# В AbstractType.hpp тернарный оператор форсирует sizeof() на типах по ссылке.
+# Заменяем на `if constexpr`, чтобы отсечь неполные типы (EffectManagerState &).
 # ==============================================================================
 file(GLOB_RECURSE TULIP_HEADERS
-    "${CMAKE_SOURCE_DIR}/cpm-cache/*AbstractType.hpp"
+    "${CMAKE_SOURCE_DIR}/*AbstractType.hpp"
     "${CMAKE_BINARY_DIR}/*AbstractType.hpp"
-    "${CMAKE_CURRENT_BINARY_DIR}/*AbstractType.hpp"
+    "$ENV{CPM_SOURCE_CACHE}/*AbstractType.hpp"
 )
-if (DEFINED tuliphook_SOURCE_DIR)
-    list(APPEND TULIP_HEADERS "${tuliphook_SOURCE_DIR}/include/tulip/AbstractType.hpp")
-endif()
 list(REMOVE_DUPLICATES TULIP_HEADERS)
 
 foreach(HEADER_PATH ${TULIP_HEADERS})
@@ -73,14 +70,13 @@ setup_geode_mod(${PROJECT_NAME})
 
 # ==============================================================================
 # ФИКС БАГА БИНДИНГОВ GEODE 2.2081:
-# Подключаем DefaultInclude, EffectManagerState и SequenceTriggerState
+# Подключаем DefaultInclude (пространство gd), затем SequenceTriggerState.
 # ==============================================================================
 set(GEODE_FIX_HEADER "${CMAKE_CURRENT_BINARY_DIR}/geode_fix.hpp")
 file(WRITE "${GEODE_FIX_HEADER}"
     "// Fix for Geode bindings codegen bug in GD 2.2081\n"
     "#pragma once\n"
     "#include <Geode/DefaultInclude.hpp>\n"
-    "#include <Geode/binding/EffectManagerState.hpp>\n"
     "#include <Geode/binding/SequenceTriggerState.hpp>\n"
 )
 
