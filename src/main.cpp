@@ -1,5 +1,5 @@
 // CBF-style TAS bot for Geometry Dash 2.2081 / Geode 5.x (Android & PC)
-// Финальная оптимизированная версия: исправлен сброс иконок и субтиковый расчет времени кликов.
+// Финальная версия: исправлен сброс иконок/цветов и сохранение по вкладкам гаража.
 
 #include <Geode/Geode.hpp>
 #include <Geode/modify/PlayLayer.hpp>
@@ -46,16 +46,27 @@ class $modify(BotGameManager, GameManager) {
 
 class $modify(BotGameStatsManager, GameStatsManager) {
     bool isItemUnlocked(UnlockType type, int id) {
-        // Разблокировка абсолютно всех предметов, путей, звуков и иконок 2.2
+        // Разблокировка всех предметов, путей, магазинов и цветов 2.2
         return true;
     }
 };
 
 class $modify(BotGarageLayer, GJGarageLayer) {
+    // Сохранение при переключении между вкладками (куб, корабль, цвета и т.д.)
+    void onSelectTab(cocos2d::CCObject* sender) {
+        GameManager::sharedState()->save();
+        GJGarageLayer::onSelectTab(sender);
+    }
+
+    // Сохранение при выходе по кнопке «Назад»
     void onBack(cocos2d::CCObject* sender) {
-        // Немедленно сохраняем изменения на диск при выходе из гаража
         GameManager::sharedState()->save();
         GJGarageLayer::onBack(sender);
+    }
+
+    // Гарантированное сохранение при закрытии слоя гаража любым способом
+    ~BotGarageLayer() {
+        GameManager::sharedState()->save();
     }
 };
 
@@ -345,7 +356,7 @@ namespace bot {
 
         for (auto const& cmd : gl->m_queuedButtons) {
             PlayerButtonCommand c = cmd;
-            // Сохраняем физический субтиковый timestamp RobTop'а
+            // Сохраняем физический субтиковый timestamp без искажений
             if (c.m_timestamp <= 1.0) {
                 c.m_timestamp = windowStart;
             } else if (windowEnd > windowStart) {
@@ -542,7 +553,7 @@ class $modify(BotBaseGameLayer, GJBaseGameLayer) {
     void processCommands(float dt, bool isHalfTick, bool isLastTick) {
         if (bot::mode != bot::Mode::Off && bot::isPlayLayer(this)) {
             bot::drainQueuedButtons(this);
-            GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
+            this->m_queuedButtons.clear();
             return;
         }
         GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
