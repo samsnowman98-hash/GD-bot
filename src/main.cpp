@@ -1,5 +1,5 @@
 // CBF-style TAS bot for Geometry Dash 2.2081 / Geode 5.x (Android & PC)
-// Диагностическая версия: добавлены логи субтиков и сохранения гаража.
+// Финальная оптимизированная версия: исправлен сброс иконок и субтиковый расчет времени кликов.
 
 #include <Geode/Geode.hpp>
 #include <Geode/modify/PlayLayer.hpp>
@@ -32,7 +32,7 @@
 using namespace geode::prelude;
 
 // ---------------------------------------------------------------------------
-// Разблокировка всех иконок, всех цветов и Practice Music Sync + Диагностика
+// Разблокировка всех иконок, всех цветов и Practice Music Sync
 // ---------------------------------------------------------------------------
 class $modify(BotGameManager, GameManager) {
     bool isIconUnlocked(int id, IconType type) {
@@ -46,23 +46,14 @@ class $modify(BotGameManager, GameManager) {
 
 class $modify(BotGameStatsManager, GameStatsManager) {
     bool isItemUnlocked(UnlockType type, int id) {
-        if (type == UnlockType::GJItem) {
-            if (id == 17 || id == 16) {
-                return true;
-            }
-            bool const orig = GameStatsManager::isItemUnlocked(type, id);
-            if (!orig) {
-                geode::log::warn("[IconDiag] GameStatsManager::isItemUnlocked(GJItem, id={}) is FALSE in vanilla!", id);
-            }
-            return orig;
-        }
+        // Разблокировка абсолютно всех предметов, путей, звуков и иконок 2.2
         return true;
     }
 };
 
 class $modify(BotGarageLayer, GJGarageLayer) {
     void onBack(cocos2d::CCObject* sender) {
-        geode::log::info("[IconDiag] GJGarageLayer::onBack: forcing GameManager::sharedState()->save()");
+        // Немедленно сохраняем изменения на диск при выходе из гаража
         GameManager::sharedState()->save();
         GJGarageLayer::onBack(sender);
     }
@@ -349,44 +340,20 @@ namespace bot {
         }
         if (gl->m_queuedButtons.empty()) return;
 
-        std::vector<PlayerButtonCommand> batch(gl->m_queuedButtons.begin(), gl->m_queuedButtons.end());
-        gl->m_queuedButtons.clear();
-
-        std::stable_sort(batch.begin(), batch.end(), [](auto const& a, auto const& b) {
-            return a.m_timestamp < b.m_timestamp;
-        });
-
-        double const nativeMin = batch.front().m_timestamp;
-        double const nativeMax = batch.back().m_timestamp;
-        double const nativeSpan = nativeMax - nativeMin;
-
         double const windowStart = lastFrameTime;
         double const windowEnd = currentFrameTime;
-        double const windowSpan = std::max(0.0, windowEnd - windowStart);
-        double const steadyNow = getCurrentTimestamp();
 
-        size_t const n = batch.size();
-        geode::log::info("[TASDiag] drainQueuedButtons: n={}, steadyNow={:.6f}, win=[{:.6f} .. {:.6f}] span={:.6f}, natSpan={:.6f}",
-            n, steadyNow, windowStart, windowEnd, windowSpan, nativeSpan);
-
-        for (size_t i = 0; i < n; ++i) {
-            double remapped;
-            double tVal = 0.0;
-            if (nativeSpan > 1e-6 && windowSpan > 1e-6) {
-                tVal = std::clamp((batch[i].m_timestamp - nativeMin) / nativeSpan, 0.0, 1.0);
-                remapped = windowStart + tVal * windowSpan;
+        for (auto const& cmd : gl->m_queuedButtons) {
+            PlayerButtonCommand c = cmd;
+            // Сохраняем физический субтиковый timestamp RobTop'а
+            if (c.m_timestamp <= 1.0) {
+                c.m_timestamp = windowStart;
+            } else if (windowEnd > windowStart) {
+                c.m_timestamp = std::clamp(c.m_timestamp, windowStart, windowEnd);
             }
-            else {
-                tVal = (n > 1) ? static_cast<double>(i) / static_cast<double>(n - 1) : 0.0;
-                remapped = windowStart + tVal * windowSpan;
-            }
-
-            geode::log::info("[TASDiag]   cmd[{}]: raw_ts={:.6f}, tVal={:.6f}, remapped={:.6f}, btn={}, push={}",
-                i, batch[i].m_timestamp, tVal, remapped, (int)batch[i].m_button, batch[i].m_isPush);
-
-            batch[i].m_timestamp = remapped;
-            inputVector.push_back(batch[i]);
+            inputVector.push_back(c);
         }
+        gl->m_queuedButtons.clear();
     }
 
     inline void buildStepQueue(PlayLayer* pl, int stepCount) {
@@ -405,11 +372,6 @@ namespace bot {
         double stepDelta = deltaTime / stepCount;
         size_t inputIdx = 0;
 
-        if (!inputVector.empty()) {
-            geode::log::info("[TASDiag] buildStepQueue: dt={:.6f}, stepCount={}, stepDelta={:.6f}, inputVecSize={}",
-                deltaTime, stepCount, stepDelta, inputVector.size());
-        }
-
         for (int i = 0; i < stepCount; ++i) {
             double elapsed = 0.0;
             double stepStart = i * stepDelta;
@@ -418,8 +380,9 @@ namespace bot {
             while (inputIdx < inputVector.size()) {
                 auto const& in = inputVector[inputIdx];
                 double rel = in.m_timestamp - lastFrameTime;
+                if (rel < 0.0) rel = 0.0;
 
-                if (rel < stepEnd) {
+                if (rel < stepEnd || (i == stepCount - 1)) {
                     double t = std::clamp((rel - stepStart) / stepDelta, 0.0, 1.0);
                     if (t < elapsed) t = elapsed;
 
@@ -431,9 +394,6 @@ namespace bot {
                     s.deltaFactor = std::max(0.0, t - elapsed);
                     s.endStep = false;
                     stepQueue.push_back(s);
-
-                    geode::log::info("[TASDiag]   Sub: stepIdx={}, rel={:.6f}, t={:.6f}, deltaFactor={:.6f}, btn={}",
-                        i, rel, t, s.deltaFactor, s.button);
 
                     elapsed = t;
                     ++inputIdx;
@@ -563,9 +523,6 @@ class $modify(BotBaseGameLayer, GJBaseGameLayer) {
             a.down = down;
             a.p1 = isPlayer1;
             macro.push_back(a);
-
-            geode::log::info("[TASDiag] RECORDED ACTION: step={}, frac={:.6f}, btn={}, down={}, p1={}",
-                a.step, a.frac, (int)a.button, a.down, a.p1);
 
             GJBaseGameLayer::handleButton(down, button, isPlayer1);
             return;
