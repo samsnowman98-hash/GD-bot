@@ -1,5 +1,5 @@
 // CBF-style TAS bot for Geometry Dash 2.2081 / Geode 5.x (Android & PC)
-// Исправлены: Clang/NDK компиляция, 100k+ TPS саб-тики на любых скоростях (включая 0.01x), сброс иконок и чекпоинты.
+// Полная поддержка 100k+ TPS саб-тиков на любых скоростях (включая 0.01x), непрерывная шкала времени, сохранение иконок и чекпоинты.
 
 #include <Geode/Geode.hpp>
 #include <Geode/modify/PlayLayer.hpp>
@@ -33,7 +33,7 @@
 using namespace geode::prelude;
 
 // ---------------------------------------------------------------------------
-// Безопасное сохранение и восстановление третьего цвета и свечения через C++20/23 concepts
+// Безопасное сохранение и восстановление третьего цвета и свечения через C++20 concepts
 // ---------------------------------------------------------------------------
 template <typename GM>
 inline void saveColor3IfAvailable(GM* gm, Mod* mod) {
@@ -224,7 +224,7 @@ namespace bot {
 
     struct Action {
         uint32_t step = 0;   // номер физического шага от старта попытки
-        double frac = 0.0;   // субтиковая доля внутри шага [0..1]
+        double frac = 0.0;   // субтиковая доля внутри шага [0..1)
         uint8_t button = 1;
         bool down = false;
         bool p1 = true;
@@ -235,6 +235,13 @@ namespace bot {
         bool push = false;
         bool p1 = true;
         double frac = 0.0;
+    };
+
+    struct RawInput {
+        int button = 1;
+        bool push = false;
+        bool p1 = true;
+        double timestamp = 0.0;
     };
 
     // ---- состояние бота ----
@@ -253,10 +260,11 @@ namespace bot {
 
     inline bool disableDeathEffects = Mod::get()->getSavedValue<bool>("disableDeathEffects", true);
 
-    // ---- непрерывная физическая шкала времени CBF ----
-    inline std::vector<PlayerButtonCommand> inputVector;
-    inline double stepTimeAnchor = 0.0;
-    inline uint32_t anchorStep = 0;
+    // ---- непрерывная субтиковая шкала CBF ----
+    inline std::vector<RawInput> pendingRecordInputs;
+    inline double g_stepAnchorWallTime = 0.0;
+    inline uint32_t g_stepAnchorStep = 0;
+
     inline bool inputThisStep = false;
     inline bool p1Split = false;
     inline bool p2Split = false;
@@ -298,9 +306,9 @@ namespace bot {
     }
 
     inline void resetEngine() {
-        inputVector.clear();
-        stepTimeAnchor = getCurrentTimestamp();
-        anchorStep = step;
+        pendingRecordInputs.clear();
+        g_stepAnchorWallTime = getCurrentTimestamp();
+        g_stepAnchorStep = step;
         inputThisStep = false;
         p1Split = false;
         p2Split = false;
@@ -327,9 +335,8 @@ namespace bot {
 
     inline void setTimeScale(float s) {
         if (std::fabs(s - appliedScale) < 1e-6f) return;
-        // Перепривязка якоря при смене скорости
-        stepTimeAnchor = getCurrentTimestamp();
-        anchorStep = step;
+        g_stepAnchorWallTime = getCurrentTimestamp();
+        g_stepAnchorStep = step;
         appliedScale = s;
         CCDirector::sharedDirector()->getScheduler()->setTimeScale(s);
         updateAudioPitch();
@@ -345,6 +352,15 @@ namespace bot {
         } else {
             updateAudioPitch();
         }
+    }
+
+    inline void recordRawInput(int button, bool push, bool isPlayer1, double timestamp) {
+        RawInput raw;
+        raw.button = button;
+        raw.push = push;
+        raw.p1 = isPlayer1;
+        raw.timestamp = timestamp;
+        pendingRecordInputs.push_back(raw);
     }
 
     inline double parseSpeedString(std::string const& str) {
@@ -501,25 +517,6 @@ namespace bot {
         }
     }
 
-    inline void drainQueuedButtons(GJBaseGameLayer* gl) {
-        if (!gl) return;
-        if (mode == Mode::Play) {
-            gl->m_queuedButtons.clear();
-            return;
-        }
-        if (gl->m_queuedButtons.empty()) return;
-
-        double const now = getCurrentTimestamp();
-        for (auto const& cmd : gl->m_queuedButtons) {
-            PlayerButtonCommand c = cmd;
-            if (c.m_timestamp <= 1.0) {
-                c.m_timestamp = now;
-            }
-            inputVector.push_back(c);
-        }
-        gl->m_queuedButtons.clear();
-    }
-
     inline void onFrameStart() {
         PlayLayer* pl = PlayLayer::get();
         CCNode* par = nullptr;
@@ -533,9 +530,9 @@ namespace bot {
         if (mode == Mode::Off) return;
 
         if (idle) {
-            inputVector.clear();
-            stepTimeAnchor = getCurrentTimestamp();
-            anchorStep = step;
+            pendingRecordInputs.clear();
+            g_stepAnchorWallTime = getCurrentTimestamp();
+            g_stepAnchorStep = step;
         }
     }
 
@@ -577,9 +574,33 @@ class $modify(BotScheduler, CCScheduler) {
 };
 
 // ---------------------------------------------------------------------------
-// Перехват кнопок
+// Прямой высокоточный перехват аппаратного ввода (Windows / Android)
 // ---------------------------------------------------------------------------
 class $modify(BotBaseGameLayer, GJBaseGameLayer) {
+    void pushButton(int button, bool isPlayer2) {
+        if (bot::mode == bot::Mode::Record && bot::isPlayLayer(this)) {
+            double const now = bot::getCurrentTimestamp();
+            bot::recordRawInput(button, true, !isPlayer2, now);
+            return;
+        }
+        if (bot::mode == bot::Mode::Play && bot::isPlayLayer(this)) {
+            return;
+        }
+        GJBaseGameLayer::pushButton(button, isPlayer2);
+    }
+
+    void releaseButton(int button, bool isPlayer2) {
+        if (bot::mode == bot::Mode::Record && bot::isPlayLayer(this)) {
+            double const now = bot::getCurrentTimestamp();
+            bot::recordRawInput(button, false, !isPlayer2, now);
+            return;
+        }
+        if (bot::mode == bot::Mode::Play && bot::isPlayLayer(this)) {
+            return;
+        }
+        GJBaseGameLayer::releaseButton(button, isPlayer2);
+    }
+
     void handleButton(bool down, int button, bool isPlayer1) {
         using namespace bot;
         if (mode == Mode::Off || silent > 0 || !isPlayLayer(this)) {
@@ -593,24 +614,14 @@ class $modify(BotBaseGameLayer, GJBaseGameLayer) {
         }
 
         if (applying > 0) {
-            Action a;
-            a.step = applyStep;
-            a.frac = applyFrac;
-            a.button = static_cast<uint8_t>(button);
-            a.down = down;
-            a.p1 = isPlayer1;
-            macro.push_back(a);
-
             GJBaseGameLayer::handleButton(down, button, isPlayer1);
             return;
         }
-
-        GJBaseGameLayer::handleButton(down, button, isPlayer1);
     }
 
     void processCommands(float dt, bool isHalfTick, bool isLastTick) {
         if (bot::mode != bot::Mode::Off && bot::isPlayLayer(this)) {
-            bot::drainQueuedButtons(this);
+            this->m_queuedButtons.clear();
             return;
         }
         GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
@@ -665,6 +676,16 @@ class $modify(BotPlayerObject, PlayerObject) {
         uint32_t const cur = step;
         std::vector<StepSub> subs;
 
+        float const scale = (appliedScale > 0.0001f) ? appliedScale : 1.0f;
+        double const stepDuration = static_cast<double>(stepDelta) / static_cast<double>(scale);
+        double const now = getCurrentTimestamp();
+
+        // Защита от фазового дрейфа шкалы при смене FPS или лагах
+        if (g_stepAnchorWallTime <= 0.0 || std::abs(now - g_stepAnchorWallTime) > 3.0) {
+            g_stepAnchorWallTime = now;
+            g_stepAnchorStep = cur;
+        }
+
         if (mode == Mode::Play) {
             while (playIndex < macro.size() && macro[playIndex].step <= cur) {
                 auto const& a = macro[playIndex++];
@@ -677,42 +698,37 @@ class $modify(BotPlayerObject, PlayerObject) {
             }
         }
         else { // Record
-            float const scale = (appliedScale > 0.0001f) ? appliedScale : 1.0f;
-            double const stepDuration = static_cast<double>(stepDelta) / scale;
+            std::vector<RawInput> remaining;
+            for (auto const& in : pendingRecordInputs) {
+                double stepsOffset = (in.timestamp - g_stepAnchorWallTime) / stepDuration;
+                int64_t targetStep = static_cast<int64_t>(g_stepAnchorStep) + static_cast<int64_t>(std::floor(stepsOffset));
+                double frac = stepsOffset - std::floor(stepsOffset);
 
-            double const now = getCurrentTimestamp();
-            if (stepTimeAnchor <= 0.0 || std::abs(now - stepTimeAnchor) > 3.0) {
-                stepTimeAnchor = now;
-                anchorStep = cur;
-            }
-
-            // Математически точные границы шага cur в реальном времени
-            double const stepStartTime = stepTimeAnchor + (static_cast<double>(cur) - static_cast<double>(anchorStep)) * stepDuration;
-            double const stepEndTime = stepStartTime + stepDuration;
-
-            std::stable_sort(inputVector.begin(), inputVector.end(), [](auto const& a, auto const& b) {
-                return a.m_timestamp < b.m_timestamp;
-            });
-
-            size_t consumed = 0;
-            for (auto const& in : inputVector) {
-                if (in.m_timestamp <= stepEndTime || (consumed == 0 && in.m_timestamp < stepStartTime)) {
+                if (targetStep <= static_cast<int64_t>(cur)) {
                     StepSub s;
-                    s.button = static_cast<int>(in.m_button);
-                    s.push = in.m_isPush;
-                    s.p1 = !in.m_isPlayer2;
-                    double rel = in.m_timestamp - stepStartTime;
-                    s.frac = std::clamp(rel / stepDuration, 0.0, 1.0);
+                    s.button = in.button;
+                    s.push = in.push;
+                    s.p1 = in.p1;
+                    if (targetStep < static_cast<int64_t>(cur)) {
+                        s.frac = 0.0001;
+                    } else {
+                        s.frac = std::clamp(frac, 0.0001, 0.9999);
+                    }
                     subs.push_back(s);
-                    ++consumed;
+
+                    Action a;
+                    a.step = cur;
+                    a.frac = s.frac;
+                    a.button = static_cast<uint8_t>(s.button);
+                    a.down = s.push;
+                    a.p1 = s.p1;
+                    macro.push_back(a);
                 }
                 else {
-                    break;
+                    remaining.push_back(in);
                 }
             }
-            if (consumed > 0) {
-                inputVector.erase(inputVector.begin(), inputVector.begin() + consumed);
-            }
+            pendingRecordInputs = std::move(remaining);
         }
 
         inputThisStep = !subs.empty();
@@ -721,6 +737,8 @@ class $modify(BotPlayerObject, PlayerObject) {
             p1Split = false;
             p2Split = false;
             PlayerObject::update(stepDelta);
+            g_stepAnchorWallTime += stepDuration;
+            g_stepAnchorStep = cur + 1;
             ++step;
             return;
         }
@@ -730,10 +748,10 @@ class $modify(BotPlayerObject, PlayerObject) {
             return a.frac < b.frac;
         });
 
-        // Гарантируем положительную дельту между кликами внутри одного тика (100k+ TPS)
+        // Гарантируем строго положительную дельту между кликами внутри одного тика (100k+ TPS)
         for (size_t i = 1; i < subs.size(); ++i) {
-            if (subs[i].frac < subs[i - 1].frac + 1e-5) {
-                subs[i].frac = std::min(1.0, subs[i - 1].frac + 1e-5);
+            if (subs[i].frac <= subs[i - 1].frac + 1e-5) {
+                subs[i].frac = std::min(0.9999, subs[i - 1].frac + 1e-5);
             }
         }
 
@@ -801,6 +819,8 @@ class $modify(BotPlayerObject, PlayerObject) {
         }
 
         midStep = false;
+        g_stepAnchorWallTime += stepDuration;
+        g_stepAnchorStep = cur + 1;
         ++step;
     }
 
@@ -897,8 +917,9 @@ class $modify(BotPlayLayer, PlayLayer) {
         }
 
         bot::step = it->second;
-        bot::stepTimeAnchor = bot::getCurrentTimestamp();
-        bot::anchorStep = bot::step;
+        bot::g_stepAnchorStep = bot::step;
+        bot::g_stepAnchorWallTime = bot::getCurrentTimestamp();
+        bot::pendingRecordInputs.clear();
 
         if (bot::mode == bot::Mode::Record) {
             uint32_t s = bot::step;
