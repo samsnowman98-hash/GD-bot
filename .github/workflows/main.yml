@@ -43,7 +43,13 @@ jobs:
       # ВРЕМЕННЫЙ шаг: ищем, в каком классе объявлен pushButton
       - name: Find pushButton
         if: always() && startsWith(matrix.config.target, 'Android')
-        run: grep -rn "void pushButton" . --include=*.hpp | head -20 || true
+        run: |
+          echo "=== SDK ==="
+          grep -rn "pushButton" "$GEODE_SDK" --include=*.hpp || echo "no match in SDK"
+          echo "=== bindings ==="
+          grep -rn "pushButton" /home/runner/work/GD-bot/GD-bot/build --include=*.hpp || echo "no match in build"
+          echo "=== cpm ==="
+          grep -rln "pushButton" /home/runner/work/GD-bot/GD-bot/cpm-cache --include=*.hpp || echo "no match in cpm"
 
   package:
     name: Package Mod
