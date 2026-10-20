@@ -1,4 +1,9 @@
 // CBF-style TAS bot for Geometry Dash 2.2081 / Geode 5.x (Android & PC)
+//
+// Ключевая идея CBF: реальный ввод перехватывается ДО того, как игра
+// положит его в очередь тика (m_queuedButtons), а применяется внутри шага
+// через субтиковую симуляцию в PlayerObject::update. Это даёт точность
+// меньше одного тика и в записи, и в воспроизведении.
 
 #include <Geode/Geode.hpp>
 #include <Geode/modify/PlayLayer.hpp>
@@ -7,6 +12,8 @@
 #include <Geode/modify/PauseLayer.hpp>
 #include <Geode/modify/CCScheduler.hpp>
 #include <Geode/modify/CCCircleWave.hpp>
+#include <Geode/modify/CCKeyboardDispatcher.hpp>
+#include <Geode/modify/CCTouchDispatcher.hpp>
 #include <Geode/modify/GameManager.hpp>
 #include <Geode/modify/GameStatsManager.hpp>
 #include <Geode/modify/MenuLayer.hpp>
@@ -16,11 +23,11 @@
 #include <fmod.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <ctime>
-#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -34,31 +41,21 @@ using namespace geode::prelude;
 // Разблокировка предметов (сохранение игры не модифицируется)
 // ---------------------------------------------------------------------------
 class $modify(BotGameManager, GameManager) {
-    bool isIconUnlocked(int id, IconType type) {
-        return true;
-    }
-
-    bool isColorUnlocked(int id, UnlockType type) {
-        return true;
-    }
+    bool isIconUnlocked(int id, IconType type) { return true; }
+    bool isColorUnlocked(int id, UnlockType type) { return true; }
 };
 
 class $modify(BotGameStatsManager, GameStatsManager) {
-    bool isItemUnlocked(UnlockType type, int id) {
-        return true;
-    }
+    bool isItemUnlocked(UnlockType type, int id) { return true; }
 };
 
 // ---------------------------------------------------------------------------
-// Общее состояние настроек (объявлено до использования в хуках)
+// Общее состояние настроек (объявлено до хуков)
 // ---------------------------------------------------------------------------
 namespace bot {
     inline bool disableDeathEffects = true;
 }
 
-// ---------------------------------------------------------------------------
-// Меню: загрузка настроек мода (безопасно, уже после инициализации Mod)
-// ---------------------------------------------------------------------------
 class $modify(BotMenuLayer, MenuLayer) {
     bool init() {
         if (!MenuLayer::init()) return false;
@@ -73,7 +70,7 @@ namespace bot {
 
     constexpr uint32_t kMagic = 0x32544F42; // "BOT2"
     constexpr uint32_t kMaxActions = 2'000'000;
-    constexpr std::uintmax_t kMaxFileSize = 64ull * 1024ull * 1024ull; // 64 MB
+    constexpr std::uintmax_t kMaxFileSize = 64ull * 1024ull * 1024ull;
 
     enum class Mode { Off, Record, Play };
 
@@ -165,14 +162,14 @@ namespace bot {
         rotationDelta = 0.f;
     }
 
+    // ВАЖНО: в Record выключаем clickBetweenSteps. Очередь тика нам не нужна —
+    // клики приходят из диспетчера ввода и применяются субтиково вручную.
+    // Если оставить true, игра сама дренирует очередь на границах шага,
+    // и время клика квантуется до TPS.
     inline void applyClickFlags() {
         auto pl = PlayLayer::get();
         if (!pl) return;
-        if (mode == Mode::Record) {
-            pl->m_clickBetweenSteps = true;
-            pl->m_clickOnSteps = false;
-        }
-        else if (mode == Mode::Play) {
+        if (mode == Mode::Record || mode == Mode::Play) {
             pl->m_clickBetweenSteps = false;
             pl->m_clickOnSteps = false;
         }
@@ -269,11 +266,9 @@ namespace bot {
         if (start == std::string::npos) return "";
         size_t end = out.find_last_not_of(' ');
         out = out.substr(start, end - start + 1);
-        // Windows: точка/пробел в конце недопустимы
         while (!out.empty() && (out.back() == '.' || out.back() == ' ')) out.pop_back();
         if (out.size() > 80) out.resize(80);
 
-        // Windows: зарезервированные имена
         std::string upper;
         upper.reserve(out.size());
         for (char c : out) upper.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
@@ -393,6 +388,28 @@ namespace bot {
             g_stepStartTime = 0.0;
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Маппинг клавиш / тача в кнопки игрока.
+    // По умолчанию в GD: Space и стрелка вверх — прыжок P1, стрелка вниз —
+    // P2 (в двойном режиме). Игроки переназначают клавиши в настройках,
+    // поэтому при необходимости добавьте свои комбинации.
+    // -----------------------------------------------------------------------
+    inline int keyToButtonPC(enumKeyCodes key, bool& outP1) {
+        switch (key) {
+            case KEY_Space: outP1 = true;  return 1;
+            case KEY_Up:    outP1 = true;  return 1;
+            case KEY_Down:  outP1 = false; return 2;
+            default: break;
+        }
+        return 0;
+    }
+
+    inline int touchToButton(float x, float width, bool& outP1) {
+        bool leftHalf = x < width * 0.5f;
+        outP1 = leftHalf;
+        return leftHalf ? 1 : 2;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -420,12 +437,69 @@ class $modify(BotScheduler, CCScheduler) {
 };
 
 // ---------------------------------------------------------------------------
-// Перехват нажатий.
-// В 2.2081 GJBaseGameLayer::queueButton и processQueuedButtons объявлены
-// inline в заголовке — Geode не может их хукать. Реальный ввод приходит
-// через виртуальный handleButton, поэтому перехватываем именно его.
-// Порядок проверок важен: silent > 0 должен идти до записи, иначе
-// silentReleaseAll() запишет отпускание кнопок в макрос.
+// ПЕРЕХВАТ ВВОДА (PC/Android). Стоит ВЫШЕ handleButton, поэтому время
+// нажатия ещё не квантовано тиком. Именно этого не хватало для CBF.
+// ---------------------------------------------------------------------------
+class $modify(BotKeyboardDispatcher, CCKeyboardDispatcher) {
+    bool dispatchKeyboardMSG(enumKeyCodes key, bool down, bool isKeyRepeat) {
+        using namespace bot;
+
+        if (mode == Mode::Record && !isKeyRepeat && bot::recordingActive()) {
+            bool p1 = true;
+            int btn = keyToButtonPC(key, p1);
+            if (btn > 0) {
+                recordRawInput(btn, down, p1, getCurrentTimestamp());
+                return true; // поглотить: в игру не пускаем
+            }
+        }
+        return CCKeyboardDispatcher::dispatchKeyboardMSG(key, down, isKeyRepeat);
+    }
+};
+
+// Тач-ввод-фокусированная часть: работает и на Android, и на PC с тач-экраном.
+// Хук CCTouchDispatcher, а не PlayLayer::ccTouchBegan: там уже могут быть
+// игровые задержки. CCTouchDispatcher — самая ранняя из доступных точек.
+class $modify(BotTouchDispatcher, CCTouchDispatcher) {
+    void touchesBegan(CCSet* touches, CCEvent* event) {
+        using namespace bot;
+        if (mode == Mode::Record && bot::recordingActive()) {
+            auto pl = PlayLayer::get();
+            auto win = CCDirector::sharedDirector()->getWinSize();
+            for (auto* obj : *touches) {
+                auto touch = static_cast<CCTouch*>(obj);
+                auto loc = touch->getLocation();
+                if (loc.y < win.height * 0.15f) continue; // панель UI снизу — пропускаем
+                bool p1 = true;
+                int btn = touchToButton(loc.x, win.width, p1);
+                recordRawInput(btn, true, p1, getCurrentTimestamp());
+            }
+            return; // в игру тач не пускаем
+        }
+        CCTouchDispatcher::touchesBegan(touches, event);
+    }
+
+    void touchesEnded(CCSet* touches, CCEvent* event) {
+        using namespace bot;
+        if (mode == Mode::Record && bot::recordingActive()) {
+            auto win = CCDirector::sharedDirector()->getWinSize();
+            for (auto* obj : *touches) {
+                auto touch = static_cast<CCTouch*>(obj);
+                auto loc = touch->getLocation();
+                if (loc.y < win.height * 0.15f) continue;
+                bool p1 = true;
+                int btn = touchToButton(loc.x, win.width, p1);
+                recordRawInput(btn, false, p1, getCurrentTimestamp());
+            }
+            return;
+        }
+        CCTouchDispatcher::touchesEnded(touches, event);
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Применение ввода в субтиковый момент. Реальные нажатия сюда уже не
+// доходят — они поглощены диспетчерами выше. handleButton остаётся
+// для silentReleaseAll и applyInput (флаг applying).
 // ---------------------------------------------------------------------------
 class $modify(BotBaseGameLayer, GJBaseGameLayer) {
     void handleButton(bool down, int button, bool isPlayer1) {
@@ -441,31 +515,23 @@ class $modify(BotBaseGameLayer, GJBaseGameLayer) {
             return;
         }
 
-        if (mode == Mode::Record) {
-            recordRawInput(button, down, isPlayer1, getCurrentTimestamp());
-            return;
-        }
-
-        // Mode::Play: реальный ввод игрока игнорируем
+        // Mode::Record / Mode::Play: реальные нажатия перехвачены выше,
+        // сюда попадают только внутренние вызовы — не пропускаем.
     }
 };
 
 // ---------------------------------------------------------------------------
-// Нарезка подтиков игрока
+// Нарезка подтиков игрока (движок CBF)
 // ---------------------------------------------------------------------------
 class $modify(BotPlayerObject, PlayerObject) {
     void playSpawnEffect() {
         this->setVisible(true);
-        if (bot::disableDeathEffects && bot::mode != bot::Mode::Off) {
-            return;
-        }
+        if (bot::disableDeathEffects && bot::mode != bot::Mode::Off) return;
         PlayerObject::playSpawnEffect();
     }
 
     void playDeathEffect() {
-        if (bot::disableDeathEffects && bot::mode != bot::Mode::Off) {
-            return;
-        }
+        if (bot::disableDeathEffects && bot::mode != bot::Mode::Off) return;
         PlayerObject::playDeathEffect();
     }
 
@@ -476,18 +542,15 @@ class $modify(BotPlayerObject, PlayerObject) {
             PlayerObject::update(stepDelta);
             return;
         }
-
         if (stepDelta <= 1e-9f) {
             PlayerObject::update(stepDelta);
             return;
         }
-
         if (mode == Mode::Off) {
             PlayerObject::update(stepDelta);
             if (this == pl->m_player1) ++step;
             return;
         }
-
         if (this != pl->m_player1) {
             if (!inputThisStep || this != pl->m_player2) {
                 PlayerObject::update(stepDelta);
@@ -502,7 +565,6 @@ class $modify(BotPlayerObject, PlayerObject) {
         double const stepDuration = static_cast<double>(stepDelta) / static_cast<double>(scale);
         double const now = getCurrentTimestamp();
 
-        // Синхронизация времени шага без накопления задержки
         if (g_stepStartTime <= 0.0 || (now - g_stepStartTime) > (stepDuration * 4.0) || g_stepStartTime > now) {
             g_stepStartTime = now - stepDuration;
         }
@@ -564,7 +626,6 @@ class $modify(BotPlayerObject, PlayerObject) {
             return a.frac < b.frac;
         });
 
-        // Разделяем одновременные нажатия с минимальным смещением
         for (size_t i = 1; i < subs.size(); ++i) {
             if (subs[i].frac <= subs[i - 1].frac + 1e-5) {
                 subs[i].frac = std::min(0.9999, subs[i - 1].frac + 1e-5);
@@ -664,8 +725,8 @@ class $modify(BotPlayLayer, PlayLayer) {
 
         if (auto mod = Mod::get()) {
             bot::disableDeathEffects = mod->getSavedValue<bool>("disableDeathEffects", true);
+            bot::recSpeed = mod->getSavedValue<double>("recSpeed", 1.0);
         }
-
         bot::applyClickFlags();
 
         if (Loader::get()->isModLoaded("syzzi.click_between_frames")) {
@@ -732,10 +793,7 @@ class $modify(BotPlayLayer, PlayLayer) {
         if (bot::mode == bot::Mode::Record) {
             uint32_t s = bot::step;
             auto& m = bot::macro;
-            m.erase(
-                std::remove_if(m.begin(), m.end(), [s](bot::Action const& a) { return a.step >= s; }),
-                m.end()
-            );
+            m.erase(std::remove_if(m.begin(), m.end(), [s](bot::Action const& a) { return a.step >= s; }), m.end());
             bot::syncPlayback(this);
         }
         else if (bot::mode == bot::Mode::Play) {
@@ -782,28 +840,18 @@ class $modify(BotPauseLayer, PauseLayer) {
             else if (!bot::macro.empty()) st = fmt::format("OFF ({} acts loaded)", bot::macro.size());
             m_fields->m_statusLabel->setString(st.c_str());
         }
-        if (m_fields->m_offSprite) {
-            m_fields->m_offSprite->setColor(bot::mode == bot::Mode::Off ? ccColor3B{ 80, 255, 80 } : ccColor3B{ 255, 255, 255 });
-        }
-        if (m_fields->m_recSprite) {
-            m_fields->m_recSprite->setColor(bot::mode == bot::Mode::Record ? ccColor3B{ 255, 80, 80 } : ccColor3B{ 255, 255, 255 });
-        }
-        if (m_fields->m_playSprite) {
-            m_fields->m_playSprite->setColor(bot::mode == bot::Mode::Play ? ccColor3B{ 80, 200, 255 } : ccColor3B{ 255, 255, 255 });
-        }
-        if (m_fields->m_fxSprite) {
-            m_fields->m_fxSprite->setColor(bot::disableDeathEffects ? ccColor3B{ 255, 180, 80 } : ccColor3B{ 255, 255, 255 });
-        }
+        if (m_fields->m_offSprite) m_fields->m_offSprite->setColor(bot::mode == bot::Mode::Off ? ccColor3B{80,255,80} : ccColor3B{255,255,255});
+        if (m_fields->m_recSprite) m_fields->m_recSprite->setColor(bot::mode == bot::Mode::Record ? ccColor3B{255,80,80} : ccColor3B{255,255,255});
+        if (m_fields->m_playSprite) m_fields->m_playSprite->setColor(bot::mode == bot::Mode::Play ? ccColor3B{80,200,255} : ccColor3B{255,255,255});
+        if (m_fields->m_fxSprite) m_fields->m_fxSprite->setColor(bot::disableDeathEffects ? ccColor3B{255,180,80} : ccColor3B{255,255,255});
     }
 
-    // Перестройка списка через runAction на следующем кадре, чтобы
-    // не уничтожать CCMenuItem из его собственного колбэка.
     void refreshMacroListDeferred() {
         m_fields->m_refreshScheduled = false;
         this->refreshMacroList();
     }
 
-    void scheduleRefreshMacroList() {
+        void scheduleRefreshMacroList() {
         if (m_fields->m_refreshScheduled) return;
         m_fields->m_refreshScheduled = true;
         this->runAction(CCSequence::createWithTwoActions(
@@ -871,7 +919,6 @@ class $modify(BotPauseLayer, PauseLayer) {
             auto delBtn = CCMenuItemExt::createSpriteExtra(delSpr, [this, path](CCObject*) {
                 std::error_code ec2;
                 std::filesystem::remove(path, ec2);
-                // Не перестраиваем список прямо здесь: кнопка сейчас выполняет свой колбэк
                 this->scheduleRefreshMacroList();
                 Notification::create("Macro deleted", NotificationIcon::Info)->show();
             });
