@@ -31,8 +31,7 @@
 using namespace geode::prelude;
 
 // ---------------------------------------------------------------------------
-// Разблокировка предметов (иконки и цвета остаются под управлением игры,
-// сохранение не модифицируется, чтобы не портить пользовательский save)
+// Разблокировка предметов (сохранение игры не модифицируется)
 // ---------------------------------------------------------------------------
 class $modify(BotGameManager, GameManager) {
     bool isIconUnlocked(int id, IconType type) {
@@ -49,6 +48,13 @@ class $modify(BotGameStatsManager, GameStatsManager) {
         return true;
     }
 };
+
+// ---------------------------------------------------------------------------
+// Общее состояние настроек (объявлено до использования в хуках)
+// ---------------------------------------------------------------------------
+namespace bot {
+    inline bool disableDeathEffects = true;
+}
 
 // ---------------------------------------------------------------------------
 // Меню: загрузка настроек мода (безопасно, уже после инициализации Mod)
@@ -103,9 +109,6 @@ namespace bot {
     inline std::unordered_map<CheckpointObject*, uint32_t> checkpoints;
     inline double recSpeed = 1.0;
     inline float appliedScale = 1.0f;
-
-    // Значение по умолчанию; реальное значение подгружается в BotMenuLayer::init()
-    inline bool disableDeathEffects = true;
 
     inline std::vector<RawInput> pendingRecordInputs;
     inline double g_stepStartTime = 0.0;
@@ -394,35 +397,20 @@ class $modify(BotScheduler, CCScheduler) {
 };
 
 // ---------------------------------------------------------------------------
-// Перехват нажатий (через pushButton и releaseButton для обхода инлайнинга)
+// Перехват нажатий: запись и блокировка ввода происходят в handleButton,
+// так как pushButton/releaseButton нет в GJBaseGameLayer этой версии bindings
 // ---------------------------------------------------------------------------
 class $modify(BotBaseGameLayer, GJBaseGameLayer) {
-    void pushButton(PlayerButton button, bool isPlayer2) {
-        if (bot::mode == bot::Mode::Record && bot::isPlayLayer(this)) {
-            bot::recordRawInput(static_cast<int>(button), true, !isPlayer2, bot::getCurrentTimestamp());
-            return;
-        }
-        if (bot::mode == bot::Mode::Play && bot::isPlayLayer(this)) {
-            return;
-        }
-        GJBaseGameLayer::pushButton(button, isPlayer2);
-    }
-
-    void releaseButton(PlayerButton button, bool isPlayer2) {
-        if (bot::mode == bot::Mode::Record && bot::isPlayLayer(this)) {
-            bot::recordRawInput(static_cast<int>(button), false, !isPlayer2, bot::getCurrentTimestamp());
-            return;
-        }
-        if (bot::mode == bot::Mode::Play && bot::isPlayLayer(this)) {
-            return;
-        }
-        GJBaseGameLayer::releaseButton(button, isPlayer2);
-    }
-
     void handleButton(bool down, int button, bool isPlayer1) {
         using namespace bot;
         if (mode == Mode::Off || silent > 0 || !isPlayLayer(this)) {
             GJBaseGameLayer::handleButton(down, button, isPlayer1);
+            return;
+        }
+
+        // Человеческий ввод в режиме записи сохраняем, но не применяем сразу
+        if (mode == Mode::Record && applying == 0) {
+            recordRawInput(button, down, isPlayer1, getCurrentTimestamp());
             return;
         }
 
