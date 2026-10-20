@@ -544,19 +544,29 @@ class $modify(BotScheduler, CCScheduler) {
 };
 
 // ---------------------------------------------------------------------------
-// Перехват нажатий
+// Перехват нажатий (через pushButton и releaseButton для обхода инлайнинга)
 // ---------------------------------------------------------------------------
 class $modify(BotBaseGameLayer, GJBaseGameLayer) {
-    void queueButton(int button, bool push, bool isPlayer2, double timestamp) {
+    void pushButton(PlayerButton button, bool isPlayer2) {
         if (bot::mode == bot::Mode::Record && bot::isPlayLayer(this)) {
-            // Всегда используем точный монотонный таймер мода
-            bot::recordRawInput(button, push, !isPlayer2, bot::getCurrentTimestamp());
+            bot::recordRawInput(static_cast<int>(button), true, !isPlayer2, bot::getCurrentTimestamp());
             return;
         }
         if (bot::mode == bot::Mode::Play && bot::isPlayLayer(this)) {
             return;
         }
-        GJBaseGameLayer::queueButton(button, push, isPlayer2, timestamp);
+        GJBaseGameLayer::pushButton(button, isPlayer2);
+    }
+
+    void releaseButton(PlayerButton button, bool isPlayer2) {
+        if (bot::mode == bot::Mode::Record && bot::isPlayLayer(this)) {
+            bot::recordRawInput(static_cast<int>(button), false, !isPlayer2, bot::getCurrentTimestamp());
+            return;
+        }
+        if (bot::mode == bot::Mode::Play && bot::isPlayLayer(this)) {
+            return;
+        }
+        GJBaseGameLayer::releaseButton(button, isPlayer2);
     }
 
     void handleButton(bool down, int button, bool isPlayer1) {
@@ -949,7 +959,6 @@ class $modify(BotPauseLayer, PauseLayer) {
         auto scroll = ScrollLayer::create(CCSize{ viewW, viewH });
         scroll->m_contentLayer->setContentSize(CCSize{ viewW, totalH });
 
-        // Единое меню для всех кнопок строк списка
         auto rowMenu = CCMenu::create();
         rowMenu->setPosition(0.0f, 0.0f);
         rowMenu->setContentSize(CCSize{ viewW, totalH });
