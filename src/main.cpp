@@ -72,6 +72,8 @@ class $modify(BotMenuLayer, MenuLayer) {
 namespace bot {
 
     constexpr uint32_t kMagic = 0x32544F42; // "BOT2"
+    constexpr uint32_t kMaxActions = 2'000'000;
+    constexpr std::uintmax_t kMaxFileSize = 64ull * 1024ull * 1024ull; // 64 MB
 
     enum class Mode { Off, Record, Play };
 
@@ -160,6 +162,7 @@ namespace bot {
         p1Split = false;
         p2Split = false;
         midStep = false;
+        rotationDelta = 0.f;
     }
 
     inline void applyClickFlags() {
@@ -232,6 +235,7 @@ namespace bot {
         auto dir = Mod::get()->getSaveDir() / "macros";
         std::error_code ec;
         std::filesystem::create_directories(dir, ec);
+        if (ec) return Mod::get()->getSaveDir();
         return dir;
     }
 
@@ -265,7 +269,22 @@ namespace bot {
         if (start == std::string::npos) return "";
         size_t end = out.find_last_not_of(' ');
         out = out.substr(start, end - start + 1);
+        // Windows: точка/пробел в конце недопустимы
+        while (!out.empty() && (out.back() == '.' || out.back() == ' ')) out.pop_back();
         if (out.size() > 80) out.resize(80);
+
+        // Windows: зарезервированные имена
+        std::string upper;
+        upper.reserve(out.size());
+        for (char c : out) upper.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
+        static const char* reserved[] = {
+            "CON","PRN","AUX","NUL",
+            "COM1","COM2","COM3","COM4","COM5","COM6","COM7","COM8","COM9",
+            "LPT1","LPT2","LPT3","LPT4","LPT5","LPT6","LPT7","LPT8","LPT9"
+        };
+        for (auto const* r : reserved) {
+            if (upper == r) { out = "_" + out; break; }
+        }
         return out;
     }
 
@@ -287,12 +306,16 @@ namespace bot {
     }
 
     inline bool loadMacro(std::filesystem::path const& path, std::vector<Action>& actions) {
+        std::error_code ec;
+        auto size = std::filesystem::file_size(path, ec);
+        if (ec || size > kMaxFileSize) return false;
+
         std::ifstream in(path, std::ios::binary);
         if (!in) return false;
         uint32_t magic = 0, count = 0;
         in.read(reinterpret_cast<char*>(&magic), 4);
         in.read(reinterpret_cast<char*>(&count), 4);
-        if (!in || magic != kMagic || count > 5'000'000) return false;
+        if (!in || magic != kMagic || count > kMaxActions) return false;
         std::vector<Action> tmp;
         tmp.reserve(count);
         for (uint32_t i = 0; i < count; ++i) {
@@ -397,46 +420,33 @@ class $modify(BotScheduler, CCScheduler) {
 };
 
 // ---------------------------------------------------------------------------
-// Перехват нажатий: реальный ввод перехватывается в queueButton и не
-// попадает в обычный путь игры; применяется только через подшаговую
-// симуляцию в PlayerObject::update (см. applyInput + флаг applying)
+// Перехват нажатий.
+// В 2.2081 GJBaseGameLayer::queueButton и processQueuedButtons объявлены
+// inline в заголовке — Geode не может их хукать. Реальный ввод приходит
+// через виртуальный handleButton, поэтому перехватываем именно его.
+// Порядок проверок важен: silent > 0 должен идти до записи, иначе
+// silentReleaseAll() запишет отпускание кнопок в макрос.
 // ---------------------------------------------------------------------------
 class $modify(BotBaseGameLayer, GJBaseGameLayer) {
-    void queueButton(int button, bool push, bool isPlayer2, double timestamp) {
-        using namespace bot;
-        if (mode == Mode::Record && isPlayLayer(this)) {
-            recordRawInput(button, push, !isPlayer2, timestamp);
-            return;
-        }
-        if (mode == Mode::Play && isPlayLayer(this)) {
-            return;
-        }
-        GJBaseGameLayer::queueButton(button, push, isPlayer2, timestamp);
-    }
-
-    void processQueuedButtons(float dt, bool clearInputQueue) {
-        if (bot::mode != bot::Mode::Off && bot::isPlayLayer(this)) {
-            this->m_queuedButtons.clear();
-            return;
-        }
-        GJBaseGameLayer::processQueuedButtons(dt, clearInputQueue);
-    }
-
     void handleButton(bool down, int button, bool isPlayer1) {
         using namespace bot;
+
         if (mode == Mode::Off || silent > 0 || !isPlayLayer(this)) {
             GJBaseGameLayer::handleButton(down, button, isPlayer1);
             return;
         }
 
-        if (mode == Mode::Play || mode == Mode::Record) {
-            if (applying > 0) {
-                GJBaseGameLayer::handleButton(down, button, isPlayer1);
-            }
+        if (applying > 0) {
+            GJBaseGameLayer::handleButton(down, button, isPlayer1);
             return;
         }
 
-        GJBaseGameLayer::handleButton(down, button, isPlayer1);
+        if (mode == Mode::Record) {
+            recordRawInput(button, down, isPlayer1, getCurrentTimestamp());
+            return;
+        }
+
+        // Mode::Play: реальный ввод игрока игнорируем
     }
 };
 
@@ -667,6 +677,7 @@ class $modify(BotPlayLayer, PlayLayer) {
     void onQuit() {
         bot::setTimeScale(1.0f);
         bot::restoreAudioPitch();
+        bot::resetEngine();
         PlayLayer::onQuit();
     }
 
@@ -759,6 +770,8 @@ class $modify(BotPauseLayer, PauseLayer) {
         ButtonSprite* m_playSprite = nullptr;
         ButtonSprite* m_fxSprite = nullptr;
         TextInput* m_nameInput = nullptr;
+        TextInput* m_speedInput = nullptr;
+        bool m_refreshScheduled = false;
     };
 
     void updateStatusUI() {
@@ -783,13 +796,16 @@ class $modify(BotPauseLayer, PauseLayer) {
         }
     }
 
-    // Вызывается через runAction на следующем кадре, чтобы не уничтожать
-    // кнопку, из колбэка которой был вызван этот метод
+    // Перестройка списка через runAction на следующем кадре, чтобы
+    // не уничтожать CCMenuItem из его собственного колбэка.
     void refreshMacroListDeferred() {
+        m_fields->m_refreshScheduled = false;
         this->refreshMacroList();
     }
 
     void scheduleRefreshMacroList() {
+        if (m_fields->m_refreshScheduled) return;
+        m_fields->m_refreshScheduled = true;
         this->runAction(CCSequence::createWithTwoActions(
             CCDelayTime::create(0.0f),
             CCCallFunc::create(this, callfunc_selector(BotPauseLayer::refreshMacroListDeferred))
@@ -803,6 +819,7 @@ class $modify(BotPauseLayer, PauseLayer) {
         std::vector<std::filesystem::path> files;
         std::error_code ec;
         for (auto const& entry : std::filesystem::directory_iterator(bot::getMacroDir(), ec)) {
+            if (ec) break;
             if (entry.is_regular_file() && entry.path().extension() == ".gdbot") {
                 files.push_back(entry.path());
             }
@@ -907,7 +924,7 @@ class $modify(BotPauseLayer, PauseLayer) {
             bot::setMode(bot::Mode::Record);
             this->updateStatusUI();
             Notification::create("Recording started", NotificationIcon::Info)->show();
-            this->onRestart(nullptr);
+            if (auto pl = PlayLayer::get()) pl->resetLevel();
         });
         recBtn->setPosition(panelW * 0.5f, panelH - 58.0f);
         modeMenu->addChild(recBtn);
@@ -921,7 +938,7 @@ class $modify(BotPauseLayer, PauseLayer) {
             bot::setMode(bot::Mode::Play);
             this->updateStatusUI();
             Notification::create("Playing...", NotificationIcon::Success)->show();
-            this->onRestart(nullptr);
+            if (auto pl = PlayLayer::get()) pl->resetLevel();
         });
         playBtn->setPosition(panelW * 0.8f, panelH - 58.0f);
         modeMenu->addChild(playBtn);
@@ -934,15 +951,16 @@ class $modify(BotPauseLayer, PauseLayer) {
         speedLbl->setPosition(10.0f, panelH - 84.0f);
         panelBg->addChild(speedLbl);
 
-        auto speedInput = TextInput::create(65.0f, "1.00", "chatFont.fnt");
-        speedInput->setFilter("0123456789.,");
-        speedInput->setScale(0.7f);
-        speedInput->setPosition(100.0f, panelH - 84.0f);
-        speedInput->setCallback([](std::string const& str) {
+        m_fields->m_speedInput = TextInput::create(65.0f, "1.00", "chatFont.fnt");
+        m_fields->m_speedInput->setFilter("0123456789.,");
+        m_fields->m_speedInput->setScale(0.7f);
+        m_fields->m_speedInput->setPosition(100.0f, panelH - 84.0f);
+        m_fields->m_speedInput->setCallback([](std::string const& str) {
             bot::recSpeed = bot::parseSpeedString(str);
+            if (auto mod = Mod::get()) mod->setSavedValue("recSpeed", bot::recSpeed);
         });
-        speedInput->setString(fmt::format("{:.2f}", bot::recSpeed));
-        panelBg->addChild(speedInput);
+        m_fields->m_speedInput->setString(fmt::format("{:.2f}", bot::recSpeed));
+        panelBg->addChild(m_fields->m_speedInput);
 
         auto fxMenu = CCMenu::create();
         fxMenu->setPosition(0.0f, 0.0f);
@@ -991,7 +1009,7 @@ class $modify(BotPauseLayer, PauseLayer) {
             bool existed = std::filesystem::exists(path);
 
             if (bot::saveMacro(path, bot::macro)) {
-                this->refreshMacroList();
+                this->scheduleRefreshMacroList();
                 Notification::create(
                     existed ? "Macro overwritten" : "Saved macro",
                     NotificationIcon::Success
