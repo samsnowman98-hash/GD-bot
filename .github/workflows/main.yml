@@ -40,6 +40,11 @@ jobs:
           combine: true
           target: ${{ matrix.config.target }}
 
+      # ВРЕМЕННЫЙ шаг: ищем, в каком классе объявлен pushButton
+      - name: Find pushButton
+        if: always() && startsWith(matrix.config.target, 'Android')
+        run: grep -rn "void pushButton" . --include=*.hpp | head -20 || true
+
   package:
     name: Package Mod
     needs: ['build']
