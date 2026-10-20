@@ -397,20 +397,35 @@ class $modify(BotScheduler, CCScheduler) {
 };
 
 // ---------------------------------------------------------------------------
-// Перехват нажатий: запись и блокировка ввода происходят в handleButton,
-// так как pushButton/releaseButton нет в GJBaseGameLayer этой версии bindings
+// Перехват нажатий: реальный ввод перехватывается в queueButton и не
+// попадает в обычный путь игры; применяется только через подшаговую
+// симуляцию в PlayerObject::update (см. applyInput + флаг applying)
 // ---------------------------------------------------------------------------
 class $modify(BotBaseGameLayer, GJBaseGameLayer) {
+    void queueButton(int button, bool push, bool isPlayer2, double timestamp) {
+        using namespace bot;
+        if (mode == Mode::Record && isPlayLayer(this)) {
+            recordRawInput(button, push, !isPlayer2, timestamp);
+            return;
+        }
+        if (mode == Mode::Play && isPlayLayer(this)) {
+            return;
+        }
+        GJBaseGameLayer::queueButton(button, push, isPlayer2, timestamp);
+    }
+
+    void processQueuedButtons(float dt, bool clearInputQueue) {
+        if (bot::mode != bot::Mode::Off && bot::isPlayLayer(this)) {
+            this->m_queuedButtons.clear();
+            return;
+        }
+        GJBaseGameLayer::processQueuedButtons(dt, clearInputQueue);
+    }
+
     void handleButton(bool down, int button, bool isPlayer1) {
         using namespace bot;
         if (mode == Mode::Off || silent > 0 || !isPlayLayer(this)) {
             GJBaseGameLayer::handleButton(down, button, isPlayer1);
-            return;
-        }
-
-        // Человеческий ввод в режиме записи сохраняем, но не применяем сразу
-        if (mode == Mode::Record && applying == 0) {
-            recordRawInput(button, down, isPlayer1, getCurrentTimestamp());
             return;
         }
 
@@ -422,14 +437,6 @@ class $modify(BotBaseGameLayer, GJBaseGameLayer) {
         }
 
         GJBaseGameLayer::handleButton(down, button, isPlayer1);
-    }
-
-    void processCommands(float dt, bool isHalfTick, bool isLastTick) {
-        if (bot::mode != bot::Mode::Off && bot::isPlayLayer(this)) {
-            this->m_queuedButtons.clear();
-            return;
-        }
-        GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
     }
 };
 
