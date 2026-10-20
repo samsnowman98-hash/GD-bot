@@ -9,7 +9,6 @@
 #include <Geode/modify/CCCircleWave.hpp>
 #include <Geode/modify/GameManager.hpp>
 #include <Geode/modify/GameStatsManager.hpp>
-#include <Geode/modify/GJGarageLayer.hpp>
 #include <Geode/modify/MenuLayer.hpp>
 #include <Geode/ui/ScrollLayer.hpp>
 #include <Geode/ui/TextInput.hpp>
@@ -32,126 +31,8 @@
 using namespace geode::prelude;
 
 // ---------------------------------------------------------------------------
-// Безопасное сохранение и восстановление третьего цвета и свечения
-// ---------------------------------------------------------------------------
-template <typename GM>
-inline void saveColor3IfAvailable(GM* gm, Mod* mod) {
-    if constexpr (requires { gm->m_playerColor3; }) {
-        if (gm->m_playerColor3 >= 0) mod->setSavedValue("saved_color3", static_cast<int>(gm->m_playerColor3));
-    }
-    else if constexpr (requires { gm->m_playerGlowColor; }) {
-        if (gm->m_playerGlowColor >= 0) mod->setSavedValue("saved_color3", static_cast<int>(gm->m_playerGlowColor));
-    }
-    else if constexpr (requires { gm->m_playerColorGlow; }) {
-        if (gm->m_playerColorGlow >= 0) mod->setSavedValue("saved_color3", static_cast<int>(gm->m_playerColorGlow));
-    }
-}
-
-template <typename GM>
-inline void restoreColor3IfAvailable(GM* gm, int col3) {
-    if (col3 < 0) return;
-    if constexpr (requires { gm->m_playerColor3 = col3; }) {
-        gm->m_playerColor3 = col3;
-    }
-    else if constexpr (requires { gm->m_playerGlowColor = col3; }) {
-        gm->m_playerGlowColor = col3;
-    }
-    else if constexpr (requires { gm->m_playerColorGlow = col3; }) {
-        gm->m_playerColorGlow = col3;
-    }
-}
-
-template <typename GM>
-inline void saveGlowIfAvailable(GM* gm, Mod* mod) {
-    if constexpr (requires { gm->m_playerGlow; }) {
-        mod->setSavedValue("saved_glow", static_cast<bool>(gm->m_playerGlow));
-    }
-}
-
-template <typename GM>
-inline void restoreGlowIfAvailable(GM* gm, Mod* mod) {
-    if constexpr (requires { gm->m_playerGlow; }) {
-        if (mod->hasSavedValue("saved_glow")) {
-            gm->m_playerGlow = mod->getSavedValue<bool>("saved_glow");
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Сохранение и восстановление иконок/цветов
-// ---------------------------------------------------------------------------
-inline void saveCustomIcons() {
-    auto gm = GameManager::sharedState();
-    if (!gm) return;
-    auto mod = Mod::get();
-    if (gm->m_playerFrame > 0) mod->setSavedValue("saved_frame", static_cast<int>(gm->m_playerFrame));
-    if (gm->m_playerShip > 0) mod->setSavedValue("saved_ship", static_cast<int>(gm->m_playerShip));
-    if (gm->m_playerBall > 0) mod->setSavedValue("saved_ball", static_cast<int>(gm->m_playerBall));
-    if (gm->m_playerBird > 0) mod->setSavedValue("saved_bird", static_cast<int>(gm->m_playerBird));
-    if (gm->m_playerDart > 0) mod->setSavedValue("saved_dart", static_cast<int>(gm->m_playerDart));
-    if (gm->m_playerRobot > 0) mod->setSavedValue("saved_robot", static_cast<int>(gm->m_playerRobot));
-    if (gm->m_playerSpider > 0) mod->setSavedValue("saved_spider", static_cast<int>(gm->m_playerSpider));
-    if (gm->m_playerSwing > 0) mod->setSavedValue("saved_swing", static_cast<int>(gm->m_playerSwing));
-    if (gm->m_playerJetpack > 0) mod->setSavedValue("saved_jetpack", static_cast<int>(gm->m_playerJetpack));
-    if (gm->m_playerDeathEffect > 0) mod->setSavedValue("saved_deathEffect", static_cast<int>(gm->m_playerDeathEffect));
-    if (gm->m_playerStreak > 0) mod->setSavedValue("saved_streak", static_cast<int>(gm->m_playerStreak));
-    if (gm->m_playerColor >= 0) mod->setSavedValue("saved_color1", static_cast<int>(gm->m_playerColor));
-    if (gm->m_playerColor2 >= 0) mod->setSavedValue("saved_color2", static_cast<int>(gm->m_playerColor2));
-    saveColor3IfAvailable(gm, mod);
-    saveGlowIfAvailable(gm, mod);
-}
-
-inline void restoreCustomIcons() {
-    auto gm = GameManager::sharedState();
-    if (!gm) return;
-    auto mod = Mod::get();
-
-    int frame = mod->getSavedValue<int>("saved_frame", -1);
-    if (frame > 0) gm->m_playerFrame = frame;
-
-    int ship = mod->getSavedValue<int>("saved_ship", -1);
-    if (ship > 0) gm->m_playerShip = ship;
-
-    int ball = mod->getSavedValue<int>("saved_ball", -1);
-    if (ball > 0) gm->m_playerBall = ball;
-
-    int bird = mod->getSavedValue<int>("saved_bird", -1);
-    if (bird > 0) gm->m_playerBird = bird;
-
-    int dart = mod->getSavedValue<int>("saved_dart", -1);
-    if (dart > 0) gm->m_playerDart = dart;
-
-    int robot = mod->getSavedValue<int>("saved_robot", -1);
-    if (robot > 0) gm->m_playerRobot = robot;
-
-    int spider = mod->getSavedValue<int>("saved_spider", -1);
-    if (spider > 0) gm->m_playerSpider = spider;
-
-    int swing = mod->getSavedValue<int>("saved_swing", -1);
-    if (swing > 0) gm->m_playerSwing = swing;
-
-    int jetpack = mod->getSavedValue<int>("saved_jetpack", -1);
-    if (jetpack > 0) gm->m_playerJetpack = jetpack;
-
-    int death = mod->getSavedValue<int>("saved_deathEffect", -1);
-    if (death > 0) gm->m_playerDeathEffect = death;
-
-    int streak = mod->getSavedValue<int>("saved_streak", -1);
-    if (streak > 0) gm->m_playerStreak = streak;
-
-    int col1 = mod->getSavedValue<int>("saved_color1", -1);
-    if (col1 >= 0) gm->m_playerColor = col1;
-
-    int col2 = mod->getSavedValue<int>("saved_color2", -1);
-    if (col2 >= 0) gm->m_playerColor2 = col2;
-
-    int col3 = mod->getSavedValue<int>("saved_color3", -1);
-    restoreColor3IfAvailable(gm, col3);
-    restoreGlowIfAvailable(gm, mod);
-}
-
-// ---------------------------------------------------------------------------
-// Разблокировка предметов
+// Разблокировка предметов (иконки и цвета остаются под управлением игры,
+// сохранение не модифицируется, чтобы не портить пользовательский save)
 // ---------------------------------------------------------------------------
 class $modify(BotGameManager, GameManager) {
     bool isIconUnlocked(int id, IconType type) {
@@ -161,21 +42,6 @@ class $modify(BotGameManager, GameManager) {
     bool isColorUnlocked(int id, UnlockType type) {
         return true;
     }
-
-    void dataLoaded(DS_Dictionary* dict) {
-        GameManager::dataLoaded(dict);
-        restoreCustomIcons();
-    }
-
-    void firstLoad() {
-        GameManager::firstLoad();
-        restoreCustomIcons();
-    }
-
-    void save() {
-        saveCustomIcons();
-        GameManager::save();
-    }
 };
 
 class $modify(BotGameStatsManager, GameStatsManager) {
@@ -184,33 +50,16 @@ class $modify(BotGameStatsManager, GameStatsManager) {
     }
 };
 
-class $modify(BotGarageLayer, GJGarageLayer) {
-    bool init() {
-        restoreCustomIcons();
-        return GJGarageLayer::init();
-    }
-
-    void onSelectTab(cocos2d::CCObject* sender) {
-        saveCustomIcons();
-        GJGarageLayer::onSelectTab(sender);
-    }
-
-    void onBack(cocos2d::CCObject* sender) {
-        saveCustomIcons();
-        GameManager::sharedState()->save();
-        GJGarageLayer::onBack(sender);
-    }
-
-    ~BotGarageLayer() {
-        saveCustomIcons();
-        GameManager::sharedState()->save();
-    }
-};
-
+// ---------------------------------------------------------------------------
+// Меню: загрузка настроек мода (безопасно, уже после инициализации Mod)
+// ---------------------------------------------------------------------------
 class $modify(BotMenuLayer, MenuLayer) {
     bool init() {
-        restoreCustomIcons();
-        return MenuLayer::init();
+        if (!MenuLayer::init()) return false;
+        if (auto mod = Mod::get()) {
+            bot::disableDeathEffects = mod->getSavedValue<bool>("disableDeathEffects", true);
+        }
+        return true;
     }
 };
 
@@ -255,7 +104,8 @@ namespace bot {
     inline double recSpeed = 1.0;
     inline float appliedScale = 1.0f;
 
-    inline bool disableDeathEffects = Mod::get()->getSavedValue<bool>("disableDeathEffects", true);
+    // Значение по умолчанию; реальное значение подгружается в BotMenuLayer::init()
+    inline bool disableDeathEffects = true;
 
     inline std::vector<RawInput> pendingRecordInputs;
     inline double g_stepStartTime = 0.0;
@@ -674,7 +524,7 @@ class $modify(BotPlayerObject, PlayerObject) {
                     s.button = in.button;
                     s.push = in.push;
                     s.p1 = in.p1;
-                    
+
                     double rel = in.timestamp - stepStartTime;
                     s.frac = std::clamp(rel / stepDuration, 0.0, 0.9999);
                     subs.push_back(s);
@@ -798,8 +648,6 @@ class $modify(BotPlayerObject, PlayerObject) {
 // ---------------------------------------------------------------------------
 class $modify(BotPlayLayer, PlayLayer) {
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
-        restoreCustomIcons();
-
         bot::mode = bot::Mode::Off;
         bot::step = 0;
         bot::playIndex = 0;
@@ -808,6 +656,10 @@ class $modify(BotPlayLayer, PlayLayer) {
         bot::restoreAudioPitch();
 
         if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
+
+        if (auto mod = Mod::get()) {
+            bot::disableDeathEffects = mod->getSavedValue<bool>("disableDeathEffects", true);
+        }
 
         bot::applyClickFlags();
 
@@ -936,6 +788,19 @@ class $modify(BotPauseLayer, PauseLayer) {
         }
     }
 
+    // Вызывается через runAction на следующем кадре, чтобы не уничтожать
+    // кнопку, из колбэка которой был вызван этот метод
+    void refreshMacroListDeferred() {
+        this->refreshMacroList();
+    }
+
+    void scheduleRefreshMacroList() {
+        this->runAction(CCSequence::createWithTwoActions(
+            CCDelayTime::create(0.0f),
+            CCCallFunc::create(this, callfunc_selector(BotPauseLayer::refreshMacroListDeferred))
+        ));
+    }
+
     void refreshMacroList() {
         if (!m_fields->m_fileListContainer) return;
         m_fields->m_fileListContainer->removeAllChildren();
@@ -994,7 +859,8 @@ class $modify(BotPauseLayer, PauseLayer) {
             auto delBtn = CCMenuItemExt::createSpriteExtra(delSpr, [this, path](CCObject*) {
                 std::error_code ec2;
                 std::filesystem::remove(path, ec2);
-                this->refreshMacroList();
+                // Не перестраиваем список прямо здесь: кнопка сейчас выполняет свой колбэк
+                this->scheduleRefreshMacroList();
                 Notification::create("Macro deleted", NotificationIcon::Info)->show();
             });
             delBtn->setPosition(145.0f, y + rowH / 2.0f);
