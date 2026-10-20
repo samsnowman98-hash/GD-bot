@@ -40,16 +40,23 @@ jobs:
           combine: true
           target: ${{ matrix.config.target }}
 
-      # ВРЕМЕННЫЙ шаг: ищем, в каком классе объявлен pushButton
-      - name: Find pushButton
+      # ВРЕМЕННЫЙ диагностический шаг
+      - name: Find input methods
         if: always() && startsWith(matrix.config.target, 'Android')
         run: |
-          echo "=== SDK ==="
-          grep -rn "pushButton" "$GEODE_SDK" --include=*.hpp || echo "no match in SDK"
-          echo "=== bindings ==="
-          grep -rn "pushButton" /home/runner/work/GD-bot/GD-bot/build --include=*.hpp || echo "no match in build"
-          echo "=== cpm ==="
-          grep -rln "pushButton" /home/runner/work/GD-bot/GD-bot/cpm-cache --include=*.hpp || echo "no match in cpm"
+          FILE=/home/runner/work/GD-bot/GD-bot/build/bindings/bindings/Geode/binding/GJBaseGameLayer.hpp
+          if [ -f "$FILE" ]; then
+            echo "=== handleButton ==="
+            grep -n "handleButton" "$FILE" || echo none
+            echo "=== queueButton / QueuedButton / m_queuedButtons ==="
+            grep -n "queueButton\|QueuedButton\|m_queuedButtons" "$FILE" || echo none
+            echo "=== all lines containing 'button' (case-insensitive) ==="
+            grep -ni "button" "$FILE"
+          else
+            echo "File not found: $FILE"
+            echo "Searching for GJBaseGameLayer.hpp anywhere under build/..."
+            find /home/runner/work/GD-bot/GD-bot/build -iname "GJBaseGameLayer.hpp"
+          fi
 
   package:
     name: Package Mod
