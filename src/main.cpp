@@ -1,9 +1,4 @@
 // CBF-style TAS bot for Geometry Dash 2.2081 / Geode 5.x (Android & PC)
-//
-// Ключевая идея CBF: реальный ввод перехватывается ДО того, как игра
-// положит его в очередь тика (m_queuedButtons), а применяется внутри шага
-// через субтиковую симуляцию в PlayerObject::update. Это даёт точность
-// меньше одного тика и в записи, и в воспроизведении.
 
 #include <Geode/Geode.hpp>
 #include <Geode/modify/PlayLayer.hpp>
@@ -38,7 +33,7 @@
 using namespace geode::prelude;
 
 // ---------------------------------------------------------------------------
-// Разблокировка предметов (сохранение игры не модифицируется)
+// Разблокировка предметов
 // ---------------------------------------------------------------------------
 class $modify(BotGameManager, GameManager) {
     bool isIconUnlocked(int id, IconType type) { return true; }
@@ -49,9 +44,6 @@ class $modify(BotGameStatsManager, GameStatsManager) {
     bool isItemUnlocked(UnlockType type, int id) { return true; }
 };
 
-// ---------------------------------------------------------------------------
-// Общее состояние настроек (объявлено до хуков)
-// ---------------------------------------------------------------------------
 namespace bot {
     inline bool disableDeathEffects = true;
 }
@@ -130,6 +122,17 @@ namespace bot {
         return pl && static_cast<GJBaseGameLayer*>(pl) == l;
     }
 
+    inline bool recordingActive() {
+        if (mode != Mode::Record) return false;
+        auto pl = PlayLayer::get();
+        if (!pl || pl->m_playerDied) return false;
+        auto par = pl->getParent();
+        if (!par) return false;
+        if (par->getChildByType<PauseLayer>(0)) return false;
+        if (pl->getChildByType<EndLevelLayer>(0)) return false;
+        return true;
+    }
+
     inline void restoreAudioPitch() {
         auto fae = FMODAudioEngine::sharedEngine();
         if (!fae || !fae->m_backgroundMusicChannel) return;
@@ -162,10 +165,6 @@ namespace bot {
         rotationDelta = 0.f;
     }
 
-    // ВАЖНО: в Record выключаем clickBetweenSteps. Очередь тика нам не нужна —
-    // клики приходят из диспетчера ввода и применяются субтиково вручную.
-    // Если оставить true, игра сама дренирует очередь на границах шага,
-    // и время клика квантуется до TPS.
     inline void applyClickFlags() {
         auto pl = PlayLayer::get();
         if (!pl) return;
@@ -389,12 +388,6 @@ namespace bot {
         }
     }
 
-    // -----------------------------------------------------------------------
-    // Маппинг клавиш / тача в кнопки игрока.
-    // По умолчанию в GD: Space и стрелка вверх — прыжок P1, стрелка вниз —
-    // P2 (в двойном режиме). Игроки переназначают клавиши в настройках,
-    // поэтому при необходимости добавьте свои комбинации.
-    // -----------------------------------------------------------------------
     inline int keyToButtonPC(enumKeyCodes key, bool& outP1) {
         switch (key) {
             case KEY_Space: outP1 = true;  return 1;
@@ -437,43 +430,43 @@ class $modify(BotScheduler, CCScheduler) {
 };
 
 // ---------------------------------------------------------------------------
-// ПЕРЕХВАТ ВВОДА (PC/Android). Стоит ВЫШЕ handleButton, поэтому время
-// нажатия ещё не квантовано тиком. Именно этого не хватало для CBF.
+// Перехват клавиатуры (PC).
+// В 2.2081 игра сама передаёт таймстемп нажатия 4-м параметром —
+// это и есть CBF-точное время, до всех очередей.
 // ---------------------------------------------------------------------------
 class $modify(BotKeyboardDispatcher, CCKeyboardDispatcher) {
-    bool dispatchKeyboardMSG(enumKeyCodes key, bool down, bool isKeyRepeat) {
+    bool dispatchKeyboardMSG(enumKeyCodes key, bool isKeyDown, bool isKeyRepeat, double timestamp) {
         using namespace bot;
 
         if (mode == Mode::Record && !isKeyRepeat && bot::recordingActive()) {
             bool p1 = true;
             int btn = keyToButtonPC(key, p1);
             if (btn > 0) {
-                recordRawInput(btn, down, p1, getCurrentTimestamp());
-                return true; // поглотить: в игру не пускаем
+                recordRawInput(btn, isKeyDown, p1, timestamp);
+                return true;
             }
         }
-        return CCKeyboardDispatcher::dispatchKeyboardMSG(key, down, isKeyRepeat);
+        return CCKeyboardDispatcher::dispatchKeyboardMSG(key, isKeyDown, isKeyRepeat, timestamp);
     }
 };
 
-// Тач-ввод-фокусированная часть: работает и на Android, и на PC с тач-экраном.
-// Хук CCTouchDispatcher, а не PlayLayer::ccTouchBegan: там уже могут быть
-// игровые задержки. CCTouchDispatcher — самая ранняя из доступных точек.
+// ---------------------------------------------------------------------------
+// Перехват тача (Android). Стоит выше handleButton.
+// ---------------------------------------------------------------------------
 class $modify(BotTouchDispatcher, CCTouchDispatcher) {
     void touchesBegan(CCSet* touches, CCEvent* event) {
         using namespace bot;
         if (mode == Mode::Record && bot::recordingActive()) {
-            auto pl = PlayLayer::get();
             auto win = CCDirector::sharedDirector()->getWinSize();
             for (auto* obj : *touches) {
                 auto touch = static_cast<CCTouch*>(obj);
                 auto loc = touch->getLocation();
-                if (loc.y < win.height * 0.15f) continue; // панель UI снизу — пропускаем
+                if (loc.y < win.height * 0.15f) continue;
                 bool p1 = true;
                 int btn = touchToButton(loc.x, win.width, p1);
                 recordRawInput(btn, true, p1, getCurrentTimestamp());
             }
-            return; // в игру тач не пускаем
+            return;
         }
         CCTouchDispatcher::touchesBegan(touches, event);
     }
@@ -497,9 +490,7 @@ class $modify(BotTouchDispatcher, CCTouchDispatcher) {
 };
 
 // ---------------------------------------------------------------------------
-// Применение ввода в субтиковый момент. Реальные нажатия сюда уже не
-// доходят — они поглощены диспетчерами выше. handleButton остаётся
-// для silentReleaseAll и applyInput (флаг applying).
+// Применение ввода. Реальные нажатия сюда не доходят.
 // ---------------------------------------------------------------------------
 class $modify(BotBaseGameLayer, GJBaseGameLayer) {
     void handleButton(bool down, int button, bool isPlayer1) {
@@ -509,19 +500,15 @@ class $modify(BotBaseGameLayer, GJBaseGameLayer) {
             GJBaseGameLayer::handleButton(down, button, isPlayer1);
             return;
         }
-
         if (applying > 0) {
             GJBaseGameLayer::handleButton(down, button, isPlayer1);
             return;
         }
-
-        // Mode::Record / Mode::Play: реальные нажатия перехвачены выше,
-        // сюда попадают только внутренние вызовы — не пропускаем.
     }
 };
 
 // ---------------------------------------------------------------------------
-// Нарезка подтиков игрока (движок CBF)
+// Субтиковая симуляция
 // ---------------------------------------------------------------------------
 class $modify(BotPlayerObject, PlayerObject) {
     void playSpawnEffect() {
@@ -817,7 +804,7 @@ class $modify(BotPlayLayer, PlayLayer) {
 };
 
 // ---------------------------------------------------------------------------
-// Интерфейс меню паузы
+// Меню паузы
 // ---------------------------------------------------------------------------
 class $modify(BotPauseLayer, PauseLayer) {
     struct Fields {
@@ -851,7 +838,7 @@ class $modify(BotPauseLayer, PauseLayer) {
         this->refreshMacroList();
     }
 
-        void scheduleRefreshMacroList() {
+    void scheduleRefreshMacroList() {
         if (m_fields->m_refreshScheduled) return;
         m_fields->m_refreshScheduled = true;
         this->runAction(CCSequence::createWithTwoActions(
@@ -886,7 +873,7 @@ class $modify(BotPauseLayer, PauseLayer) {
 
         auto rowMenu = CCMenu::create();
         rowMenu->setPosition(0.0f, 0.0f);
-        rowMenu->setContentSize(CCSize{ viewW, totalH });
+                rowMenu->setContentSize(CCSize{ viewW, totalH });
         scroll->m_contentLayer->addChild(rowMenu);
 
         for (size_t i = 0; i < files.size(); ++i) {
