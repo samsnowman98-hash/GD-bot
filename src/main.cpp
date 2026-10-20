@@ -1,5 +1,4 @@
 // CBF-style TAS bot for Geometry Dash 2.2081 / Geode 5.x (Android & PC)
-// Исправлены: сигнатура queueButton (4 аргумента), 100k+ TPS саб-тики на любых скоростях (включая 0.01x), сброс иконок и чекпоинты.
 
 #include <Geode/Geode.hpp>
 #include <Geode/modify/PlayLayer.hpp>
@@ -33,7 +32,7 @@
 using namespace geode::prelude;
 
 // ---------------------------------------------------------------------------
-// Безопасное сохранение и восстановление третьего цвета и свечения через C++20 concepts
+// Безопасное сохранение и восстановление третьего цвета и свечения
 // ---------------------------------------------------------------------------
 template <typename GM>
 inline void saveColor3IfAvailable(GM* gm, Mod* mod) {
@@ -79,7 +78,7 @@ inline void restoreGlowIfAvailable(GM* gm, Mod* mod) {
 }
 
 // ---------------------------------------------------------------------------
-// Сохранение и восстановление иконок/цветов (обход сброса GD 2.2 verifyLoadedDatabase)
+// Сохранение и восстановление иконок/цветов
 // ---------------------------------------------------------------------------
 inline void saveCustomIcons() {
     auto gm = GameManager::sharedState();
@@ -152,7 +151,7 @@ inline void restoreCustomIcons() {
 }
 
 // ---------------------------------------------------------------------------
-// Разблокировка всех предметов и сохранение
+// Разблокировка предметов
 // ---------------------------------------------------------------------------
 class $modify(BotGameManager, GameManager) {
     bool isIconUnlocked(int id, IconType type) {
@@ -193,7 +192,6 @@ class $modify(BotGarageLayer, GJGarageLayer) {
 
     void onSelectTab(cocos2d::CCObject* sender) {
         saveCustomIcons();
-        GameManager::sharedState()->save();
         GJGarageLayer::onSelectTab(sender);
     }
 
@@ -223,8 +221,8 @@ namespace bot {
     enum class Mode { Off, Record, Play };
 
     struct Action {
-        uint32_t step = 0;   // номер физического шага от старта попытки
-        double frac = 0.0;   // субтиковая доля внутри шага [0..1)
+        uint32_t step = 0;
+        double frac = 0.0;
         uint8_t button = 1;
         bool down = false;
         bool p1 = true;
@@ -244,7 +242,6 @@ namespace bot {
         double timestamp = 0.0;
     };
 
-    // ---- состояние бота ----
     inline Mode mode = Mode::Off;
     inline std::vector<Action> macro;
     inline uint32_t step = 0;
@@ -260,7 +257,6 @@ namespace bot {
 
     inline bool disableDeathEffects = Mod::get()->getSavedValue<bool>("disableDeathEffects", true);
 
-    // ---- непрерывная субтиковая шкала CBF ----
     inline std::vector<RawInput> pendingRecordInputs;
     inline double g_stepStartTime = 0.0;
 
@@ -306,7 +302,7 @@ namespace bot {
 
     inline void resetEngine() {
         pendingRecordInputs.clear();
-        g_stepStartTime = getCurrentTimestamp();
+        g_stepStartTime = 0.0;
         inputThisStep = false;
         p1Split = false;
         p2Split = false;
@@ -333,7 +329,7 @@ namespace bot {
 
     inline void setTimeScale(float s) {
         if (std::fabs(s - appliedScale) < 1e-6f) return;
-        g_stepStartTime = getCurrentTimestamp();
+        g_stepStartTime = 0.0;
         appliedScale = s;
         CCDirector::sharedDirector()->getScheduler()->setTimeScale(s);
         updateAudioPitch();
@@ -502,16 +498,6 @@ namespace bot {
             if (held[b][1]) pl->handleButton(true, b, false);
         }
         --silent;
-
-        // Убираем ложный буфер прыжка куба/робота/паука при загрузке чекпоинта в воздухе
-        if (pl->m_player1 && !pl->m_player1->m_isOnGround &&
-            !pl->m_player1->m_isShip && !pl->m_player1->m_isBird && !pl->m_player1->m_isDart && !pl->m_player1->m_isSwing) {
-            pl->m_player1->m_jumpBuffered = false;
-        }
-        if (pl->m_player2 && !pl->m_player2->m_isOnGround &&
-            !pl->m_player2->m_isShip && !pl->m_player2->m_isBird && !pl->m_player2->m_isDart && !pl->m_player2->m_isSwing) {
-            pl->m_player2->m_jumpBuffered = false;
-        }
     }
 
     inline void onFrameStart() {
@@ -528,30 +514,18 @@ namespace bot {
 
         if (idle) {
             pendingRecordInputs.clear();
-            g_stepStartTime = getCurrentTimestamp();
+            g_stepStartTime = 0.0;
         }
-    }
-
-    inline void clearCollisionLog(PlayerObject* p) {
-        if (!p) return;
-        p->m_collisionLogTop->removeAllObjects();
-        p->m_collisionLogBottom->removeAllObjects();
-        p->m_collisionLogLeft->removeAllObjects();
-        p->m_collisionLogRight->removeAllObjects();
-        p->m_lastCollisionLeft = -1;
-        p->m_lastCollisionRight = -1;
-        p->m_lastCollisionBottom = -1;
-        p->m_lastCollisionTop = -1;
     }
 }
 
 // ---------------------------------------------------------------------------
-// Глушение ударной волны смерти
+// Эффект волны смерти
 // ---------------------------------------------------------------------------
 class $modify(BotCircleWave, CCCircleWave) {
     void update(float dt) {
         if (bot::disableDeathEffects && bot::mode != bot::Mode::Off) {
-            this->removeFromParentAndCleanup(true);
+            this->setVisible(false);
             return;
         }
         CCCircleWave::update(dt);
@@ -559,7 +533,7 @@ class $modify(BotCircleWave, CCCircleWave) {
 };
 
 // ---------------------------------------------------------------------------
-// Контроллер времени кадра и аудио-синхронизации
+// Контроллер планировщика
 // ---------------------------------------------------------------------------
 class $modify(BotScheduler, CCScheduler) {
     void update(float dt) {
@@ -570,13 +544,13 @@ class $modify(BotScheduler, CCScheduler) {
 };
 
 // ---------------------------------------------------------------------------
-// Прямой высокоточный перехват аппаратного ввода в GD 2.2081 (Windows / Android)
+// Перехват нажатий
 // ---------------------------------------------------------------------------
 class $modify(BotBaseGameLayer, GJBaseGameLayer) {
     void queueButton(int button, bool push, bool isPlayer2, double timestamp) {
         if (bot::mode == bot::Mode::Record && bot::isPlayLayer(this)) {
-            double const now = (timestamp > 1.0) ? timestamp : bot::getCurrentTimestamp();
-            bot::recordRawInput(button, push, !isPlayer2, now);
+            // Всегда используем точный монотонный таймер мода
+            bot::recordRawInput(button, push, !isPlayer2, bot::getCurrentTimestamp());
             return;
         }
         if (bot::mode == bot::Mode::Play && bot::isPlayLayer(this)) {
@@ -612,7 +586,7 @@ class $modify(BotBaseGameLayer, GJBaseGameLayer) {
 };
 
 // ---------------------------------------------------------------------------
-// Потоковая подтиковая нарезка шагов с мульти-сплитом (100k+ TPS)
+// Нарезка подтиков игрока
 // ---------------------------------------------------------------------------
 class $modify(BotPlayerObject, PlayerObject) {
     void playSpawnEffect() {
@@ -663,8 +637,8 @@ class $modify(BotPlayerObject, PlayerObject) {
         double const stepDuration = static_cast<double>(stepDelta) / static_cast<double>(scale);
         double const now = getCurrentTimestamp();
 
-        // Защита от фазового дрейфа шкалы при смене FPS или системных лагах
-        if (g_stepStartTime <= 0.0 || std::abs(now - g_stepStartTime) > 3.0) {
+        // Синхронизация времени шага без накопления задержки
+        if (g_stepStartTime <= 0.0 || (now - g_stepStartTime) > (stepDuration * 4.0) || g_stepStartTime > now) {
             g_stepStartTime = now - stepDuration;
         }
 
@@ -685,13 +659,14 @@ class $modify(BotPlayerObject, PlayerObject) {
         else { // Record
             std::vector<RawInput> remaining;
             for (auto const& in : pendingRecordInputs) {
-                if (in.timestamp <= stepEndTime || (remaining.empty() && in.timestamp < stepStartTime)) {
+                if (in.timestamp <= stepEndTime) {
                     StepSub s;
                     s.button = in.button;
                     s.push = in.push;
                     s.p1 = in.p1;
+                    
                     double rel = in.timestamp - stepStartTime;
-                    s.frac = std::clamp(rel / stepDuration, 0.0001, 0.9999);
+                    s.frac = std::clamp(rel / stepDuration, 0.0, 0.9999);
                     subs.push_back(s);
 
                     Action a;
@@ -715,17 +690,16 @@ class $modify(BotPlayerObject, PlayerObject) {
             p1Split = false;
             p2Split = false;
             PlayerObject::update(stepDelta);
-            g_stepStartTime += stepDuration;
+            g_stepStartTime = stepEndTime;
             ++step;
             return;
         }
 
-        // Сортировка действий внутри шага по субтиковому времени
         std::stable_sort(subs.begin(), subs.end(), [](auto const& a, auto const& b) {
             return a.frac < b.frac;
         });
 
-        // Гарантируем строго положительную дельту между кликами внутри одного тика (100k+ TPS)
+        // Разделяем одновременные нажатия с минимальным смещением
         for (size_t i = 1; i < subs.size(); ++i) {
             if (subs[i].frac <= subs[i - 1].frac + 1e-5) {
                 subs[i].frac = std::min(0.9999, subs[i - 1].frac + 1e-5);
@@ -755,18 +729,14 @@ class $modify(BotPlayerObject, PlayerObject) {
             if (substepDelta > 1e-9f) {
                 PlayerObject::update(substepDelta);
                 if (i == 0 && ((this->m_yVelocity < 0) ^ this->m_isUpsideDown)) this->m_isOnGround = p1StartedOnGround;
-                if (!this->m_isOnSlope || this->m_isDart) pl->checkCollisions(this, 0.0f, true);
-                else pl->checkCollisions(this, stepDelta, true);
+                pl->checkCollisions(this, substepDelta, true);
                 PlayerObject::updateRotation(substepDelta);
-                bot::clearCollisionLog(this);
 
                 if (p2Split && p2) {
                     p2->update(substepDelta);
                     if (i == 0 && ((p2->m_yVelocity < 0) ^ p2->m_isUpsideDown)) p2->m_isOnGround = p2StartedOnGround;
-                    if (!p2->m_isOnSlope || p2->m_isDart) pl->checkCollisions(p2, 0.0f, true);
-                    else pl->checkCollisions(p2, stepDelta, true);
+                    pl->checkCollisions(p2, substepDelta, true);
                     p2->updateRotation(substepDelta);
-                    bot::clearCollisionLog(p2);
                 }
             }
 
@@ -774,29 +744,24 @@ class $modify(BotPlayerObject, PlayerObject) {
             lastFrac = s.frac;
         }
 
-        // Оставшаяся часть шага после последнего саб-клика
         double remainingFactor = std::max(0.0, 1.0 - lastFrac);
         float remainingDelta = static_cast<float>(stepDelta * remainingFactor);
         rotationDelta = remainingDelta;
 
         if (remainingDelta > 1e-9f) {
             PlayerObject::update(remainingDelta);
-            if (!this->m_isOnSlope || this->m_isDart) pl->checkCollisions(this, 0.0f, true);
-            else pl->checkCollisions(this, stepDelta, true);
+            pl->checkCollisions(this, remainingDelta, true);
             PlayerObject::updateRotation(remainingDelta);
-            bot::clearCollisionLog(this);
 
             if (p2Split && p2) {
                 p2->update(remainingDelta);
-                if (!p2->m_isOnSlope || p2->m_isDart) pl->checkCollisions(p2, 0.0f, true);
-                else pl->checkCollisions(p2, stepDelta, true);
+                pl->checkCollisions(p2, remainingDelta, true);
                 p2->updateRotation(remainingDelta);
-                bot::clearCollisionLog(p2);
             }
         }
 
         midStep = false;
-        g_stepStartTime += stepDuration;
+        g_stepStartTime = stepEndTime;
         ++step;
     }
 
@@ -819,7 +784,7 @@ class $modify(BotPlayerObject, PlayerObject) {
 };
 
 // ---------------------------------------------------------------------------
-// Уровень, чекпоинты, рестарты, эффекты смерти
+// Контроллер уровня и чекпоинтов
 // ---------------------------------------------------------------------------
 class $modify(BotPlayLayer, PlayLayer) {
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
@@ -893,7 +858,7 @@ class $modify(BotPlayLayer, PlayLayer) {
         }
 
         bot::step = it->second;
-        bot::g_stepStartTime = bot::getCurrentTimestamp();
+        bot::g_stepStartTime = 0.0;
         bot::pendingRecordInputs.clear();
 
         if (bot::mode == bot::Mode::Record) {
@@ -921,15 +886,7 @@ class $modify(BotPlayLayer, PlayLayer) {
     }
 
     void destroyPlayer(PlayerObject* player, GameObject* object) {
-        if (!bot::disableDeathEffects || bot::mode == bot::Mode::Off) {
-            PlayLayer::destroyPlayer(player, object);
-            return;
-        }
-
-        auto myPos = this->getPosition();
         PlayLayer::destroyPlayer(player, object);
-        this->stopAllActions();
-        this->setPosition(myPos);
     }
 };
 
@@ -992,24 +949,23 @@ class $modify(BotPauseLayer, PauseLayer) {
         auto scroll = ScrollLayer::create(CCSize{ viewW, viewH });
         scroll->m_contentLayer->setContentSize(CCSize{ viewW, totalH });
 
+        // Единое меню для всех кнопок строк списка
+        auto rowMenu = CCMenu::create();
+        rowMenu->setPosition(0.0f, 0.0f);
+        rowMenu->setContentSize(CCSize{ viewW, totalH });
+        scroll->m_contentLayer->addChild(rowMenu);
+
         for (size_t i = 0; i < files.size(); ++i) {
             auto path = files[i];
             float y = totalH - static_cast<float>(i + 1) * rowH;
-
-            auto rowNode = CCNode::create();
-            rowNode->setPosition(0.0f, y);
-            rowNode->setContentSize(CCSize{ viewW, rowH });
 
             std::string name = path.stem().string();
             if (name.length() > 14) name = name.substr(0, 12) + "..";
             auto lbl = CCLabelBMFont::create(name.c_str(), "chatFont.fnt");
             lbl->setScale(0.4f);
             lbl->setAnchorPoint(CCPoint{ 0.0f, 0.5f });
-            lbl->setPosition(4.0f, rowH / 2.0f);
-            rowNode->addChild(lbl);
-
-            auto rowMenu = CCMenu::create();
-            rowMenu->setPosition(0.0f, 0.0f);
+            lbl->setPosition(4.0f, y + rowH / 2.0f);
+            scroll->m_contentLayer->addChild(lbl);
 
             auto loadSpr = ButtonSprite::create("L", 12, true, "goldFont.fnt", "GJ_button_01.png", 16.0f, 0.4f);
             auto loadBtn = CCMenuItemExt::createSpriteExtra(loadSpr, [this, path](CCObject*) {
@@ -1022,7 +978,7 @@ class $modify(BotPauseLayer, PauseLayer) {
                     Notification::create("Failed to load", NotificationIcon::Error)->show();
                 }
             });
-            loadBtn->setPosition(120.0f, rowH / 2.0f);
+            loadBtn->setPosition(120.0f, y + rowH / 2.0f);
             rowMenu->addChild(loadBtn);
 
             auto delSpr = ButtonSprite::create("X", 12, true, "goldFont.fnt", "GJ_button_06.png", 16.0f, 0.4f);
@@ -1032,11 +988,8 @@ class $modify(BotPauseLayer, PauseLayer) {
                 this->refreshMacroList();
                 Notification::create("Macro deleted", NotificationIcon::Info)->show();
             });
-            delBtn->setPosition(145.0f, rowH / 2.0f);
+            delBtn->setPosition(145.0f, y + rowH / 2.0f);
             rowMenu->addChild(delBtn);
-
-            rowNode->addChild(rowMenu);
-            scroll->m_contentLayer->addChild(rowNode);
         }
 
         scroll->scrollToTop();
