@@ -11,6 +11,13 @@
 //
 // Никаких изменений отправки результатов, прогресса, античита или рекордов.
 // Шаг назад намеренно недоступен.
+//
+// Compile-fix for Geode 5.11.2 / GD 2.2081:
+// - ModalScrollLayer: no implicit default ctor.
+// - Removed non-hookable inline hooks:
+//   GJBaseGameLayer::queueButton
+//   GJBaseGameLayer::shouldUseSubstepForButton
+// - Input capture adapted to handleButton + processQueuedButtons.
 
 #include <Geode/Geode.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
@@ -1110,7 +1117,7 @@ namespace gdbot {
         r.sentHeld = desired;
     }
 
-    void installNativeFlags() {
+    void installNativeFlags(bool clearQueue = true) {
         auto& r = state().run;
         if (!r.play)
             return;
@@ -1123,7 +1130,9 @@ namespace gdbot {
 
         r.play->m_clickBetweenSteps = false;
         r.play->m_clickOnSteps = false;
-        r.play->m_queuedButtons.clear();
+
+        if (clearQueue)
+            r.play->m_queuedButtons.clear();
     }
 
     void restoreNativeFlags() {
@@ -1334,7 +1343,11 @@ namespace gdbot {
         });
     }
 
-    void mapRawInputs(double frameDelta, double inputEnd) {
+    void mapRawInputs(
+        double frameDelta,
+        double inputEnd,
+        bool staticTimestampAllowed = false
+    ) {
         auto& s = state();
         auto& r = s.run;
 
@@ -1351,20 +1364,27 @@ namespace gdbot {
 
             if (!r.frameMode) {
                 double ratio = 1.0;
-                if (std::isfinite(input.timestamp) &&
-                    std::isfinite(inputSpan) && inputSpan > 0.0) {
+                bool haveSpan =
+                    std::isfinite(input.timestamp) &&
+                    std::isfinite(inputSpan) &&
+                    inputSpan > 0.0;
+
+                if (haveSpan) {
                     ratio = std::clamp(
                         (input.timestamp - r.inputAnchor) / inputSpan,
                         0.0, 1.0
                     );
                 }
-                else if (!r.badTimestampWarned) {
+                else if (!staticTimestampAllowed && !r.badTimestampWarned) {
                     r.badTimestampWarned = true;
                     postNotice(
                         "Шкала времени ввода недоступна: проверьте привязку кликов.",
                         true
                     );
                 }
+
+                if (staticTimestampAllowed && !haveSpan)
+                    ratio = 0.0;
 
                 tick = origin + span * ratio;
             }
@@ -1768,10 +1788,13 @@ namespace gdbot {
             return;
         }
 
-        installNativeFlags();
+        // Do not clear native queue here: without queueButton hook it is the
+        // only source of queued user input. It is drained in processQueuedButtons.
+        installNativeFlags(false);
 
         if (r.play->m_isPaused) {
             r.paused = true;
+            r.play->m_queuedButtons.clear();
             restoreAudio();
             return;
         }
@@ -1785,6 +1808,7 @@ namespace gdbot {
             r.paused = false;
             r.inputAnchor = inputTimestamp();
             r.rawInputs.clear();
+            r.play->m_queuedButtons.clear();
 
             frameDelta = 0.0;
 
@@ -1906,6 +1930,13 @@ namespace gdbot {
                 ++r.step;
                 if (wasRecording)
                     s.buffer.length = r.step;
+
+                // Inputs captured during this fixed step are scheduled for the
+                // next step. This partially compensates for the unavailable
+                // queueButton hook.
+                if (!r.rawInputs.empty() && !r.dead && !r.stopRequested) {
+                    mapRawInputs(0.0, inputTimestamp(), true);
+                }
             }
 
             if (r.markPending && !r.dead && !r.stopRequested) {
@@ -2218,14 +2249,30 @@ namespace gdbot {
 
     class ModalScrollLayer final : public ScrollLayer {
     public:
-        using ScrollLayer::init;
+        // ScrollLayer in this SDK has no accessible default constructor.
+        // Inherit its real constructor(s) and initialize via the available init().
+        using ScrollLayer::ScrollLayer;
 
         static ModalScrollLayer* create(CCSize const& size) {
-            auto* layer = new ModalScrollLayer;
-            if (layer->init(size)) {
+            auto* layer = new ModalScrollLayer(size);
+
+            bool ok = false;
+            if constexpr (requires { layer->init(size); }) {
+                ok = layer->init(size);
+            }
+            else if constexpr (requires { layer->init(); }) {
+                ok = layer->init();
+            }
+            else {
+                // If the bound class already fully initializes in constructor.
+                ok = true;
+            }
+
+            if (ok) {
                 layer->autorelease();
                 return layer;
             }
+
             delete layer;
             return nullptr;
         }
@@ -3213,10 +3260,10 @@ namespace gdbot {
 
 class $modify(GDBotBaseLayer, GJBaseGameLayer) {
     static void onModify(auto& self) {
-        if (!self.setHookPriorityPre(
-                "GJBaseGameLayer::queueButton", Priority::First)) {
-            log::warn("Не удалось установить первый приоритет очереди ввода.");
-        }
+        // NOTE:
+        // GJBaseGameLayer::queueButton and GJBaseGameLayer::shouldUseSubstepForButton
+        // have inline definitions in Geode 5.11.2 / GD 2.2081 bindings and cannot
+        // be hooked through $modify. Their hooks were removed.
 
         if (!self.setHookPriorityPost(
                 "GJBaseGameLayer::getModifiedDelta", Priority::Last)) {
@@ -3237,26 +3284,6 @@ class $modify(GDBotBaseLayer, GJBaseGameLayer) {
                 "GJBaseGameLayer::handleButton", Priority::First)) {
             log::warn("Не удалось установить приоритет прямого ввода.");
         }
-
-        if (!self.setHookPriorityPre(
-                "GJBaseGameLayer::shouldUseSubstepForButton", Priority::First)) {
-            log::warn("Не удалось установить приоритет нативных подшагов.");
-        }
-    }
-
-    void queueButton(
-        int button, bool push, bool isPlayer2, double timestamp
-    ) {
-        if (!gdbot::controls(this)) {
-            GJBaseGameLayer::queueButton(
-                button, push, isPlayer2, timestamp
-            );
-            return;
-        }
-
-        auto const& r = gdbot::state().run;
-        if (!r.injecting)
-            gdbot::enqueueRaw(push, button, isPlayer2, timestamp);
     }
 
     void handleButton(bool down, int button, bool isPlayer1) {
@@ -3277,28 +3304,34 @@ class $modify(GDBotBaseLayer, GJBaseGameLayer) {
             return;
         }
 
-        if (r.inSlice) {
-            GJBaseGameLayer::handleButton(down, button, isPlayer1);
-            return;
-        }
-
+        // Capture both direct calls and calls dispatched from the native queue.
+        // Native application is intentionally suppressed while bot is active.
         gdbot::enqueueRaw(
             down, button, !isPlayer1, gdbot::inputTimestamp()
         );
     }
 
     void processQueuedButtons(float dt, bool clearInputQueue) {
-        if (gdbot::controls(this)) {
-            this->m_queuedButtons.clear();
+        if (!gdbot::controls(this)) {
+            GJBaseGameLayer::processQueuedButtons(dt, clearInputQueue);
             return;
         }
-        GJBaseGameLayer::processQueuedButtons(dt, clearInputQueue);
-    }
 
-    bool shouldUseSubstepForButton(float dt) {
-        if (gdbot::controls(this))
-            return false;
-        return GJBaseGameLayer::shouldUseSubstepForButton(dt);
+        auto& r = gdbot::state().run;
+
+        // While resetting/loading/injecting or paused, do not let queued native
+        // input reach physics. Drop it safely.
+        if (r.resetDepth || r.loadDepth || r.injecting ||
+            r.pauseGuard || r.paused ||
+            (r.play && r.play->m_isPaused) || r.dead) {
+            m_queuedButtons.clear();
+            return;
+        }
+
+        // Dispatch the native queue. Each queued event reaches handleButton(),
+        // where gdbot::enqueueRaw() captures it and native handling is suppressed.
+        GJBaseGameLayer::processQueuedButtons(dt, clearInputQueue);
+        m_queuedButtons.clear();
     }
 
     double getModifiedDelta(float dt) {
