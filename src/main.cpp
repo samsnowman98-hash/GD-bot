@@ -46,7 +46,6 @@
 #include <Geode/binding/GJGameLevel.hpp>
 #include <Geode/binding/PlayerObject.hpp>
 
-#include <Geode/ui/Popup.hpp>
 #include <Geode/ui/ScrollLayer.hpp>
 #include <Geode/ui/TextInput.hpp>
 #include <Geode/ui/Notification.hpp>
@@ -2122,9 +2121,10 @@ namespace gdbot {
     CCRect safeRect() {
         auto window = CCDirector::sharedDirector()->getWinSize();
 
-        // VERIFY-7: точное имя/пространство имен safe-area API в SDK 5.11.2.
-        // Изолировано в одном адаптере, чтобы исправление не затронуло UI.
-        auto area = geode::utils::cocos::getSafeAreaRect();
+        // ПАТЧ 5 / подтверждено логом сборки: функция объявлена в
+        // namespace geode::cocos (utils/general.hpp), а не в
+        // geode::utils::cocos — такого пространства имён не существует.
+        auto area = geode::cocos::getSafeAreaRect();
 
         if (area.size.width <= 0.0f || area.size.height <= 0.0f)
             area = CCRect{0.0f, 0.0f, window.width, window.height};
@@ -2309,27 +2309,119 @@ namespace gdbot {
         ));
     }
 
-    class ChoicePopup final : public Popup<> {
+    // -----------------------------------------------------------------
+    // ПАТЧ 6 / замена Popup<>.
+    //
+    // Сборка показала, что в этой версии Geode SDK имя `Popup` вообще не
+    // резолвится (`unknown template name 'Popup'`, без подсказки о
+    // существующей перегрузке/пространстве имён) — то есть предположение
+    // о наличии шаблона geode::Popup<...> в этом конкретном SDK не
+    // подтвердилось. Вместо того чтобы гадать дальше про незнакомый API,
+    // модальные окна собраны на `CCLayerColor` — ровно тот же паттерн,
+    // что уже использован в этом файле для полноэкранных слоёв
+    // (см. DraggableLauncher) и опирается только на базовые классы
+    // cocos2d, в существовании и сигнатурах которых сомнений нет.
+    //
+    // ModalLayer — затемняющая подложка на весь экран (блокирует клики по
+    // сцене под собой через ccTouchBegan -> true) с центрированным боксом
+    // m_box, в который добавляется содержимое конкретной модалки.
+    // -----------------------------------------------------------------
+
+    constexpr int kModalTouchPriority = -5000;
+
+    class ModalLayer : public CCLayerColor {
+    protected:
+        CCLayerColor* m_box = nullptr;
+
+        bool initModal(float width, float height) {
+            if (!CCLayerColor::initWithColor({0, 0, 0, 160}))
+                return false;
+
+            auto window = CCDirector::sharedDirector()->getWinSize();
+            this->setContentSize(window);
+            this->setPosition({0.0f, 0.0f});
+            this->setTouchEnabled(true);
+
+            m_box = CCLayerColor::create({24, 29, 39, 255});
+            m_box->setContentSize({width, height});
+            m_box->ignoreAnchorPointForPosition(false);
+            m_box->setAnchorPoint({0.5f, 0.5f});
+
+            auto area = safeRect();
+            m_box->setPosition({
+                area.origin.x + area.size.width / 2,
+                area.origin.y + area.size.height / 2
+            });
+            this->addChild(m_box);
+
+            return true;
+        }
+
+        CCSize boxSize() const {
+            return m_box->getContentSize();
+        }
+
+    public:
+        void registerWithTouchDispatcher() override {
+            CCDirector::sharedDirector()->getTouchDispatcher()
+                ->addTargetedDelegate(this, kModalTouchPriority, true);
+        }
+
+        bool ccTouchBegan(CCTouch*, CCEvent*) override {
+            // Поглощает клик, не давая ему дойти до сцены под модалкой.
+            return true;
+        }
+
+        void onEnter() override {
+            CCLayerColor::onEnter();
+            ++state().modalCount;
+        }
+
+        void onExit() override {
+            state().modalCount = std::max(0, state().modalCount - 1);
+            CCLayerColor::onExit();
+        }
+
+        void close() {
+            this->removeFromParentAndCleanup(true);
+        }
+
+        // Добавляет модалку в текущую сцену и проигрывает анимацию
+        // появления. Заменяет связку show()+animateOpen() из Popup<>.
+        void present() {
+            auto* scene = CCDirector::sharedDirector()->getRunningScene();
+            if (!scene || !m_box)
+                return;
+
+            scene->addChild(this, 100000);
+
+            m_box->setScale(0.92f);
+            m_box->runAction(
+                CCEaseBackOut::create(CCScaleTo::create(0.18f, 1.0f))
+            );
+        }
+    };
+
+    class ChoiceModal final : public ModalLayer {
         std::string m_text;
         std::vector<ChoiceAction> m_actions;
 
-    protected:
-        bool setup() override {
-            auto size = m_mainLayer->getContentSize();
+        void build() {
+            auto size = boxSize();
 
             auto* title = russianLabel("Бот", 22.0f);
             title->setPosition({size.width / 2, size.height - 24.0f});
-            m_mainLayer->addChild(title);
+            m_box->addChild(title);
 
             auto* body = russianLabel(m_text, 14.0f, size.width - 36.0f);
             body->setAnchorPoint({0.5f, 1.0f});
             body->setPosition({size.width / 2, size.height - 48.0f});
             fitLabel(body, size.width - 36.0f, size.height - 148.0f);
-            m_mainLayer->addChild(body);
+            m_box->addChild(body);
 
             auto* menu = CCMenu::create();
             menu->setPosition({0, 0});
-            m_mainLayer->addChild(menu);
+            m_box->addChild(menu);
 
             float y = 35.0f + 34.0f * (m_actions.size() - 1);
             for (std::size_t i = 0; i < m_actions.size(); ++i) {
@@ -2339,63 +2431,44 @@ namespace gdbot {
                     {size.width - 38.0f, 28.0f},
                     [this, i] {
                         auto callback = m_actions[i].second;
-                        this->onClose(nullptr);
+                        this->close();
                         if (callback)
                             callback();
                     }
                 );
                 y -= 34.0f;
             }
-            return true;
-        }
-
-        void onEnter() override {
-            Popup<>::onEnter();
-            ++state().modalCount;
-        }
-
-        void onExit() override {
-            state().modalCount = std::max(0, state().modalCount - 1);
-            Popup<>::onExit();
         }
 
     public:
-        static ChoicePopup* create(
+        static ChoiceModal* create(
             std::string text, std::vector<ChoiceAction> actions
         ) {
             auto area = safeRect();
-            auto* popup = new ChoicePopup;
-            popup->m_text = std::move(text);
-            popup->m_actions = std::move(actions);
+            auto* modal = new ChoiceModal;
+            modal->m_text = std::move(text);
+            modal->m_actions = std::move(actions);
 
             float width = std::min(430.0f, area.size.width);
             float height = std::min(270.0f, area.size.height);
 
-            if (!popup->initAnchored(width, height)) {
-                delete popup;
+            if (!modal->initModal(width, height)) {
+                delete modal;
                 return nullptr;
             }
 
-            auto window = CCDirector::sharedDirector()->getWinSize();
-            auto delta = CCPoint{
-                area.origin.x + area.size.width / 2 - window.width / 2,
-                area.origin.y + area.size.height / 2 - window.height / 2
-            };
-            popup->m_mainLayer->setPosition(
-                popup->m_mainLayer->getPosition() + delta
-            );
-
-            popup->autorelease();
-            return popup;
+            modal->build();
+            modal->autorelease();
+            return modal;
         }
     };
 
     void ask(std::string text, std::vector<ChoiceAction> actions) {
         if (actions.empty())
             return;
-        if (auto* popup = ChoicePopup::create(
+        if (auto* modal = ChoiceModal::create(
                 std::move(text), std::move(actions))) {
-            popup->show();
+            modal->present();
         }
     }
 
