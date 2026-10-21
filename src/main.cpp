@@ -1,40 +1,16 @@
 // src/main.cpp
 // Geometry Dash 2.2081 / Geode 5.11.2 / C++23
 //
-// ВАЖНО:
-// VERIFY-N — обязательная проверка перед использованием на реальных уровнях.
-// Одних сигнатур bindings недостаточно, чтобы доказать, что processCommands
-// охватывает ВСЮ интеграцию физического шага. Ниже этот контракт проверяется
-// частично: количеством вызовов, расположением checkCollisions и состоянием
-// игроков до/после processCommands. При обнаружении несовместимости бот
-// останавливается, а не продолжает создавать заведомо неправильный макрос.
-//
-// Эта проверка — детектор, а не барьер: несовместимость обнаруживается
-// ПОСЛЕ того, как нативный код уже выполнил шаг физики с неучтённым нами
-// делением на подшаги. Остановка происходит максимально быстро после этого,
-// но сам уже выполненный шаг отменить нельзя — поэтому запись за этот шаг
-// обрезается (trimRecording), а не просто помечается как «подозрительная».
+// Полный rewrite UI-слоя:
+// - Popup<> не используется.
+// - Модальные окна собраны на локальном ModalLayer.
+// - Меню внутри модалок используют ModalMenu с повышенным touch priority.
+// - ScrollLayer внутри модалки использует ModalScrollLayer.
+// - getSafeAreaRect() вызывается как простое имя.
+// - fs::u8path() заменён на std::u8string.
 //
 // Никаких изменений отправки результатов, прогресса, античита или рекордов.
-//
-// Макрос:
-//   заголовок 48 байт, записи по 16 байт, CRC32 в конце;
-//   little-endian; double хранится как IEEE-754 binary64;
-//   фаза [0, 1), фаза 1 канонически представляется следующим шагом, фазой 0.
-//
-// Сохранение файла атомарно в пределах одной файловой системы: сначала
-// пишется во временный файл в той же папке, затем временный файл
-// ПЕРЕИМЕНОВЫВАЕТСЯ в целевое имя (fs::rename). Если процесс будет прерван
-// на Android в середине записи, под финальным именем никогда не окажется
-// частично записанный файл — он либо не появится вовсе (и останется только
-// .tmp-мусор, который безопасно удалить), либо появится полностью целым.
-//
-// Кириллица:
-//   интерфейс рисуется CCLabelTTF, а НЕ стандартными bigFont/chatFont;
-//   TextInput используется только для чисел и ASCII-имени файла.
-//
-// Шаг назад намеренно недоступен. Непроверенные снимки состояния не выдаются
-// за полноценное восстановление RNG, триггеров, действий и состояния модов.
+// Шаг назад намеренно недоступен.
 
 #include <Geode/Geode.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
@@ -54,7 +30,6 @@
 #include <Geode/utils/cocos.hpp>
 #include <Geode/utils/file.hpp>
 
-// VERIFY-6: путь FMOD-заголовка в установленном SDK.
 #if __has_include(<Geode/fmod/fmod.hpp>)
 # include <Geode/fmod/fmod.hpp>
 #elif __has_include(<fmod.hpp>)
@@ -226,8 +201,6 @@ namespace gdbot {
         bool markPending = false;
         bool drainingMark = false;
 
-        // Невладеющие ключи. Объекты принадлежат игре.
-        // Карта очищается/прореживается при сбросе, store/remove и onQuit.
         std::map<CheckpointObject*, CheckpointData> checkpoints;
 
         bool stopRequested = false;
@@ -281,7 +254,6 @@ namespace gdbot {
     };
 
     State& state() {
-        // Только обычная C++-инициализация. Mod::get() здесь не вызывается.
         static State value;
         return value;
     }
@@ -315,7 +287,13 @@ namespace gdbot {
     }
 
     fs::path utf8Path(std::string const& text) {
-        return fs::u8path(text);
+        if (text.empty())
+            return {};
+
+        return fs::path(std::u8string(
+            reinterpret_cast<char8_t const*>(text.data()),
+            text.size()
+        ));
     }
 
     std::string shorten(std::string const& text, std::size_t maxBytes) {
@@ -355,8 +333,6 @@ namespace gdbot {
     bool parseSpeed(std::string text, double& result) {
         std::replace(text.begin(), text.end(), ',', '.');
 
-        // Не зависит от системного десятичного разделителя.
-        // Не требует floating-point from_chars в Android libc++.
         std::istringstream stream(text);
         stream.imbue(std::locale::classic());
 
@@ -386,12 +362,6 @@ namespace gdbot {
     }
 
     double inputTimestamp() {
-        // VERIFY-2:
-        // - возвращаемый тип getInputTimestamp;
-        // - одна ли шкала/эпоха с timestamp в queueButton;
-        // - соответствует ли интервал этой шкалы переданному update(dt).
-        //
-        // Абсолютное значение не используется для физики/воспроизведения.
         return static_cast<double>(geode::utils::getInputTimestamp());
     }
 
@@ -399,24 +369,17 @@ namespace gdbot {
         if (!level)
             return 0;
 
-        // VERIFY-3: m_levelID и .value() в SDK/bindings 2.2081.
         auto value = level->m_levelID.value();
         return value > 0 ? static_cast<std::uint64_t>(value) : 0;
     }
 
     std::uint8_t buttonBit(int button, bool player2) {
-        // VERIFY-3: численные значения кнопок:
-        // 1 — прыжок, 2 — влево, 3 — вправо.
         if (button < 1 || button > 3)
             return 0;
 
         auto index = static_cast<unsigned>(button - 1) + (player2 ? 3u : 0u);
         return static_cast<std::uint8_t>(1u << index);
     }
-
-    // ---------------------------------------------------------------------
-    // Бинарный формат и проверка файлов
-    // ---------------------------------------------------------------------
 
     constexpr auto makeCRCTable() {
         std::array<std::uint32_t, 256> result{};
@@ -688,7 +651,6 @@ namespace gdbot {
             action.down = down != 0;
             action.player2 = player != 0;
 
-            // Принимаем точную фазу 1 и переводим в канонический вид.
             if (action.phase == 1.0) {
                 if (action.step == std::numeric_limits<std::uint32_t>::max()) {
                     error = "Переполнение номера шага.";
@@ -764,8 +726,13 @@ namespace gdbot {
         auto directory = parent / "GDBotMacros";
 
         fs::create_directories(directory, ec);
-        if (ec || !fs::is_directory(directory, ec) || ec) {
+        if (ec) {
             error = "Не удалось создать подпапку макросов.";
+            return false;
+        }
+
+        if (!fs::is_directory(directory, ec) || ec) {
+            error = "Путь не является доступной папкой.";
             return false;
         }
 
@@ -806,7 +773,7 @@ namespace gdbot {
         s.configured = true;
 
         auto* mod = Mod::get();
-        auto tps = mod->getSavedValue<int>("physics-tps", kDefaultTPS);
+        auto tps = mod->getSavedValue<int>("physics-tps", static_cast<int>(kDefaultTPS));
         s.tps = static_cast<std::uint32_t>(
             std::clamp(tps, static_cast<int>(kMinTPS), static_cast<int>(kMaxTPS))
         );
@@ -844,25 +811,6 @@ namespace gdbot {
             );
         }
     }
-
-    // ---------------------------------------------------------------------
-    // ПАТЧ 1 / сохранение макроса.
-    //
-    // Было: writeMacro() во временный файл, затем fs::copy_file() поверх
-    // финального имени. copy_file() НЕ атомарна: если процесс убьют (на
-    // Android это штатная ситуация — OOM-killer, выгрузка активности)
-    // в середине копирования, под финальным именем .gdbot окажется
-    // наполовину скопированный, то есть БИТЫЙ, файл — ровно то, от чего
-    // этот бинарный формат с CRC32 пытался защититься.
-    //
-    // Стало: writeMacro() во временный файл в ТОЙ ЖЕ папке, затем
-    // fs::rename() временного файла в финальное имя. В пределах одной
-    // файловой системы rename — атомарная операция на всех трёх целевых
-    // платформах (Windows/Android/десктопный Linux под WSL и т.п.):
-    // наблюдатель либо видит старое состояние (файла с таким именем нет),
-    // либо новое (файл полностью записан), но никогда — частично записанный
-    // файл под финальным именем.
-    // ---------------------------------------------------------------------
 
     void saveBuffer() {
         auto& s = state();
@@ -934,10 +882,6 @@ namespace gdbot {
                 continue;
             }
 
-            // Атомарное переименование внутри одной папки/ФС.
-            // Если имя тем временем заняли (гонка с другим процессом/вкладкой),
-            // rename завершится ошибкой file_exists/already_exists, и цикл
-            // перейдёт к следующему суффиксу, не трогая временный файл.
             std::error_code renameError;
             fs::rename(temporary, target, renameError);
 
@@ -1042,14 +986,7 @@ namespace gdbot {
         return true;
     }
 
-    // ---------------------------------------------------------------------
-    // Звук
-    // ---------------------------------------------------------------------
-
     FMOD::ChannelGroup* masterGroup() {
-        // VERIFY-6:
-        // sharedEngine()->m_system в bindings 2.2081.
-        // Используется мастер-группа FMOD, без выдуманных полей каналов музыки.
         auto* engine = FMODAudioEngine::sharedEngine();
         if (!engine || !engine->m_system)
             return nullptr;
@@ -1107,15 +1044,11 @@ namespace gdbot {
             ? static_cast<float>(s.recordingSpeed)
             : 1.0f;
 
-        // VERIFY-6: проверить фактическое изменение темпа/тона на всех платформах.
-        // Мастер-группа распространяет изменение и на звуковые эффекты.
         if (group->setPitch(pitch) != FMOD_OK)
             audioFailure();
         else
             audio.pitchOwned = true;
 
-        // В экспериментальном покадровом режиме аудио не должно убегать
-        // на минуты вперёд, пока физика неподвижна.
         bool freezeAudio = r.frameMode && !paused && active();
 
         if (freezeAudio && !audio.pauseOwned) {
@@ -1134,10 +1067,6 @@ namespace gdbot {
             audio.pauseOwned = false;
         }
     }
-
-    // ---------------------------------------------------------------------
-    // Ввод, удержания и управление сеансом
-    // ---------------------------------------------------------------------
 
     std::uint8_t effectiveHeld() {
         auto const& s = state();
@@ -1334,26 +1263,6 @@ namespace gdbot {
         showNotice("Запуск с начала уровня после выхода из паузы.");
     }
 
-    // ---------------------------------------------------------------------
-    // ПАТЧ 2 / двойная инициализация таймлайна.
-    //
-    // Было: play->resetLevelFromStart() синхронно проходит через хук
-    // GDBotPlayLayer::resetLevelFromStart(), который вызывает resetBegin()
-    // ДО и resetEnd() ПОСЛЕ нативного вызова. resetEnd() видит
-    // r.internalRestart == true и САМ делает clearTimeline() +
-    // r.checkpoints.clear() (см. ниже по файлу). После возврата из
-    // resetLevelFromStart() та же пара вызовов повторялась здесь ещё раз —
-    // безвредно по результату, но clearTimeline() попутно переустанавливает
-    // r.inputAnchor = inputTimestamp(), поэтому первое, уже выполненное
-    // resetEnd()'ом выставление анкера полностью пропадало впустую, и был
-    // неочевидный вопрос "кто на самом деле отвечает за инициализацию".
-    //
-    // Стало: инициализация таймлайна и чекпоинтов после
-    // resetLevelFromStart() выполняется ровно один раз — внутри resetEnd()
-    // по флагу internalRestart. Здесь остаётся только то, что resetEnd()
-    // сознательно не делает (режим бота, флаг паузы, содержимое буфера).
-    // ---------------------------------------------------------------------
-
     void beginPendingStart() {
         auto& s = state();
         auto& r = s.run;
@@ -1375,14 +1284,11 @@ namespace gdbot {
 
         r.internalRestart = true;
         play->resetLevelFromStart();
-        if (r.play != play || r.session != session)
+        if (r.play != play || r.session != session) {
+            r.internalRestart = false;
             return;
+        }
         r.internalRestart = false;
-
-        // clearTimeline() и checkpoints.clear() уже выполнены внутри
-        // resetEnd() (см. ветку internalRestart) синхронно во время
-        // вызова play->resetLevelFromStart() выше — повторять их здесь
-        // не нужно и означало бы бесполезно перевыставлять inputAnchor.
 
         r.paused = play->m_isPaused;
         r.mode = mode;
@@ -1573,10 +1479,6 @@ namespace gdbot {
         return result;
     }
 
-    // ---------------------------------------------------------------------
-    // Практика и восстановление чекпоинтов
-    // ---------------------------------------------------------------------
-
     CheckpointData captureCheckpointData() {
         auto const& r = state().run;
         CheckpointData data;
@@ -1597,7 +1499,6 @@ namespace gdbot {
         if (!r.play)
             return;
 
-        // VERIFY-4: m_checkpointArray — CCArray*, содержащий действующие CP.
         auto* array = r.play->m_checkpointArray;
         std::erase_if(r.checkpoints, [array](auto const& entry) {
             return !array || !array->containsObject(entry.first);
@@ -1653,9 +1554,6 @@ namespace gdbot {
             ) - s.buffer.actions.begin()
         );
 
-        // VERIFY-5: идемпотентность handleButton при повторном выставлении
-        // уже восстановленного состояния кнопки. Проверить, что это не создаёт
-        // дополнительный фронт прыжка после native loadFromCheckpoint.
         sendMask(effectiveHeld(), true);
 
         r.dead = false;
@@ -1733,10 +1631,6 @@ namespace gdbot {
             flushStop();
     }
 
-    // ---------------------------------------------------------------------
-    // Фиксированный драйвер и собственные подшаги
-    // ---------------------------------------------------------------------
-
     PlayerStamp stampPlayer(PlayerObject* player) {
         if (!player)
             return {};
@@ -1788,11 +1682,6 @@ namespace gdbot {
             return;
         }
 
-        // VERIFY-1: processCommands должен быть полным ядром шага,
-        // а не только обработчиком триггеров/команд.
-        //
-        // Единицы dt не угадываются: разделяется именно переданный движком dt,
-        // в одинаковых пропорциях при записи и воспроизведении.
         if (!(physicsStamp() == r.beforeTick))
             r.badKernel = true;
 
@@ -1828,8 +1717,6 @@ namespace gdbot {
             bool previous = r.inSlice;
             r.inSlice = true;
 
-            // VERIFY-1: семантика isHalfTick/isLastTick при дроблении.
-            // Финализация последнего тика разрешена только последнему подшагу.
             original(slice, isHalfTick, isLastTick && finalSlice);
 
             r.inSlice = previous;
@@ -1899,19 +1786,14 @@ namespace gdbot {
             r.inputAnchor = inputTimestamp();
             r.rawInputs.clear();
 
-            // Не включаем длительность паузы в накопитель.
             frameDelta = 0.0;
 
-            // VERIFY-5: native pause может сбрасывать внутренние поля игрока
-            // в обход handleButton. Повторное выставление должно быть проверено.
             sendMask(effectiveHeld(), true);
         }
 
         syncAudio();
 
         if (r.dead) {
-            // Даем нативной логике смерти/возрождения работать.
-            // Номера шагов макроса во время ожидания возрождения не идут.
             original(static_cast<float>(frameDelta));
             flushStop();
             return;
@@ -1977,8 +1859,6 @@ namespace gdbot {
             r.discardCurrentStep = false;
             r.beforeTick = physicsStamp();
 
-            // VERIFY-1: GJBaseGameLayer::update(float) как точка внешнего
-            // драйвера 2.2081. Вызов оригинала выполняется ОДИН раз на квант.
             original(static_cast<float>(quantum));
 
             r.inTick = false;
@@ -2043,9 +1923,6 @@ namespace gdbot {
             if (r.dead)
                 break;
         }
-
-        // При достижении kMaxBurst остаток НЕ выбрасывается.
-        // Слабое устройство будет отставать, но не пропускать физические шаги.
     }
 
     void attach(PlayLayer* play, GJGameLevel* level) {
@@ -2114,17 +1991,10 @@ namespace gdbot {
         );
     }
 
-    // ---------------------------------------------------------------------
-    // Русский интерфейс
-    // ---------------------------------------------------------------------
-
     CCRect safeRect() {
         auto window = CCDirector::sharedDirector()->getWinSize();
 
-        // ПАТЧ 5 / подтверждено логом сборки: функция объявлена в
-        // namespace geode::cocos (utils/general.hpp), а не в
-        // geode::utils::cocos — такого пространства имён не существует.
-        auto area = geode::cocos::getSafeAreaRect();
+        auto area = getSafeAreaRect();
 
         if (area.size.width <= 0.0f || area.size.height <= 0.0f)
             area = CCRect{0.0f, 0.0f, window.width, window.height};
@@ -2138,7 +2008,6 @@ namespace gdbot {
     }
 
     char const* systemFont() {
-        // VERIFY-9: фактическое наличие кириллицы в системном шрифте.
 #ifdef GEODE_IS_WINDOWS
         return "Arial";
 #else
@@ -2189,7 +2058,6 @@ namespace gdbot {
         }
 
         void invoke(CCObject*) {
-            // Копия позволяет callback закрыть/удалить владеющую панель.
             auto callback = m_callback;
             if (callback)
                 callback();
@@ -2205,6 +2073,8 @@ namespace gdbot {
         bool enabled = true
     ) {
         auto* normal = CCNode::create();
+        if (!normal)
+            return nullptr;
         normal->setContentSize(size);
 
         auto* background = CCLayerColor::create(
@@ -2212,9 +2082,12 @@ namespace gdbot {
                     : ccColor4B{52, 55, 61, 190},
             size.width, size.height
         );
-        normal->addChild(background);
+        if (background)
+            normal->addChild(background);
 
         auto* label = russianLabel(text, 14.0f);
+        if (!label)
+            return nullptr;
         label->setPosition({size.width / 2, size.height / 2});
         fitLabel(label, size.width - 10, size.height - 6);
         if (!enabled)
@@ -2222,13 +2095,20 @@ namespace gdbot {
         normal->addChild(label);
 
         auto* handler = CallbackNode::create(std::move(callback));
+        if (!handler)
+            return nullptr;
+
         auto* item = CCMenuItemSpriteExtra::create(
             normal, handler, menu_selector(CallbackNode::invoke)
         );
+        if (!item)
+            return nullptr;
+
         item->addChild(handler);
         item->setPosition(position);
         item->setEnabled(enabled);
-        menu->addChild(item);
+        if (menu)
+            menu->addChild(item);
         return item;
     }
 
@@ -2251,8 +2131,6 @@ namespace gdbot {
     void showNotice(std::string const& text, bool warning) {
         auto area = safeRect();
 
-        // Geode Notification сохраняется как контейнер/анимация.
-        // Его bitmap-текст заменяется визуально системным TTF-текстом.
         auto placeholderLength = static_cast<std::size_t>(
             std::clamp(area.size.width / 14.0f, 16.0f, 32.0f)
         );
@@ -2262,26 +2140,25 @@ namespace gdbot {
             3.5f
         );
 
-        // VERIFY-9: Notification создаёт дочерний CCLabelBMFont в init,
-        // а его позиция/размер пригодны для замены текста.
         if (auto* bitmap = findBitmapLabel(notification)) {
             auto* parent = bitmap->getParent();
             auto* label = russianLabel(text, 13.0f);
-            label->setAnchorPoint(bitmap->getAnchorPoint());
-            label->setPosition(bitmap->getPosition());
+            if (label && parent) {
+                label->setAnchorPoint(bitmap->getAnchorPoint());
+                label->setPosition(bitmap->getPosition());
 
-            float width = std::min(
-                area.size.width - 36.0f,
-                bitmap->getContentSize().width * bitmap->getScaleX()
-            );
-            fitLabel(label, std::max(width, 80.0f), 22.0f);
-            bitmap->setOpacity(0);
-            parent->addChild(label, bitmap->getZOrder() + 1);
-            notification->show();
-            return;
+                float width = std::min(
+                    area.size.width - 36.0f,
+                    bitmap->getContentSize().width * bitmap->getScaleX()
+                );
+                fitLabel(label, std::max(width, 80.0f), 22.0f);
+                bitmap->setOpacity(0);
+                parent->addChild(label, bitmap->getZOrder() + 1);
+                notification->show();
+                return;
+            }
         }
 
-        // Резервный TTF-тост, если структура Notification изменилась.
         auto* scene = CCDirector::sharedDirector()->getRunningScene();
         if (!scene)
             return;
@@ -2290,12 +2167,18 @@ namespace gdbot {
         auto* toast = CCLayerColor::create(
             {20, 27, 37, 245}, width, 48.0f
         );
+        if (!toast)
+            return;
+
         toast->setPosition({
             area.origin.x + (area.size.width - width) / 2,
             area.origin.y + area.size.height - 54.0f
         });
 
         auto* label = russianLabel(text, 12.0f, width - 18.0f);
+        if (!label)
+            return;
+
         label->setAnchorPoint({0.5f, 0.5f});
         label->setPosition({width / 2, 24.0f});
         fitLabel(label, width - 18.0f, 40.0f);
@@ -2304,45 +2187,76 @@ namespace gdbot {
 
         toast->runAction(CCSequence::create(
             CCDelayTime::create(3.5f),
-            CCRemoveSelf::create(),
+            CCRemoveSelf::create(true),
             nullptr
         ));
     }
 
-    // -----------------------------------------------------------------
-    // ПАТЧ 6 / замена Popup<>.
-    //
-    // Сборка показала, что в этой версии Geode SDK имя `Popup` вообще не
-    // резолвится (`unknown template name 'Popup'`, без подсказки о
-    // существующей перегрузке/пространстве имён) — то есть предположение
-    // о наличии шаблона geode::Popup<...> в этом конкретном SDK не
-    // подтвердилось. Вместо того чтобы гадать дальше про незнакомый API,
-    // модальные окна собраны на `CCLayerColor` — ровно тот же паттерн,
-    // что уже использован в этом файле для полноэкранных слоёв
-    // (см. DraggableLauncher) и опирается только на базовые классы
-    // cocos2d, в существовании и сигнатурах которых сомнений нет.
-    //
-    // ModalLayer — затемняющая подложка на весь экран (блокирует клики по
-    // сцене под собой через ccTouchBegan -> true) с центрированным боксом
-    // m_box, в который добавляется содержимое конкретной модалки.
-    // -----------------------------------------------------------------
+    constexpr int kModalMenuTouchPriority = 1000;
+    constexpr int kModalScrollTouchPriority = 750;
+    constexpr int kModalTouchPriority = 500;
 
-    constexpr int kModalTouchPriority = -5000;
+    class ModalMenu final : public CCMenu {
+    public:
+        using CCMenu::init;
+
+        static ModalMenu* create() {
+            auto* menu = new ModalMenu;
+            if (menu->init()) {
+                menu->autorelease();
+                return menu;
+            }
+            delete menu;
+            return nullptr;
+        }
+
+        void registerWithTouchDispatcher() override {
+            CCDirector::sharedDirector()->getTouchDispatcher()
+                ->addTargetedDelegate(this, kModalMenuTouchPriority, true);
+        }
+    };
+
+    class ModalScrollLayer final : public ScrollLayer {
+    public:
+        using ScrollLayer::init;
+
+        static ModalScrollLayer* create(CCSize const& size) {
+            auto* layer = new ModalScrollLayer;
+            if (layer->init(size)) {
+                layer->autorelease();
+                return layer;
+            }
+            delete layer;
+            return nullptr;
+        }
+
+        void registerWithTouchDispatcher() override {
+            CCDirector::sharedDirector()->getTouchDispatcher()
+                ->addTargetedDelegate(this, kModalScrollTouchPriority, true);
+        }
+    };
 
     class ModalLayer : public CCLayerColor {
     protected:
         CCLayerColor* m_box = nullptr;
 
+    public:
         bool initModal(float width, float height) {
-            if (!CCLayerColor::initWithColor({0, 0, 0, 160}))
+            auto window = CCDirector::sharedDirector()->getWinSize();
+
+            if (!CCLayerColor::initWithColor(
+                    {0, 0, 0, 160}, window.width, window.height)) {
+                return false;
+            }
+
+            setContentSize(window);
+            setPosition({0.0f, 0.0f});
+            setTouchEnabled(true);
+
+            m_box = CCLayerColor::create({24, 29, 39, 255}, width, height);
+            if (!m_box)
                 return false;
 
-            auto window = CCDirector::sharedDirector()->getWinSize();
-            this->setContentSize(window);
-            this->setPosition({0.0f, 0.0f});
-            this->setTouchEnabled(true);
-
-            m_box = CCLayerColor::create({24, 29, 39, 255});
             m_box->setContentSize({width, height});
             m_box->ignoreAnchorPointForPosition(false);
             m_box->setAnchorPoint({0.5f, 0.5f});
@@ -2352,23 +2266,21 @@ namespace gdbot {
                 area.origin.x + area.size.width / 2,
                 area.origin.y + area.size.height / 2
             });
-            this->addChild(m_box);
+            addChild(m_box);
 
             return true;
         }
 
         CCSize boxSize() const {
-            return m_box->getContentSize();
+            return m_box ? m_box->getContentSize() : CCSize{0.0f, 0.0f};
         }
 
-    public:
         void registerWithTouchDispatcher() override {
             CCDirector::sharedDirector()->getTouchDispatcher()
                 ->addTargetedDelegate(this, kModalTouchPriority, true);
         }
 
         bool ccTouchBegan(CCTouch*, CCEvent*) override {
-            // Поглощает клик, не давая ему дойти до сцены под модалкой.
             return true;
         }
 
@@ -2383,11 +2295,9 @@ namespace gdbot {
         }
 
         void close() {
-            this->removeFromParentAndCleanup(true);
+            removeFromParentAndCleanup(true);
         }
 
-        // Добавляет модалку в текущую сцену и проигрывает анимацию
-        // появления. Заменяет связку show()+animateOpen() из Popup<>.
         void present() {
             auto* scene = CCDirector::sharedDirector()->getRunningScene();
             if (!scene || !m_box)
@@ -2408,22 +2318,31 @@ namespace gdbot {
 
         void build() {
             auto size = boxSize();
+            if (!m_box)
+                return;
 
             auto* title = russianLabel("Бот", 22.0f);
-            title->setPosition({size.width / 2, size.height - 24.0f});
-            m_box->addChild(title);
+            if (title) {
+                title->setPosition({size.width / 2, size.height - 24.0f});
+                m_box->addChild(title);
+            }
 
             auto* body = russianLabel(m_text, 14.0f, size.width - 36.0f);
-            body->setAnchorPoint({0.5f, 1.0f});
-            body->setPosition({size.width / 2, size.height - 48.0f});
-            fitLabel(body, size.width - 36.0f, size.height - 148.0f);
-            m_box->addChild(body);
+            if (body) {
+                body->setAnchorPoint({0.5f, 1.0f});
+                body->setPosition({size.width / 2, size.height - 48.0f});
+                fitLabel(body, size.width - 36.0f, size.height - 148.0f);
+                m_box->addChild(body);
+            }
 
-            auto* menu = CCMenu::create();
+            auto* menu = ModalMenu::create();
+            if (!menu)
+                return;
+
             menu->setPosition({0, 0});
             m_box->addChild(menu);
 
-            float y = 35.0f + 34.0f * (m_actions.size() - 1);
+            float y = 35.0f + 34.0f * static_cast<float>(m_actions.size() - 1);
             for (std::size_t i = 0; i < m_actions.size(); ++i) {
                 textButton(
                     menu, m_actions[i].first,
@@ -2513,8 +2432,6 @@ namespace gdbot {
     void consumePickResult(Result&& result) {
         using T = std::remove_cvref_t<Result>;
 
-        // VERIFY-8: фактический PickResult и представление отмены.
-        // Поддержаны path, optional<path> и Result, оборачивающий один из них.
         if constexpr (std::is_same_v<T, fs::path>) {
             if (!result.empty())
                 acceptFolder(result);
@@ -2545,8 +2462,6 @@ namespace gdbot {
     }
 
     void chooseFolder() {
-        // Нет захвата Popup/PlayLayer: callback безопасен после их закрытия.
-        // callback выполняется в главном потоке согласно API Geode 5.
         async::spawn(
             file::pick(file::PickMode::OpenFolder, {}),
             [](auto result) {
@@ -2594,7 +2509,7 @@ namespace gdbot {
         );
     }
 
-    class BotPopup final : public Popup<> {
+    class BotPopup final : public ModalLayer {
         ScrollLayer* m_scroll = nullptr;
         CCLabelTTF* m_status = nullptr;
         CCLabelTTF* m_speedHint = nullptr;
@@ -2604,26 +2519,37 @@ namespace gdbot {
         void rebuild() {
             auto& s = state();
             auto const& r = s.run;
-            auto size = m_mainLayer->getContentSize();
+            if (!m_box)
+                return;
+
+            auto size = m_box->getContentSize();
 
             if (m_scroll)
                 m_scroll->removeFromParentAndCleanup(true);
 
             auto files = listMacros();
             float width = size.width - 24.0f;
-            float viewHeight = size.height - 80.0f;
+            float viewHeight = std::max(1.0f, size.height - 80.0f);
 
-            // Geode ScrollLayer: мышь/колесо и сенсорная прокрутка.
-            m_scroll = ScrollLayer::create({width, viewHeight});
+            m_scroll = ModalScrollLayer::create({width, viewHeight});
+            if (!m_scroll)
+                return;
+
             m_scroll->setPosition({12.0f, 16.0f});
-            m_mainLayer->addChild(m_scroll);
+            m_box->addChild(m_scroll);
 
             float contentHeight =
                 675.0f + static_cast<float>(files.size()) * 62.0f;
             auto* content = m_scroll->m_contentLayer;
+            if (!content)
+                return;
+
             content->setContentSize({width, contentHeight});
 
-            auto* menu = CCMenu::create();
+            auto* menu = ModalMenu::create();
+            if (!menu)
+                return;
+
             menu->setPosition({0, 0});
             content->addChild(menu);
 
@@ -2635,6 +2561,8 @@ namespace gdbot {
 
             auto line = [&](std::string const& text, float font = 13.0f) {
                 auto* label = russianLabel(text, font, inner);
+                if (!label)
+                    return label;
                 label->setAnchorPoint({0, 1});
                 label->setPosition({left, y});
                 content->addChild(label);
@@ -2693,21 +2621,25 @@ namespace gdbot {
                 std::function<void(std::string const&)> callback
             ) {
                 auto* label = russianLabel(caption, 14.0f);
-                label->setAnchorPoint({0, 0.5f});
-                label->setPosition({left, y - 15.0f});
-                fitLabel(label, inner * 0.55f, 28.0f);
-                content->addChild(label);
+                if (label) {
+                    label->setAnchorPoint({0, 0.5f});
+                    label->setPosition({left, y - 15.0f});
+                    fitLabel(label, inner * 0.55f, 28.0f);
+                    content->addChild(label);
+                }
 
                 float inputWidth = inner * 0.39f;
                 auto* input = TextInput::create(inputWidth, "", "bigFont.fnt");
-                input->setFilter(filter);
-                input->setString(value);
-                input->setPosition({
-                    right - inputWidth / 2,
-                    y - 15.0f
-                });
-                input->setCallback(std::move(callback));
-                content->addChild(input);
+                if (input) {
+                    input->setFilter(filter);
+                    input->setString(value);
+                    input->setPosition({
+                        right - inputWidth / 2,
+                        y - 15.0f
+                    });
+                    input->setCallback(std::move(callback));
+                    content->addChild(input);
+                }
                 y -= 39.0f;
             };
 
@@ -2874,10 +2806,12 @@ namespace gdbot {
                 auto* name = russianLabel(
                     shorten(pathText(path.filename()), 75), 12.0f
                 );
-                name->setAnchorPoint({0, 0.5f});
-                name->setPosition({left, y - 7.0f});
-                fitLabel(name, inner, 19.0f);
-                content->addChild(name);
+                if (name) {
+                    name->setAnchorPoint({0, 0.5f});
+                    name->setPosition({left, y - 7.0f});
+                    fitLabel(name, inner, 19.0f);
+                    content->addChild(name);
+                }
 
                 float buttonWidth = (inner - 12.0f) / 3.0f;
                 float buttonY = y - 32.0f;
@@ -2909,16 +2843,16 @@ namespace gdbot {
             if (files.size() == kListLimit)
                 line("Показаны первые 128 файлов.", 11.0f);
 
-            // Если перевод/системный шрифт занял больше места, расширяем
-            // содержимое без обрезания нижних строк.
             if (y < 12.0f) {
                 float extra = 12.0f - y;
                 auto* children = content->getChildren();
-                for (unsigned i = 0; i < children->count(); ++i) {
-                    auto* child = static_cast<CCNode*>(
-                        children->objectAtIndex(i)
-                    );
-                    child->setPositionY(child->getPositionY() + extra);
+                if (children) {
+                    for (unsigned i = 0; i < children->count(); ++i) {
+                        auto* child = static_cast<CCNode*>(
+                            children->objectAtIndex(i)
+                        );
+                        child->setPositionY(child->getPositionY() + extra);
+                    }
                 }
                 content->setContentSize({width, contentHeight + extra});
             }
@@ -2927,34 +2861,57 @@ namespace gdbot {
             m_revision = s.uiRevision;
         }
 
-    protected:
-        bool setup() override {
-            auto size = m_mainLayer->getContentSize();
+        bool build() {
+            if (!m_box)
+                return false;
+
+            auto size = m_box->getContentSize();
 
             auto* title = russianLabel("Бот", 24.0f);
-            title->setPosition({size.width / 2, size.height - 23.0f});
-            m_mainLayer->addChild(title);
+            auto* status = russianLabel("", 11.0f);
+            if (!title || !status)
+                return false;
 
-            m_status = russianLabel("", 11.0f);
+            title->setPosition({size.width / 2, size.height - 23.0f});
+            m_box->addChild(title);
+
+            m_status = status;
             m_status->setPosition({size.width / 2, size.height - 48.0f});
-            m_mainLayer->addChild(m_status);
+            m_box->addChild(m_status);
+
+            auto* closeMenu = ModalMenu::create();
+            if (!closeMenu)
+                return false;
+
+            closeMenu->setPosition({0, 0});
+            m_box->addChild(closeMenu);
+
+            textButton(
+                closeMenu,
+                "Закрыть",
+                {size.width - 36.0f, size.height - 20.0f},
+                {60.0f, 26.0f},
+                [this] { close(); }
+            );
 
             rebuild();
             scheduleUpdate();
             return true;
         }
 
+    public:
         void onEnter() override {
-            Popup<>::onEnter();
-            ++state().modalCount;
+            ModalLayer::onEnter();
         }
 
         void onExit() override {
-            state().modalCount = std::max(0, state().modalCount - 1);
-            Popup<>::onExit();
+            ModalLayer::onExit();
         }
 
         void update(float) override {
+            if (!m_box || !m_status)
+                return;
+
             auto const& s = state();
             auto const& r = s.run;
 
@@ -2973,11 +2930,10 @@ namespace gdbot {
             );
             m_status->setString(text.c_str());
             fitLabel(
-                m_status, m_mainLayer->getContentSize().width - 40.0f, 18.0f
+                m_status, m_box->getContentSize().width - 40.0f, 18.0f
             );
         }
 
-    public:
         static BotPopup* create() {
             auto area = safeRect();
             auto* popup = new BotPopup;
@@ -2985,28 +2941,18 @@ namespace gdbot {
             float width = std::min(500.0f, area.size.width);
             float height = std::min(360.0f, area.size.height);
 
-            if (!popup->initAnchored(width, height)) {
+            if (!popup->initModal(width, height)) {
                 delete popup;
                 return nullptr;
             }
 
-            auto window = CCDirector::sharedDirector()->getWinSize();
-            popup->m_mainLayer->setPosition(
-                popup->m_mainLayer->getPosition() + CCPoint{
-                    area.origin.x + area.size.width / 2 - window.width / 2,
-                    area.origin.y + area.size.height / 2 - window.height / 2
-                }
-            );
+            if (!popup->build()) {
+                delete popup;
+                return nullptr;
+            }
 
             popup->autorelease();
             return popup;
-        }
-
-        void animateOpen() {
-            m_mainLayer->setScale(0.92f);
-            m_mainLayer->runAction(
-                CCEaseBackOut::create(CCScaleTo::create(0.18f, 1.0f))
-            );
         }
     };
 
@@ -3019,8 +2965,7 @@ namespace gdbot {
         }
 
         if (auto* popup = BotPopup::create()) {
-            popup->show();
-            popup->animateOpen();
+            popup->present();
         }
     }
 
@@ -3050,6 +2995,9 @@ namespace gdbot {
         }
 
         void savePosition() {
+            if (!m_box)
+                return;
+
             auto area = safeRect();
             auto position = m_box->getPosition();
 
@@ -3074,6 +3022,11 @@ namespace gdbot {
             );
 
             layer->m_box = CCNode::create();
+            if (!layer->m_box) {
+                delete layer;
+                return nullptr;
+            }
+
             layer->m_box->setContentSize({54.0f, 32.0f});
             layer->m_box->setAnchorPoint({0.5f, 0.5f});
             layer->addChild(layer->m_box);
@@ -3081,11 +3034,14 @@ namespace gdbot {
             auto* background = CCLayerColor::create(
                 {38, 78, 120, 245}, 54.0f, 32.0f
             );
-            layer->m_box->addChild(background);
+            if (background)
+                layer->m_box->addChild(background);
 
             auto* label = russianLabel("Бот", 16.0f);
-            label->setPosition({27.0f, 16.0f});
-            layer->m_box->addChild(label);
+            if (label) {
+                label->setPosition({27.0f, 16.0f});
+                layer->m_box->addChild(label);
+            }
 
             auto area = safeRect();
             double x = Mod::get()->getSavedValue<double>("launcher-x", 0.0);
@@ -3112,7 +3068,7 @@ namespace gdbot {
         bool ccTouchBegan(CCTouch* touch, CCEvent*) override {
             auto const& s = state();
             if (s.modalCount > 0 || !s.run.play ||
-                !s.run.play->m_isPaused || m_touchID != -1) {
+                !s.run.play->m_isPaused || m_touchID != -1 || !m_box) {
                 return false;
             }
 
@@ -3128,7 +3084,7 @@ namespace gdbot {
         }
 
         void ccTouchMoved(CCTouch* touch, CCEvent*) override {
-            if (touch->getID() != m_touchID)
+            if (touch->getID() != m_touchID || !m_box)
                 return;
 
             auto point = convertToNodeSpace(touch->getLocation());
@@ -3157,24 +3113,6 @@ namespace gdbot {
         }
     };
 
-    // -----------------------------------------------------------------
-    // ПАТЧ 4 / двойной вызов pumpUI().
-    //
-    // Было: FrameControls — отдельный CCLayer со своим scheduleUpdate(),
-    // который тикает независимо от хука GJBaseGameLayer::update. Его
-    // update() дополнительно вызывал pumpUI(), хотя тот и так вызывается
-    // безусловно (вне зависимости от controls(this)) каждый кадр из
-    // GDBotBaseLayer::update ниже по файлу. Сейчас это не создавало
-    // видимого бага только потому, что pumpUI() идемпотентна в пределах
-    // кадра, но любое будущее изменение pumpUI(), которое начнёт
-    // накапливать состояние между вызовами, тихо сломалось бы из-за этого
-    // скрытого повторного вызова.
-    //
-    // Стало: pumpUI() вызывается только из одного места — из хука
-    // GJBaseGameLayer::update. FrameControls::update() отвечает только
-    // за собственную видимость и состояние своих кнопок.
-    // -----------------------------------------------------------------
-
     class FrameControls final : public CCLayer {
         PlayLayer* m_owner = nullptr;
         CCMenu* m_menu = nullptr;
@@ -3190,6 +3128,11 @@ namespace gdbot {
 
             layer->m_owner = owner;
             layer->m_menu = CCMenu::create();
+            if (!layer->m_menu) {
+                delete layer;
+                return nullptr;
+            }
+
             layer->m_menu->setPosition({0, 0});
             layer->addChild(layer->m_menu);
 
@@ -3212,8 +3155,10 @@ namespace gdbot {
             layer->m_hint = russianLabel(
                 "Назад недоступно", 10.0f
             );
-            layer->m_hint->setPosition({x, y - 42.0f});
-            layer->addChild(layer->m_hint);
+            if (layer->m_hint) {
+                layer->m_hint->setPosition({x, y - 42.0f});
+                layer->addChild(layer->m_hint);
+            }
 
             layer->scheduleUpdate();
             layer->setVisible(false);
@@ -3224,13 +3169,14 @@ namespace gdbot {
 
         void update(float) override {
             auto const& r = state().run;
-            bool visible = r.play == m_owner &&
+            bool visible = m_owner &&
+                           r.play == m_owner &&
                            r.frameMode &&
                            !m_owner->m_isPaused;
 
             setVisible(visible);
-            m_menu->setEnabled(visible && !r.dead);
-            // pumpUI() намеренно НЕ вызывается здесь — см. ПАТЧ 4 выше.
+            if (m_menu)
+                m_menu->setEnabled(visible && !r.dead);
         }
     };
 
@@ -3263,17 +3209,7 @@ namespace gdbot {
             );
         }
     }
-
-    // VERIFY-11:
-    // takeStateSnapshot()/compareStateSnapshot() здесь НЕ вызываются.
-    // Их наличие не доказывает возможность сохранить/восстановить полный RNG,
-    // триггеры, действия Cocos, аудио и состояние сторонних модов.
-    // Поэтому кнопка «Влево» действительно выключена, а не имитирует перемотку.
 }
-
-// -------------------------------------------------------------------------
-// Хуки. Деструкторы в $modify не переопределяются.
-// -------------------------------------------------------------------------
 
 class $modify(GDBotBaseLayer, GJBaseGameLayer) {
     static void onModify(auto& self) {
@@ -3321,29 +3257,8 @@ class $modify(GDBotBaseLayer, GJBaseGameLayer) {
         auto const& r = gdbot::state().run;
         if (!r.injecting)
             gdbot::enqueueRaw(push, button, isPlayer2, timestamp);
-
-        // Намеренно НЕ вызываем оригинал.
-        // Следующие хуки queueButton, в том числе внешнего CBF, не исполняются.
     }
 
-    // ПАТЧ 3 / недокументированное допущение.
-    //
-    // Хук handleButton — это НЕ страховка "на всякий случай", а отдельный
-    // источник ввода. На практике на Android (а возможно и в части десктопных
-    // путей) часть элементов управления — экранные кнопки, геймпад — могут
-    // вызывать GJBaseGameLayer::handleButton НАПРЯМУЮ, минуя queueButton и
-    // связанный с ним timestamp из системы ввода. Если бы это предположение
-    // было неверным и handleButton никогда не вызывался в обход очереди,
-    // перехват ниже был бы избыточен, но безвреден; если оно верно (похоже
-    // на правду по доступным описаниям 2.2081/Geode), то без этого хука
-    // бот вообще не увидел бы часть сенсорного ввода на телефоне.
-    //
-    // VERIFY-12: подтвердить на реальном устройстве Android, что (а)
-    // экранные кнопки действительно идут через handleButton в обход
-    // queueButton, и (б) что внутри processCommands/checkCollisions движок
-    // не вызывает handleButton для "виртуальных" причин (отпускание при
-    // касании орба и т.п.) вне контекста r.inSlice — иначе такие вызовы
-    // будут ошибочно считаны как пользовательский ввод следующего кадра.
     void handleButton(bool down, int button, bool isPlayer1) {
         if (!gdbot::controls(this)) {
             GJBaseGameLayer::handleButton(down, button, isPlayer1);
@@ -3362,8 +3277,6 @@ class $modify(GDBotBaseLayer, GJBaseGameLayer) {
             return;
         }
 
-        // Внутренние вызовы движка из физического ядра не превращаются
-        // в новые пользовательские события следующего кадра.
         if (r.inSlice) {
             GJBaseGameLayer::handleButton(down, button, isPlayer1);
             return;
@@ -3389,25 +3302,18 @@ class $modify(GDBotBaseLayer, GJBaseGameLayer) {
     }
 
     double getModifiedDelta(float dt) {
-        // Оригинал обязательно вызывается первым: он меняет состояние слоя.
         double native = GJBaseGameLayer::getModifiedDelta(dt);
 
         if (!gdbot::controls(this))
             return native;
 
-        // VERIFY-1: проверить фактический результат цепочки Post/Last
-        // на 2.2081 вместе с TPS bypass, speedhack и внешним CBF.
         return 1.0 / static_cast<double>(gdbot::state().tps);
     }
 
-    // VERIFY-1: наличие/хук GJBaseGameLayer::update(float) в нужных bindings.
     void update(float dt) {
         gdbot::driveUpdate(this, dt, [this](float fixedDelta) {
             GJBaseGameLayer::update(fixedDelta);
         });
-        // Единственное место вызова pumpUI(): выполняется каждый кадр,
-        // независимо от того, контролирует ли бот именно этот слой —
-        // см. ПАТЧ 4.
         gdbot::pumpUI();
     }
 
@@ -3424,12 +3330,6 @@ class $modify(GDBotBaseLayer, GJBaseGameLayer) {
         auto& r = gdbot::state().run;
         if (gdbot::controls(this) && r.inTick && !r.inSlice &&
             !r.resetDepth && !r.loadDepth) {
-            // Это детектор, а не барьер (см. примечание в начале файла):
-            // к моменту попадания сюда нативный код уже выполнил физику с
-            // делением на подшаги, которое наш CBF не учёл. Остановить
-            // уже исполняющийся нативный вызов отсюда нельзя — можно только
-            // пометить шаг как недостоверный, чтобы driveUpdate() обрезал
-            // его из записи и безопасно остановил бота сразу после возврата.
             r.badKernel = true;
         }
 
@@ -3467,10 +3367,6 @@ class $modify(GDBotPlayLayer, PlayLayer) {
         if (gdbot::owns(this) && gdbot::active() &&
             r.inTick && !r.commandsDone && !r.drainingMark) {
             r.markPending = true;
-
-            // VERIFY-4:
-            // нативные вызывающие markCheckpoint должны допускать nullptr.
-            // Запрос исполняется на ближайшей целой границе шага.
             return nullptr;
         }
 
@@ -3556,7 +3452,6 @@ class $modify(GDBotPlayLayer, PlayLayer) {
     void destroyPlayer(PlayerObject* player, GameObject* object) {
         PlayLayer::destroyPlayer(player, object);
 
-        // Не считаем смертью вызов, который нативная игра фактически отклонила.
         if (gdbot::owns(this) && this->m_playerDied)
             gdbot::onDeath();
     }
@@ -3572,8 +3467,6 @@ class $modify(GDBotPlayLayer, PlayLayer) {
             gdbot::restoreAudio();
         }
 
-        // VERIFY-5: нативный сброс кнопок при паузе должен проходить через
-        // перехватываемый handleButton либо быть безопасно восстановимым.
         PlayLayer::pauseGame(value);
 
         if (tracked && gdbot::owns(this) &&
@@ -3585,7 +3478,6 @@ class $modify(GDBotPlayLayer, PlayLayer) {
     }
 
     void levelComplete() {
-        // Отправка прогресса и результатов остается полностью нативной.
         PlayLayer::levelComplete();
 
         if (gdbot::owns(this) && gdbot::active()) {
@@ -3597,14 +3489,12 @@ class $modify(GDBotPlayLayer, PlayLayer) {
     }
 
     void onQuit() {
-        // Все обращения к живому PlayLayer — ДО оригинального onQuit.
         gdbot::detach(this);
         PlayLayer::onQuit();
     }
 };
 
 class $modify(GDBotPauseLayer, PauseLayer) {
-    // VERIFY-10: virtual void PauseLayer::customSetup() в bindings 2.2081.
     void customSetup() {
         PauseLayer::customSetup();
 
