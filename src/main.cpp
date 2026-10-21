@@ -2248,40 +2248,28 @@ namespace gdbot {
     };
 
     class ModalScrollLayer final : public ScrollLayer {
-    public:
-        // ScrollLayer in this SDK has no accessible default constructor.
-        // Inherit its real constructor(s) and initialize via the available init().
-        using ScrollLayer::ScrollLayer;
+public:
+    using ScrollLayer::ScrollLayer;
 
-        static ModalScrollLayer* create(CCSize const& size) {
-            auto* layer = new ModalScrollLayer(size);
+    static ModalScrollLayer* create(CCSize const& size) {
+        auto* layer = new ModalScrollLayer(
+            CCRect{0.0f, 0.0f, size.width, size.height},
+            false, // scrollWheelEnabled
+            true   // vertical
+        );
 
-            bool ok = false;
-            if constexpr (requires { layer->init(size); }) {
-                ok = layer->init(size);
-            }
-            else if constexpr (requires { layer->init(); }) {
-                ok = layer->init();
-            }
-            else {
-                // If the bound class already fully initializes in constructor.
-                ok = true;
-            }
-
-            if (ok) {
-                layer->autorelease();
-                return layer;
-            }
-
-            delete layer;
+        if (!layer)
             return nullptr;
-        }
 
-        void registerWithTouchDispatcher() override {
-            CCDirector::sharedDirector()->getTouchDispatcher()
-                ->addTargetedDelegate(this, kModalScrollTouchPriority, true);
-        }
-    };
+        layer->autorelease();
+        return layer;
+    }
+
+    void registerWithTouchDispatcher() override {
+        CCDirector::sharedDirector()->getTouchDispatcher()
+            ->addTargetedDelegate(this, kModalScrollTouchPriority, true);
+    }
+};
 
     class ModalLayer : public CCLayerColor {
     protected:
