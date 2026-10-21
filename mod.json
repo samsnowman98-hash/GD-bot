@@ -6,9 +6,9 @@
 		"mac": "2.2081",
 		"ios": "2.2081"
 	},
-	"id": "myname.gd_bot",
+	"id": "fermbot.gdbot",
 	"name": "FermBot",
-	"version": "v1.0.0",
+	"version": "v2.0.0",
 	"developer": "StayAlone",
 	"description": "Мой гдбот в ранней бете",
 	"dependencies": {
