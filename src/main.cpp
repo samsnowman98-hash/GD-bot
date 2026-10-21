@@ -2226,6 +2226,7 @@ namespace gdbot {
     constexpr int kModalMenuTouchPriority = 1000;
     constexpr int kModalScrollTouchPriority = 750;
     constexpr int kModalTouchPriority = 500;
+    constexpr float kFixedControlsHeight = 104.0f;
 
     class ModalMenu final : public CCMenu {
     public:
@@ -2551,36 +2552,170 @@ public:
         CCLabelTTF* m_tpsHint = nullptr;
         std::uint64_t m_revision = 0;
 
+        float m_scrollRatio = 0.0f;
+
+        CCMenu* m_fixedMenu = nullptr;
+        CCMenuItemSpriteExtra* m_recordButton = nullptr;
+        CCMenuItemSpriteExtra* m_blockInputButton = nullptr;
+        CCMenuItemSpriteExtra* m_frameModeButton = nullptr;
+
+        static CCLabelTTF* findLabelTTF(CCNode* root) {
+            if (!root)
+                return nullptr;
+            if (auto* label = typeinfo_cast<CCLabelTTF*>(root))
+                return label;
+
+            auto* children = root->getChildren();
+            if (!children)
+                return nullptr;
+
+            for (unsigned i = 0; i < children->count(); ++i) {
+                auto* child = static_cast<CCNode*>(children->objectAtIndex(i));
+                if (auto* found = findLabelTTF(child))
+                    return found;
+            }
+            return nullptr;
+        }
+
+        static void setButtonText(CCMenuItemSpriteExtra* item, std::string const& text) {
+            if (!item)
+                return;
+            auto* normal = item->getNormalImage();
+            if (!normal)
+                return;
+            if (auto* label = findLabelTTF(normal)) {
+                label->setString(text.c_str());
+                auto size = normal->getContentSize();
+                fitLabel(label, size.width - 10, size.height - 6);
+            }
+        }
+
+        void refreshFixedButtons() {
+            auto const& r = state().run;
+
+            std::string recordingText =
+                r.mode == Mode::Record ? "Остановить запись" :
+                (r.pendingStart == Mode::Record ? "Отменить начало записи" :
+                                                 "Начать запись");
+            setButtonText(m_recordButton, recordingText);
+
+            setButtonText(
+                m_blockInputButton,
+                std::string("Блокировать ввод: ") +
+                    (state().blockInput ? "да" : "нет")
+            );
+
+            setButtonText(
+                m_frameModeButton,
+                std::string("Покадровый режим: ") +
+                    (r.frameMode ? "включён" : "выключен")
+            );
+        }
+
+        void buildFixedControls() {
+            if (!m_box)
+                return;
+
+            auto size = m_box->getContentSize();
+            float width = size.width - 24.0f;
+            float half = (width - 8.0f) / 2.0f;
+
+            m_fixedMenu = ModalMenu::create();
+            if (!m_fixedMenu)
+                return;
+
+            m_fixedMenu->setPosition({0, 0});
+            m_box->addChild(m_fixedMenu);
+
+            float top = size.height - 60.0f;
+
+            m_recordButton = textButton(
+                m_fixedMenu, "Начать запись",
+                {size.width / 2, top},
+                {width, 26.0f},
+                [this] {
+                    auto& runtime = state().run;
+                    if (runtime.mode == Mode::Record ||
+                        runtime.pendingStart == Mode::Record) {
+                        stopNow(false);
+                    }
+                    else {
+                        confirmNewRecording();
+                    }
+                    refreshFixedButtons();
+                }
+            );
+
+            textButton(
+                m_fixedMenu, "Выключить бота",
+                {12.0f + half / 2, top - 30.0f},
+                {half, 26.0f},
+                [this] { stopNow(true); refreshFixedButtons(); }
+            );
+
+            textButton(
+                m_fixedMenu, "Запустить макрос",
+                {size.width - 12.0f - half / 2, top - 30.0f},
+                {half, 26.0f},
+                [this] { requestStart(Mode::Playback); refreshFixedButtons(); }
+            );
+
+            m_blockInputButton = textButton(
+                m_fixedMenu, "Блокировать ввод",
+                {12.0f + half / 2, top - 60.0f},
+                {half, 26.0f},
+                [this] {
+                    auto& current = state();
+                    current.blockInput = !current.blockInput;
+                    Mod::get()->setSavedValue("block-input", current.blockInput);
+                    if (active() && !current.run.dead)
+                        sendMask(effectiveHeld());
+                    refreshFixedButtons();
+                }
+            );
+
+            m_frameModeButton = textButton(
+                m_fixedMenu, "Покадровый режим",
+                {size.width - 12.0f - half / 2, top - 60.0f},
+                {half, 26.0f},
+                [this] {
+                    setFrameMode(!state().run.frameMode);
+                    refreshFixedButtons();
+                }
+            );
+
+            refreshFixedButtons();
+        }
         void rebuild() {
             auto& s = state();
             auto const& r = s.run;
             if (!m_box)
                 return;
-
             auto size = m_box->getContentSize();
-
-            if (m_scroll)
-                m_scroll->removeFromParentAndCleanup(true);
-
             auto files = listMacros();
             float width = size.width - 24.0f;
-            float viewHeight = std::max(1.0f, size.height - 80.0f);
+            float viewHeight = std::max(
+                1.0f, size.height - 80.0f - kFixedControlsHeight
+            );
 
-            m_scroll = ModalScrollLayer::create({width, viewHeight});
-            if (!m_scroll)
-                return;
+            bool firstBuild = m_scroll == nullptr;
+            if (firstBuild) {
+                m_scroll = ModalScrollLayer::create({width, viewHeight});
+                if (!m_scroll)
+                    return;
+                m_scroll->setPosition({12.0f, 16.0f});
+                m_box->addChild(m_scroll);
+            }
 
-            m_scroll->setPosition({12.0f, 16.0f});
-            m_box->addChild(m_scroll);
-
-            float contentHeight =
-                675.0f + static_cast<float>(files.size()) * 62.0f;
             auto* content = m_scroll->m_contentLayer;
             if (!content)
                 return;
 
-            content->setContentSize({width, contentHeight});
+            content->removeAllChildrenWithCleanup(true);
 
+            float contentHeight =
+                520.0f + static_cast<float>(files.size()) * 62.0f;
+            content->setContentSize({width, contentHeight});
             auto* menu = ModalMenu::create();
             if (!menu)
                 return;
@@ -2627,27 +2762,6 @@ public:
                 );
                 y -= 36.0f;
             };
-
-            std::string recordingText =
-                r.mode == Mode::Record ? "Остановить запись" :
-                (r.pendingStart == Mode::Record ? "Отменить начало записи" :
-                                                 "Начать запись");
-
-            fullButton(recordingText, [] {
-                auto& runtime = state().run;
-                if (runtime.mode == Mode::Record ||
-                    runtime.pendingStart == Mode::Record) {
-                    stopNow(false);
-                }
-                else {
-                    confirmNewRecording();
-                }
-            });
-
-            pairButtons(
-                "Выключить бота", [] { stopNow(true); },
-                "Запустить макрос", [] { requestStart(Mode::Playback); }
-            );
 
             auto inputRow = [&](
                 std::string caption,
@@ -2726,27 +2840,6 @@ public:
             );
             m_tpsHint = line(
                 "Меняется только при полностью выключенном боте.", 11.0f
-            );
-
-            fullButton(
-                std::string("Блокировать ввод: ") +
-                    (s.blockInput ? "да" : "нет"),
-                [] {
-                    auto& current = state();
-                    current.blockInput = !current.blockInput;
-                    Mod::get()->setSavedValue(
-                        "block-input", current.blockInput
-                    );
-                    if (active() && !current.run.dead)
-                        sendMask(effectiveHeld());
-                    changed();
-                }
-            );
-
-            fullButton(
-                std::string("Покадровый режим: ") +
-                    (r.frameMode ? "включён" : "выключен"),
-                [] { setFrameMode(!state().run.frameMode); }
             );
 
             inputRow(
@@ -2890,9 +2983,16 @@ public:
                     }
                 }
                 content->setContentSize({width, contentHeight + extra});
+                contentHeight += extra;
             }
 
-            m_scroll->scrollToTop();
+            float maxOffset = std::max(0.0f, contentHeight - viewHeight);
+            if (firstBuild) {
+                m_scroll->scrollToTop();
+            }
+            else {
+                content->setPositionY(-m_scrollRatio * maxOffset);
+            }
             m_revision = s.uiRevision;
         }
 
@@ -2928,7 +3028,7 @@ public:
                 {60.0f, 26.0f},
                 [this] { close(); }
             );
-
+            buildFixedControls();
             rebuild();
             scheduleUpdate();
             return true;
@@ -2949,10 +3049,19 @@ public:
 
             auto const& s = state();
             auto const& r = s.run;
-
-            if (m_revision != s.uiRevision)
+            if (m_revision != s.uiRevision) {
+                if (m_scroll && m_scroll->m_contentLayer) {
+                    auto* content = m_scroll->m_contentLayer;
+                    float contentHeight = content->getContentSize().height;
+                    float viewHeight = m_scroll->getContentSize().height;
+                    float maxOffset = std::max(0.0f, contentHeight - viewHeight);
+                    m_scrollRatio = maxOffset > 0.0f
+                        ? std::clamp(-content->getPositionY() / maxOffset, 0.0f, 1.0f)
+                        : 0.0f;
+                }
                 rebuild();
-
+                refreshFixedButtons();
+            }
             std::string mode =
                 r.pendingStart ? "Ожидание выхода из паузы" :
                 r.mode == Mode::Record ? "Запись" :
