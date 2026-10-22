@@ -18,6 +18,20 @@
 //   GJBaseGameLayer::queueButton
 //   GJBaseGameLayer::shouldUseSubstepForButton
 // - Input capture adapted to handleButton + processQueuedButtons.
+//
+// Timing core v2 (шаговая точность):
+// - один тик бота == ровно один нативный шаг физики (getModifiedDelta ->
+//   min(1, m_timeWarp)/240, m_extraDelta обнуляется, stepCount всегда 1);
+// - макрос хранит поток событий (step, order, button, down, player2),
+//   формат v2, файлы v1 читаются с пересортировкой фаз в order;
+// - ввод забирается из m_queuedButtons в первом хуке шага и применяется самим
+//   ботом — в одной и той же точке при записи и при воспроизведении;
+// - слайсирование processCommands и wall-clock интерполяция фаз удалены:
+//   суб-тик точность в GD даёт разбиение PlayerObject::update, а не
+//   processCommands, поэтому фаза физически ничего не решала;
+// - tps теперь темп воспроизведения (240 = нормально), а не частота физики,
+//   и на совместимость макроса не влияет.
+// Подробности и обоснование: docs/ACCURACY.md, проверки: tests/.
 
 #include <Geode/Geode.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
@@ -27,6 +41,8 @@
 #include <Geode/binding/CheckpointObject.hpp>
 #include <Geode/binding/FMODAudioEngine.hpp>
 #include <Geode/binding/GJGameLevel.hpp>
+#include <Geode/binding/GJGameState.hpp>
+#include <Geode/binding/PlayerButtonCommand.hpp>
 #include <Geode/binding/PlayerObject.hpp>
 
 #include <Geode/ui/ScrollLayer.hpp>
@@ -70,16 +86,24 @@ using namespace geode::prelude;
 namespace gdbot {
     namespace fs = std::filesystem;
 
-    constexpr std::uint32_t kDefaultTPS = 240;
+namespace {
+    constexpr std::uint32_t kNativeTPS = 240;   // нативная частота шага физики GD 2.2
+    constexpr std::uint32_t kDefaultTPS = 240;  // темп бота по умолчанию = нативный
     constexpr std::uint32_t kMinTPS = 30;
-    constexpr std::uint32_t kMaxTPS = 2000;
+    // Больше 240 шагов в секунду не существует: нативный stepCount =
+    // round(max(1, modifiedDelta*240/min(1,timeWarp))) и всегда >= 1.
+    constexpr std::uint32_t kMaxTPS = kNativeTPS;
+
     constexpr std::uint32_t kMaxBurst = 512;
     constexpr std::uint64_t kMaxEvents = 2'000'000;
     constexpr std::uint32_t kHeaderSize = 48;
     constexpr std::uint32_t kRecordSize = 16;
-    constexpr std::uint32_t kFormatVersion = 1;
+    constexpr std::uint32_t kFormatVersion = 2;
+    constexpr std::uint32_t kLegacyFormatVersion = 1;
     constexpr std::uint32_t kFooterSize = 4;
     constexpr std::size_t kListLimit = 128;
+    constexpr std::size_t kPendingInputLimit = 4096;
+}
 
     constexpr std::array<std::uint8_t, 8> kMagic{
         'G', 'D', 'B', 'O', 'T', '\r', '\n', 0x1a
@@ -99,14 +123,27 @@ namespace gdbot {
         Manual
     };
 
+    // Одно событие ввода. Шаг — нативный шаг физики (1/240 с с поправкой на
+    // timeWarp), order — порядок события внутри шага.
     struct Action {
         std::uint32_t step = 0;
-        double phase = 0.0;
+        std::uint32_t order = 0;
+        std::uint8_t button = 1;   // PlayerButton: 1=Jump, 2=Left, 3=Right
+        bool down = false;
+        bool player2 = false;
+
+        bool operator==(Action const&) const = default;
+    };
+
+    // Событие, подготовленное к применению внутри шага.
+    struct StepEvent {
+        std::uint32_t order = 0;
         std::uint8_t button = 1;
         bool down = false;
         bool player2 = false;
+        Source source = Source::Manual;
+        bool alreadyApplied = false;   // прямой handleButton мимо очереди
     };
-
     struct Macro {
         std::uint32_t tps = kDefaultTPS;
         std::uint64_t level = 0;
@@ -115,19 +152,6 @@ namespace gdbot {
         std::vector<Action> actions;
     };
 
-    struct RawInput {
-        double timestamp = 0.0;
-        std::uint8_t button = 1;
-        bool down = false;
-        bool player2 = false;
-        std::uint64_t order = 0;
-    };
-
-    struct ScheduledAction {
-        Action action;
-        Source source = Source::Manual;
-        std::uint64_t order = 0;
-    };
 
     struct CheckpointData {
         std::uint32_t nextStep = 0;
@@ -157,6 +181,31 @@ namespace gdbot {
         bool operator==(PhysicsStamp const&) const = default;
     };
 
+    struct Telemetry {
+        std::uint64_t ticks = 0;
+        std::uint64_t stepsNoHook = 0;        // тик без единого хука шага
+        std::uint64_t commandsCalls = 0;      // всего вызовов processCommands
+        std::uint64_t queuedCalls = 0;        // всего вызовов processQueuedButtons
+        std::uint32_t maxCommandsPerTick = 0; // должно быть 1
+        std::uint32_t maxQueuedPerTick = 0;
+        std::uint64_t directButtons = 0;      // handleButton внутри шага мимо очереди
+        std::uint64_t deferredButtons = 0;    // handleButton вне шага -> отложен
+        std::uint64_t droppedButtons = 0;     // подавлено (пауза/смерть/block-input)
+        std::uint64_t eventsRecorded = 0;
+        std::uint64_t eventsPlayed = 0;
+        // События макроса, которые не были применены: шаг прошёл без хука,
+        // либо курсор перескочил их. Любой nonzero здесь = потерянный клик.
+        std::uint64_t macroEventsDropped = 0;
+        // Тик, не давший физического шага (интро уровня, m_resumeTimer).
+        // Номер шага при этом НЕ сжигается — см. driveUpdate.
+        std::uint64_t ticksWithoutStep = 0;
+        long long nativeStepDrift = 0;        // native steps - committed steps
+        bool warnedNoHook = false;
+        bool warnedDrift = false;
+        bool warnedNoStep = false;
+        bool warnedDropped = false;
+    };
+
     struct Runtime {
         PlayLayer* play = nullptr;
         std::uint64_t session = 0;
@@ -166,19 +215,25 @@ namespace gdbot {
         Mode mode = Mode::Off;
         std::optional<Mode> pendingStart;
 
-        std::uint32_t step = 0;
+        // --- шаговые часы ---
+        std::uint32_t step = 0;              // шаг, который выполняется сейчас
         std::size_t playbackCursor = 0;
-        long double debt = 0.0L;
+        long double debt = 0.0L;             // аккумулятор РЕАЛЬНОГО времени, сек
+
+        bool inTick = false;                 // внутри original(q)
+        bool stepHandled = false;            // ввод этого шага уже разобран
+        std::uint32_t orderInStep = 0;
+        std::vector<StepEvent> stepEvents;   // живой ввод текущего шага
+        std::vector<StepEvent> pendingInputs;// ввод, пришедший вне шага
+
+        // --- форсирование ровно одного нативного шага ---
+        bool forceOneStep = false;
+        float forcedDelta = 1.0f / static_cast<float>(kNativeTPS);
 
         bool paused = false;
         bool dead = false;
         bool frameMode = false;
         std::uint64_t frameBudget = 0;
-
-        double inputAnchor = 0.0;
-        std::uint64_t inputOrder = 0;
-        std::vector<RawInput> rawInputs;
-        std::map<std::uint32_t, std::vector<ScheduledAction>> manualActions;
 
         std::uint8_t manualHeld = 0;
         std::uint8_t macroHeld = 0;
@@ -190,11 +245,11 @@ namespace gdbot {
 
         bool injecting = false;
         bool pauseGuard = false;
-        bool inTick = false;
-        bool inSlice = false;
+        bool inSlice = false;          // оставлено: используется чекпоинтами
         bool commandsDone = false;
         bool badKernel = false;
         unsigned commandCalls = 0;
+        unsigned queuedCalls = 0;
 
         PhysicsStamp beforeTick;
         PhysicsStamp afterCommands;
@@ -216,9 +271,8 @@ namespace gdbot {
         bool questionAfterStop = false;
         std::string stopMessage;
 
-        bool badTimestampWarned = false;
+        Telemetry telemetry;
     };
-
     struct AudioState {
         bool pitchOwned = false;
         bool pauseOwned = false;
@@ -237,7 +291,9 @@ namespace gdbot {
         bool configured = false;
         std::uint32_t tps = kDefaultTPS;
         double recordingSpeed = 1.0;
-        bool blockInput = false;
+        // По умолчанию живой ввод при воспроизведении ЗАБЛОКИРОВАН: любое
+        // случайное нажатие поверх макроса расходится с записью и роняет прогон.
+        bool blockInput = true;
         std::uint32_t frameSize = 1;
 
         fs::path directory;
@@ -274,6 +330,7 @@ namespace gdbot {
     void syncAudio();
     void stopNow(bool disableFrames);
     void flushStop();
+    void finishPlayback();
     void beginPendingStart();
 
     void changed() {
@@ -368,9 +425,6 @@ namespace gdbot {
         return state().run.play == layer;
     }
 
-    double inputTimestamp() {
-        return static_cast<double>(geode::utils::getInputTimestamp());
-    }
 
     std::uint64_t levelID(GJGameLevel* level) {
         if (!level)
@@ -486,11 +540,11 @@ namespace gdbot {
     bool actionLess(Action const& a, Action const& b) {
         if (a.step != b.step)
             return a.step < b.step;
-        return a.phase < b.phase;
+        return a.order < b.order;
     }
 
     bool validateMacro(Macro const& macro, std::string& error) {
-        if (macro.tps < kMinTPS || macro.tps > kMaxTPS ||
+        if (macro.tps < kMinTPS || macro.tps > kNativeTPS ||
             (macro.initialHeld & ~0x3fu) != 0 ||
             macro.actions.size() > kMaxEvents) {
             error = "Недопустимые параметры макроса.";
@@ -500,8 +554,6 @@ namespace gdbot {
         std::optional<Action> previous;
         for (auto const& action : macro.actions) {
             if (action.button < 1 || action.button > 3 ||
-                !std::isfinite(action.phase) ||
-                action.phase < 0.0 || action.phase >= 1.0 ||
                 action.step >= macro.length) {
                 error = "Повреждена запись действия.";
                 return false;
@@ -541,9 +593,7 @@ namespace gdbot {
 
         for (auto const& action : macro.actions) {
             writer.integer<std::uint32_t>(action.step);
-            writer.integer<std::uint64_t>(
-                std::bit_cast<std::uint64_t>(action.phase)
-            );
+            writer.integer<std::uint64_t>(action.order);
             writer.byte(action.button);
             writer.byte(action.down ? 1 : 0);
             writer.byte(action.player2 ? 1 : 0);
@@ -557,9 +607,17 @@ namespace gdbot {
         return true;
     }
 
+    // Старый формат v1 хранил double phase вместо uint32 order. Порядок
+    // событий восстанавливается сортировкой по (step, phase); сами значения
+    // фаз в v2 бессмысленны (см. docs/ACCURACY.md, раздел 1), поэтому файл
+    // перечитывается в шаговую модель.
     bool readMacro(
-        fs::path const& path, Macro& result, std::string& error
+        fs::path const& path, Macro& result, std::string& error,
+        bool& legacy
     ) {
+        legacy = false;
+        error.clear();
+
         std::error_code ec;
         auto size = fs::file_size(path, ec);
         constexpr auto maxSize =
@@ -604,10 +662,12 @@ namespace gdbot {
             return false;
         }
 
-        if (version != kFormatVersion ||
-            headerSize != kHeaderSize ||
-            recordSize != kRecordSize) {
+        if (version != kFormatVersion && version != kLegacyFormatVersion) {
             error = "Версия формата не поддерживается.";
+            return false;
+        }
+        if (headerSize != kHeaderSize || recordSize != kRecordSize) {
+            error = "Размер записи не совпадает с ожидаемым.";
             return false;
         }
         if (initial > 0x3f || count > kMaxEvents) {
@@ -623,9 +683,22 @@ namespace gdbot {
         }
 
         candidate.initialHeld = static_cast<std::uint8_t>(initial);
+        legacy = (version == kLegacyFormatVersion);
+
+        struct LegacyRow {
+            std::uint32_t step = 0;
+            double phase = 0.0;
+            std::uint8_t button = 1;
+            bool down = false;
+            bool player2 = false;
+        };
+        std::vector<LegacyRow> legacyRows;
 
         try {
-            candidate.actions.reserve(static_cast<std::size_t>(count));
+            if (legacy)
+                legacyRows.reserve(static_cast<std::size_t>(count));
+            else
+                candidate.actions.reserve(static_cast<std::size_t>(count));
         }
         catch (std::exception const&) {
             error = "Недостаточно памяти для этого макроса.";
@@ -633,15 +706,16 @@ namespace gdbot {
         }
 
         for (std::uint64_t i = 0; i < count; ++i) {
-            Action action;
-            std::uint64_t phaseBits = 0;
+            std::uint32_t step = 0;
+            std::uint64_t payload = 0;
+            std::uint8_t button = 0;
             std::uint8_t down = 0;
             std::uint8_t player = 0;
             std::uint8_t reserved = 0;
 
-            if (!reader.integer(action.step) ||
-                !reader.integer(phaseBits) ||
-                !reader.byte(action.button) ||
+            if (!reader.integer(step) ||
+                !reader.integer(payload) ||
+                !reader.byte(button) ||
                 !reader.byte(down) ||
                 !reader.byte(player) ||
                 !reader.byte(reserved)) {
@@ -649,38 +723,92 @@ namespace gdbot {
                 return false;
             }
 
-            if (down > 1 || player > 1 || reserved != 0) {
+            if (button < 1 || button > 3 || down > 1 || player > 1 ||
+                reserved != 0) {
                 error = "Повреждены флаги действия.";
                 return false;
             }
 
-            action.phase = std::bit_cast<double>(phaseBits);
-            action.down = down != 0;
-            action.player2 = player != 0;
-
-            if (action.phase == 1.0) {
-                if (action.step == std::numeric_limits<std::uint32_t>::max()) {
-                    error = "Переполнение номера шага.";
+            if (legacy) {
+                double phase = std::bit_cast<double>(payload);
+                if (!std::isfinite(phase) || phase < 0.0 || phase > 1.0) {
+                    error = "Повреждена фаза действия (старый формат).";
                     return false;
                 }
-                ++action.step;
-                action.phase = 0.0;
+                auto rowStep = step;
+                if (phase == 1.0) {
+                    if (step == std::numeric_limits<std::uint32_t>::max()) {
+                        error = "Переполнение номера шага.";
+                        return false;
+                    }
+                    rowStep = step + 1;
+                    phase = 0.0;
+                }
+                legacyRows.push_back({rowStep, phase, button, down != 0, player != 0});
             }
-
-            candidate.actions.push_back(action);
+            else {
+                Action action;
+                action.step = step;
+                action.order = payload > 0xffffffffull
+                    ? 0xffffffffu
+                    : static_cast<std::uint32_t>(payload);
+                action.button = button;
+                action.down = down != 0;
+                action.player2 = player != 0;
+                candidate.actions.push_back(action);
+            }
         }
 
         if (!reader.finish()) {
             error = "Не совпала контрольная сумма или файл изменился.";
             return false;
         }
+
+        if (legacy) {
+            std::stable_sort(
+                legacyRows.begin(), legacyRows.end(),
+                [](LegacyRow const& a, LegacyRow const& b) {
+                    if (a.step != b.step)
+                        return a.step < b.step;
+                    return a.phase < b.phase;
+                }
+            );
+
+            bool firstRow = true;
+            std::uint32_t lastStep = 0;
+            std::uint32_t order = 0;
+
+            for (auto const& row : legacyRows) {
+                if (firstRow || row.step != lastStep) {
+                    firstRow = false;
+                    lastStep = row.step;
+                    order = 0;
+                }
+                else {
+                    ++order;
+                }
+
+                Action action;
+                action.step = row.step;
+                action.order = order;
+                action.button = row.button;
+                action.down = row.down;
+                action.player2 = row.player2;
+                candidate.actions.push_back(action);
+            }
+
+            // v1 писал «шаг» в единицах 1/tps; перечитать это в нативные шаги
+            // без полной перезаписи уровня невозможно, поэтому приводим темп к
+            // нативному и предупреждаем пользователя.
+            candidate.tps = kNativeTPS;
+        }
+
         if (!validateMacro(candidate, error))
             return false;
 
         result = std::move(candidate);
         return true;
     }
-
     std::string cleanStem(std::string const& input) {
         std::string result;
         result.reserve(64);
@@ -780,6 +908,9 @@ namespace gdbot {
         s.configured = true;
 
         auto* mod = Mod::get();
+        // Темп бота: сколько нативных шагов 1/240 проигрывать в реальную
+        // секунду. 240 = обычная скорость уровня. Выше 240 не бывает:
+        // нативный stepCount = round(max(1, modifiedDelta*240/min(1,tw))).
         auto tps = mod->getSavedValue<int>("physics-tps", static_cast<int>(kDefaultTPS));
         s.tps = static_cast<std::uint32_t>(
             std::clamp(tps, static_cast<int>(kMinTPS), static_cast<int>(kMaxTPS))
@@ -791,7 +922,10 @@ namespace gdbot {
             s.recordingSpeed = 1.0;
         s.recordingSpeed = std::clamp(s.recordingSpeed, 0.01, 2.0);
 
-        s.blockInput = mod->getSavedValue<bool>("block-input", false);
+        // Ключ сменился с "block-input" на "block-live-input": старый дефолт
+        // был false, и у уже настроенных установок живой ввод молча
+        // примешивался к макросу. Новый ключ даёт безопасный дефолт всем.
+        s.blockInput = mod->getSavedValue<bool>("block-live-input", true);
 
         auto frameSize = mod->getSavedValue<int>("frame-size", 1);
         s.frameSize = static_cast<std::uint32_t>(
@@ -947,17 +1081,12 @@ namespace gdbot {
             error = "Сначала откройте уровень.";
             return false;
         }
-        if (macro.tps != s.tps) {
-            error = "Частота физики макроса не совпадает с настройкой бота.";
-            return false;
-        }
         if (macro.level != s.run.level) {
             error = "Макрос относится к другому уровню.";
             return false;
         }
         return true;
     }
-
     bool loadFile(fs::path const& path) {
         auto& s = state();
 
@@ -968,7 +1097,9 @@ namespace gdbot {
 
         Macro candidate;
         std::string error;
-        if (!readMacro(path, candidate, error) ||
+        bool legacy = false;
+
+        if (!readMacro(path, candidate, error, legacy) ||
             !compatible(candidate, error)) {
             showNotice(error, true);
             return false;
@@ -981,6 +1112,24 @@ namespace gdbot {
         s.run.checkpoints.clear();
         changed();
 
+        if (legacy) {
+            showNotice(
+                "Файл старого формата v1: фазы внутри шага пересчитаны в "
+                "порядок событий, темп приведён к 240. Для точности "
+                "перезапишите макрос.",
+                true
+            );
+        }
+
+        if (s.buffer.tps != s.tps) {
+            showNotice(
+                "Темп записи (" + std::to_string(s.buffer.tps) +
+                ") отличается от текущего (" + std::to_string(s.tps) +
+                "). Макрос хранится в нативных шагах 1/240, поэтому "
+                "воспроизведение корректно при любом темпе."
+            );
+        }
+
         if (s.buffer.level == 0) {
             showNotice(
                 "Макрос загружен. Локальные уровни без номера не различаются.",
@@ -992,7 +1141,6 @@ namespace gdbot {
         }
         return true;
     }
-
     FMOD::ChannelGroup* masterGroup() {
         auto* engine = FMODAudioEngine::sharedEngine();
         if (!engine || !engine->m_system)
@@ -1087,6 +1235,23 @@ namespace gdbot {
         return r.manualHeld;
     }
 
+    // Длительность одного нативного шага в ИГРОВОМ времени.
+    // Одновременно — значение, которое мы подсовываем в getModifiedDelta,
+    // чтобы stepCount = round(max(1, q*240/min(1,tw))) == 1 при любом timeWarp.
+    float nativeStepDelta() {
+        auto const& r = state().run;
+        constexpr float fallback = 1.0f / static_cast<float>(kNativeTPS);
+        if (!r.play)
+            return fallback;
+
+        float warp = r.play->m_gameState.m_timeWarp;
+        if (!std::isfinite(warp) || warp <= 0.0f)
+            warp = 1.0f;
+
+        float q = std::min(1.0f, warp) / static_cast<float>(kNativeTPS);
+        return q > 0.0f ? q : fallback;
+    }
+
     void sendButton(int button, bool down, bool player2) {
         auto& r = state().run;
         if (!r.play)
@@ -1096,6 +1261,12 @@ namespace gdbot {
         r.injecting = true;
         r.play->handleButton(down, button, !player2);
         r.injecting = previous;
+
+        auto bit = buttonBit(button, player2);
+        if (down)
+            r.sentHeld |= bit;
+        else
+            r.sentHeld &= static_cast<std::uint8_t>(~bit);
     }
 
     void sendMask(std::uint8_t desired, bool force = false) {
@@ -1128,6 +1299,7 @@ namespace gdbot {
             r.flagsSaved = true;
         }
 
+        // Детерминизм: никакой нативной суб-тик логики, ввод ровно по шагам.
         r.play->m_clickBetweenSteps = false;
         r.play->m_clickOnSteps = false;
 
@@ -1175,8 +1347,9 @@ namespace gdbot {
             r.frameBudget = 0;
         }
 
-        r.rawInputs.clear();
-        r.manualActions.clear();
+        r.stepEvents.clear();
+        r.pendingInputs.clear();
+        r.orderInStep = 0;
         r.debt = 0.0L;
         r.markPending = false;
 
@@ -1213,6 +1386,37 @@ namespace gdbot {
         }
     }
 
+    // Конец воспроизведения с обязательной сверкой: сколько событий макроса
+    // реально применено и сколько потеряно. Без этого прогон мог «пройти»
+    // с молча выброшенными кликами — раньше единственной реакцией была смерть.
+    void finishPlayback() {
+        auto& s = state();
+        auto& r = s.run;
+
+        auto const total = s.buffer.actions.size();
+        auto const played = r.telemetry.eventsPlayed;
+        auto const dropped = r.telemetry.macroEventsDropped;
+        bool const exact = dropped == 0 && played == total;
+
+        if (exact) {
+            requestStop(fmt::format(
+                "Макрос завершён: применено все {} событий, потерь нет.",
+                total
+            ));
+            return;
+        }
+
+        requestStop(
+            fmt::format(
+                "Макрос завершён с расхождением: применено {} из {} событий, "
+                "потеряно {}. Прогон не был точным — смотреть «без хука» и "
+                "«без шага» в статусе.",
+                played, total, dropped
+            ),
+            false, true
+        );
+    }
+
     void trimRecording(std::uint32_t nextStep) {
         auto& s = state();
         if (!s.hasBuffer)
@@ -1236,14 +1440,18 @@ namespace gdbot {
         r.playbackCursor = 0;
         r.debt = 0.0L;
         r.frameBudget = 0;
-        r.rawInputs.clear();
-        r.manualActions.clear();
+        r.stepEvents.clear();
+        r.pendingInputs.clear();
+        r.orderInStep = 0;
+        r.stepHandled = false;
         r.manualHeld = 0;
         r.macroHeld = 0;
         r.sentHeld = 0;
         r.dead = false;
         r.markPending = false;
-        r.inputAnchor = inputTimestamp();
+        r.discardCurrentStep = false;
+        if (r.play)
+            r.play->m_extraDelta = 0.0;   // аккумулятором владеем мы
     }
 
     void requestStart(Mode mode) {
@@ -1302,212 +1510,286 @@ namespace gdbot {
         r.paused = play->m_isPaused;
         r.mode = mode;
 
+        // Телеметрия — за прогон, а не за сессию уровня. Без сброса второй
+        // прогон в том же уровне сравнивал eventsPlayed с накопленным значением
+        // и finishPlayback() всегда рапортовал бы расхождение.
+        r.telemetry = Telemetry{};
+
         if (mode == Mode::Record) {
             s.buffer = Macro{};
             s.buffer.tps = s.tps;
             s.buffer.level = r.level;
             s.hasBuffer = true;
         }
-        else {
-            r.macroHeld = s.buffer.initialHeld;
-        }
+
+        // initialHeld из заголовка больше не применяется: макрос — поток
+        // событий, удерживаемые состояния восстанавливаются сами из первого
+        // же down-события. macroHeld отслеживает их только для sendMask().
+        r.macroHeld = 0;
 
         installNativeFlags();
-        sendMask(effectiveHeld(), true);
+        // Не force: sentHeld ведёт sendButton() и после clearTimeline() он 0,
+        // а resetLevelFromStart() нативно отпустил все кнопки. Force-вариант
+        // слал 6 лишних событий на каждом старте — лишний «press» способен
+        // повторно триггернуть прыжок.
+        sendMask(effectiveHeld());
         syncAudio();
         changed();
     }
 
-    void enqueueRaw(
-        bool down, int button, bool player2, double timestamp
-    ) {
+    // --- захват ввода ------------------------------------------------------
+
+    // handleButton вне шага: событие принадлежит следующему шагу.
+    void deferInput(bool down, int button, bool player2) {
         auto& r = state().run;
         if (!buttonBit(button, player2))
             return;
-        if (!r.play || r.pauseGuard || r.paused ||
-            r.play->m_isPaused || r.dead || r.pendingStart) {
-            return;
-        }
 
-        if (r.rawInputs.size() >= 65536) {
+        if (r.pendingInputs.size() >= kPendingInputLimit) {
+            ++r.telemetry.droppedButtons;
             requestStop("Переполнена очередь ввода. Бот остановлен.", false, true);
             return;
         }
 
-        r.rawInputs.push_back({
-            timestamp,
-            static_cast<std::uint8_t>(button),
-            down,
-            player2,
-            ++r.inputOrder
-        });
+        StepEvent event;
+        event.button = static_cast<std::uint8_t>(button);
+        event.down = down;
+        event.player2 = player2;
+        event.source = Source::Manual;
+        r.pendingInputs.push_back(event);
+        ++r.telemetry.deferredButtons;
     }
 
-    void mapRawInputs(
-        double frameDelta,
-        double inputEnd,
-        bool staticTimestampAllowed = false
-    ) {
-        auto& s = state();
-        auto& r = s.run;
+    // handleButton внутри шага, но мимо нативной очереди (прямой вызов —
+    // так делают сторонние моды). Игра уже применила событие, поэтому
+    // помечаем alreadyApplied: в макрос оно попадает, повторно не шлётся.
+    //
+    // ОГРАНИЧЕНИЕ (честно): при записи такое событие применяется в момент
+    // вызова (возможно, после нативного тела processCommands), а при
+    // воспроизведении — в общей точке применения ввода шага (до тела
+    // processCommands). В пределах одного шага это может дать расхождение,
+    // если в этом же шаге сработал триггер. В норме весь пользовательский
+    // ввод идёт через m_queuedButtons и этого пути не касается; телеметрия
+    // показывает его как счётчик direct.
+    void noteDirectInput(bool down, int button, bool player2) {
+        auto& r = state().run;
+        if (!buttonBit(button, player2))
+            return;
 
-        double inputSpan = inputEnd - r.inputAnchor;
-        long double origin =
-            static_cast<long double>(r.step) + r.debt * s.tps;
+        StepEvent event;
+        event.order = r.orderInStep++;
+        event.button = static_cast<std::uint8_t>(button);
+        event.down = down;
+        event.player2 = player2;
+        event.source = Source::Manual;
+        event.alreadyApplied = true;
+        r.stepEvents.push_back(event);
+    }
 
-        double speed = r.mode == Mode::Record ? s.recordingSpeed : 1.0;
-        long double span =
-            static_cast<long double>(frameDelta) * speed * s.tps;
+    // processQueuedButtons вызвался вне шага: не даём игре применить ввод
+    // в произвольный момент, переносим события на следующий шаг.
+    void deferQueued(GJBaseGameLayer* layer) {
+        auto& r = state().run;
 
-        for (auto const& input : r.rawInputs) {
-            long double tick = r.step;
+        for (auto const& command : layer->m_queuedButtons) {
+            auto button = static_cast<int>(command.m_button);
+            if (button < 1 || button > 3)
+                continue;
 
-            if (!r.frameMode) {
-                double ratio = 1.0;
-                bool haveSpan =
-                    std::isfinite(input.timestamp) &&
-                    std::isfinite(inputSpan) &&
-                    inputSpan > 0.0;
-
-                if (haveSpan) {
-                    ratio = std::clamp(
-                        (input.timestamp - r.inputAnchor) / inputSpan,
-                        0.0, 1.0
-                    );
-                }
-                else if (!staticTimestampAllowed && !r.badTimestampWarned) {
-                    r.badTimestampWarned = true;
-                    postNotice(
-                        "Шкала времени ввода недоступна: проверьте привязку кликов.",
-                        true
-                    );
-                }
-
-                if (staticTimestampAllowed && !haveSpan)
-                    ratio = 0.0;
-
-                tick = origin + span * ratio;
+            if (r.pendingInputs.size() >= kPendingInputLimit) {
+                ++r.telemetry.droppedButtons;
+                continue;
             }
 
-            if (!std::isfinite(tick) ||
-                tick >= std::numeric_limits<std::uint32_t>::max() - 1.0L) {
-                requestStop("Достигнут предел длины макроса.", false, true);
-                break;
-            }
-
-            tick = std::max(tick, static_cast<long double>(r.step));
-            auto integerPart = std::floor(tick);
-
-            Action action;
-            action.step = static_cast<std::uint32_t>(integerPart);
-            action.phase = static_cast<double>(tick - integerPart);
-            action.button = input.button;
-            action.down = input.down;
-            action.player2 = input.player2;
-
-            if (action.phase >= 1.0) {
-                ++action.step;
-                action.phase = 0.0;
-            }
-
-            r.manualActions[action.step].push_back({
-                action, Source::Manual, input.order
-            });
+            StepEvent event;
+            event.button = static_cast<std::uint8_t>(button);
+            event.down = command.m_isPush;
+            event.player2 = command.m_isPlayer2;
+            event.source = Source::Manual;
+            r.pendingInputs.push_back(event);
+            ++r.telemetry.deferredButtons;
         }
-
-        r.rawInputs.clear();
-        r.inputAnchor = inputEnd;
+        layer->m_queuedButtons.clear();
     }
 
-    void applyAction(ScheduledAction const& scheduled) {
-        auto& s = state();
-        auto& r = s.run;
-        auto const& action = scheduled.action;
-        auto bit = buttonBit(action.button, action.player2);
+    // Снять урожай ввода этого шага: отложенные события + нативная очередь.
+    // Очередь очищается — дальше ввод применяем только мы.
+    void harvestStepInputs(GJBaseGameLayer* layer) {
+        auto& r = state().run;
+
+        for (auto& event : r.pendingInputs) {
+            event.order = r.orderInStep++;
+            r.stepEvents.push_back(event);
+        }
+        r.pendingInputs.clear();
+
+        for (auto const& command : layer->m_queuedButtons) {
+            auto button = static_cast<int>(command.m_button);
+            if (button < 1 || button > 3)
+                continue;
+
+            StepEvent event;
+            event.order = r.orderInStep++;
+            event.button = static_cast<std::uint8_t>(button);
+            event.down = command.m_isPush;
+            event.player2 = command.m_isPlayer2;
+            event.source = Source::Manual;
+            r.stepEvents.push_back(event);
+        }
+        layer->m_queuedButtons.clear();
+    }
+
+    void applyEvent(StepEvent const& event) {
+        auto& r = state().run;
+        auto bit = buttonBit(event.button, event.player2);
         if (!bit)
             return;
 
-        auto& sourceMask = scheduled.source == Source::Macro
+        auto& mask = event.source == Source::Macro
             ? r.macroHeld
             : r.manualHeld;
 
-        if (action.down)
-            sourceMask |= bit;
+        if (event.down)
+            mask |= bit;
         else
-            sourceMask &= static_cast<std::uint8_t>(~bit);
+            mask &= static_cast<std::uint8_t>(~bit);
 
-        auto desired = effectiveHeld();
-        bool changesEffectiveState = ((desired ^ r.sentHeld) & bit) != 0;
+        if (event.alreadyApplied) {
+            // Событие применила сама игра (прямой handleButton мимо очереди).
+            // sentHeld обязан это учесть, иначе последующий sendMask() пошлёт
+            // лишние нажатия и может повторно триггернуть прыжок.
+            if (event.down)
+                r.sentHeld |= bit;
+            else
+                r.sentHeld &= static_cast<std::uint8_t>(~bit);
+            return;
+        }
 
-        if (r.mode == Mode::Record &&
-            scheduled.source == Source::Manual &&
-            changesEffectiveState) {
-            if (s.buffer.actions.size() >= kMaxEvents) {
+        if (event.source == Source::Macro)
+            ++r.telemetry.eventsPlayed;
+
+        sendButton(event.button, event.down, event.player2);
+    }
+
+    // Единственная точка применения ввода. Вызывается из первого хука шага
+    // (processCommands или processQueuedButtons — кто пришёл первым).
+    // При записи и при воспроизведении позиция внутри шага одинакова,
+    // поэтому воспроизведение совпадает с записью по построению.
+    void runStepInputs(GJBaseGameLayer* layer) {
+        auto& s = state();
+        auto& r = s.run;
+
+        if (!r.inTick || r.stepHandled)
+            return;
+        r.stepHandled = true;
+
+        harvestStepInputs(layer);
+
+        // 1) события макроса для этого шага
+        if (r.mode == Mode::Playback) {
+            auto const& actions = s.buffer.actions;
+
+            while (r.playbackCursor < actions.size() &&
+                   actions[r.playbackCursor].step < r.step) {
+                // Шаг пропущен без применения — событие макроса потеряно.
+                // Раньше это происходило молча и давало расхождение прогона.
+                ++r.playbackCursor;
+                ++r.telemetry.macroEventsDropped;
+                if (!r.telemetry.warnedDropped) {
+                    r.telemetry.warnedDropped = true;
+                    postNotice(
+                        "Событие макроса пропущено без применения: шаг прошёл "
+                        "без хука ввода. Прогон уже не точный — см. «потери» "
+                        "в статусе панели.",
+                        true
+                    );
+                }
+            }
+
+            std::size_t begin = r.playbackCursor;
+            while (r.playbackCursor < actions.size() &&
+                   actions[r.playbackCursor].step == r.step) {
+                ++r.playbackCursor;
+            }
+
+            for (std::size_t i = begin; i < r.playbackCursor; ++i) {
+                auto const& action = actions[i];
+                StepEvent event;
+                event.order = action.order;
+                event.button = action.button;
+                event.down = action.down;
+                event.player2 = action.player2;
+                event.source = Source::Macro;
+                applyEvent(event);
+            }
+        }
+
+        // 2) живой ввод этого шага
+        bool blocked = r.mode == Mode::Playback && s.blockInput;
+        for (auto const& event : r.stepEvents) {
+            if (blocked) {
+                ++r.telemetry.droppedButtons;
+                continue;
+            }
+            applyEvent(event);
+        }
+    }
+
+    // Коммит шага: события уходят в буфер, счётчик шага увеличивается.
+    void commitStep() {
+        auto& s = state();
+        auto& r = s.run;
+
+        if (r.discardCurrentStep) {
+            r.stepEvents.clear();
+        }
+        else if (r.mode == Mode::Record) {
+            std::size_t added = 0;
+            for (auto const& event : r.stepEvents)
+                if (event.source == Source::Manual)
+                    ++added;
+
+            if (s.buffer.actions.size() + added > kMaxEvents) {
                 r.discardCurrentStep = true;
                 requestStop(
                     "Достигнут предел числа действий. Запись остановлена.",
-                    false, true
+                    true, true
                 );
             }
             else {
-                Action recorded = action;
-                recorded.down = (desired & bit) != 0;
-                s.buffer.actions.push_back(recorded);
+                for (auto const& event : r.stepEvents) {
+                    if (event.source != Source::Manual)
+                        continue;
+
+                    Action action;
+                    action.step = r.step;
+                    action.order = event.order;
+                    action.button = event.button;
+                    action.down = event.down;
+                    action.player2 = event.player2;
+                    s.buffer.actions.push_back(action);
+                    ++r.telemetry.eventsRecorded;
+                }
             }
         }
 
-        sendMask(desired);
+        r.stepEvents.clear();
+        r.orderInStep = 0;
+        ++r.step;
+
+        if (s.hasBuffer && r.mode == Mode::Record)
+            s.buffer.length = r.step;
     }
 
-    std::vector<ScheduledAction> actionsForStep() {
-        auto& s = state();
-        auto& r = s.run;
-        std::vector<ScheduledAction> result;
-
-        if (r.mode == Mode::Playback) {
-            auto const& actions = s.buffer.actions;
-            while (r.playbackCursor < actions.size() &&
-                   actions[r.playbackCursor].step < r.step) {
-                ++r.playbackCursor;
-            }
-
-            while (r.playbackCursor < actions.size() &&
-                   actions[r.playbackCursor].step == r.step) {
-                result.push_back({
-                    actions[r.playbackCursor],
-                    Source::Macro,
-                    static_cast<std::uint64_t>(r.playbackCursor)
-                });
-                ++r.playbackCursor;
-            }
-        }
-
-        auto found = r.manualActions.find(r.step);
-        if (found != r.manualActions.end()) {
-            auto& manual = found->second;
-            result.insert(result.end(), manual.begin(), manual.end());
-            r.manualActions.erase(found);
-        }
-
-        std::stable_sort(result.begin(), result.end(), [](auto const& a, auto const& b) {
-            if (a.action.phase != b.action.phase)
-                return a.action.phase < b.action.phase;
-            if (a.source != b.source)
-                return a.source == Source::Macro;
-            return a.order < b.order;
-        });
-        return result;
-    }
+    // --- чекпоинты ---------------------------------------------------------
 
     CheckpointData captureCheckpointData() {
         auto const& r = state().run;
         CheckpointData data;
         data.nextStep = r.step;
-        data.safeBoundary = !r.inTick || r.commandsDone;
-
-        if (r.inTick && r.commandsDone)
-            ++data.nextStep;
-
+        // Чекпоинт, созданный внутри шага, шагово не восстанавливаем: часть
+        // физики шага уже исполнена, а ввод шага уже применён.
+        data.safeBoundary = !r.inTick;
         data.manualHeld = r.manualHeld;
         data.macroHeld = r.macroHeld;
         data.effectiveHeld = r.sentHeld;
@@ -1547,7 +1829,10 @@ namespace gdbot {
         if (!saved || !saved->safeBoundary) {
             if (r.mode != Mode::Off || r.frameMode) {
                 requestStop(
-                    "Нет безопасного состояния чекпоинта. Бот остановлен.",
+                    "Чекпоинт создан внутри шага физики (обычно так делает "
+                    "чекпоинт-триггер уровня), поэтому пошагово восстановить "
+                    "его нельзя: часть шага уже исполнена, а ввод шага уже "
+                    "применён. Бот остановлен.",
                     r.mode == Mode::Record, true
                 );
             }
@@ -1574,7 +1859,11 @@ namespace gdbot {
             ) - s.buffer.actions.begin()
         );
 
-        sendMask(effectiveHeld(), true);
+        // Не force: native loadFromCheckpoint() уже восстановил удерживаемые
+        // кнопки из снапшота, и sentHeld выставлен в data.effectiveHeld, так
+        // что разница обычно пуста. Force повторно нажимал бы то, что уже
+        // нажато, — это источник лишнего прыжка сразу после респавна.
+        sendMask(effectiveHeld());
 
         r.dead = false;
         syncAudio();
@@ -1590,8 +1879,7 @@ namespace gdbot {
     }
 
     void resetEnd() {
-        auto& s = state();
-        auto& r = s.run;
+        auto& r = state().run;
         if (r.resetDepth <= 0 || --r.resetDepth != 0)
             return;
 
@@ -1633,18 +1921,35 @@ namespace gdbot {
 
         r.dead = true;
         r.frameBudget = 0;
-        r.rawInputs.clear();
-        r.manualActions.clear();
+        r.stepEvents.clear();
+        r.pendingInputs.clear();
         restoreAudio();
 
-        if (r.mode == Mode::Record && !hasUsableCheckpoint()) {
+        bool const resumable = hasUsableCheckpoint();
+
+        if (r.mode == Mode::Record && !resumable) {
             requestStop(
-                "Смерть без подходящего чекпоинта. Запись оставлена в буфере.",
+                "Смерть без чекпоинта, восстанавливаемого пошагово. "
+                "Запись оставлена в буфере.",
                 true
             );
         }
         else if (r.mode == Mode::Playback) {
-            requestStop("Воспроизведение остановлено после смерти.");
+            if (resumable) {
+                // practice-режим: игра сама позовёт loadFromCheckpoint(),
+                // restoreCheckpointData() вернёт шаг и курсор и снимет r.dead.
+                // Бот намеренно НЕ выключается: раньше одна смерть гасила
+                // воспроизведение, респавн шёл уже без бота и игрок просто
+                // бежал в следующее препятствие — выглядело как «бот умирает».
+                postNotice("Смерть: продолжение с последнего чекпоинта.");
+            }
+            else {
+                requestStop(
+                    "Смерть без чекпоинта, восстанавливаемого пошагово. "
+                    "Воспроизведение остановлено.",
+                    true
+                );
+            }
         }
 
         if (!r.inTick)
@@ -1680,79 +1985,7 @@ namespace gdbot {
         };
     }
 
-    template <class Original>
-    void splitCommands(
-        GJBaseGameLayer* layer,
-        float dt,
-        bool isHalfTick,
-        bool isLastTick,
-        Original&& original
-    ) {
-        auto& r = state().run;
-
-        if (!controls(layer) || !r.inTick ||
-            r.resetDepth || r.loadDepth) {
-            original(dt, isHalfTick, isLastTick);
-            return;
-        }
-        if (++r.commandCalls > 1) {
-            original(dt, isHalfTick, isLastTick);
-            return;
-        }
-        auto actions = actionsForStep();
-        auto session = r.session;
-        auto epoch = r.epoch;
-        double position = 0.0;
-
-        auto interrupted = [&] {
-            return r.session != session || r.epoch != epoch ||
-                   !r.play || r.dead || r.stopRequested;
-        };
-
-        auto advance = [&](double end, bool finalSlice) {
-            if (end <= position)
-                return;
-
-            float slice = static_cast<float>(
-                static_cast<double>(dt) * (end - position)
-            );
-            position = end;
-
-            if (slice <= 0.0f)
-                return;
-
-            bool previous = r.inSlice;
-            r.inSlice = true;
-
-            original(slice, isHalfTick, isLastTick && finalSlice);
-
-            r.inSlice = previous;
-        };
-
-        for (std::size_t i = 0; i < actions.size();) {
-            double phase = actions[i].action.phase;
-            advance(phase, false);
-            if (interrupted())
-                break;
-
-            do {
-                applyAction(actions[i]);
-                ++i;
-            } while (i < actions.size() &&
-                     actions[i].action.phase == phase);
-
-            if (interrupted())
-                break;
-        }
-
-        if (!interrupted())
-            advance(1.0, true);
-
-        if (r.session == session && r.epoch == epoch && r.play) {
-            r.afterCommands = physicsStamp();
-            r.commandsDone = !r.dead && !r.stopRequested;
-        }
-    }
+    // --- главный цикл ------------------------------------------------------
 
     template <class Original>
     void driveUpdate(
@@ -1761,8 +1994,7 @@ namespace gdbot {
         auto& s = state();
         auto& r = s.run;
 
-        if (!r.play ||
-            static_cast<GJBaseGameLayer*>(r.play) != layer) {
+        if (!r.play || static_cast<GJBaseGameLayer*>(r.play) != layer) {
             original(incomingDelta);
             return;
         }
@@ -1775,13 +2007,13 @@ namespace gdbot {
             return;
         }
 
-        // Do not clear native queue here: without queueButton hook it is the
-        // only source of queued user input. It is drained in processQueuedButtons.
+        // Очередь НЕ чистим: её разбирает harvestStepInputs() внутри шага.
         installNativeFlags(false);
 
         if (r.play->m_isPaused) {
             r.paused = true;
-            r.play->m_queuedButtons.clear();
+            r.pendingInputs.clear();
+            layer->m_queuedButtons.clear();
             restoreAudio();
             return;
         }
@@ -1793,19 +2025,20 @@ namespace gdbot {
 
         if (r.paused) {
             r.paused = false;
-            r.inputAnchor = inputTimestamp();
-            r.rawInputs.clear();
-            r.play->m_queuedButtons.clear();
-
+            r.pendingInputs.clear();
+            layer->m_queuedButtons.clear();
+            layer->m_extraDelta = 0.0;
+            r.debt = 0.0L;
             frameDelta = 0.0;
-
-            sendMask(effectiveHeld(), true);
+            // Не force: пауза не меняет удерживаемые кнопки, sentHeld актуален.
+            sendMask(effectiveHeld());
         }
 
         syncAudio();
 
         if (r.dead) {
-            original(static_cast<float>(frameDelta));
+            // Нативный темп: форсирование шага выключено, анимация смерти штатная.
+            original(incomingDelta);
             flushStop();
             return;
         }
@@ -1816,28 +2049,44 @@ namespace gdbot {
                 return;
         }
 
-        auto inputEnd = inputTimestamp();
-        mapRawInputs(frameDelta, inputEnd);
+        float const quantum = nativeStepDelta();
+        double const speed =
+            r.mode == Mode::Record ? s.recordingSpeed : 1.0;
 
-        if (r.stopRequested) {
-            flushStop();
-            return;
+        std::uint64_t budget = 0;
+
+        if (r.frameMode) {
+            budget = std::min<std::uint64_t>(r.frameBudget, kMaxBurst);
+            r.frameBudget -= budget;
+            r.debt = 0.0L;
         }
-
-        long double quantum = 1.0L / s.tps;
-        double speed = r.mode == Mode::Record ? s.recordingSpeed : 1.0;
-
-        if (!r.frameMode)
+        else {
             r.debt += static_cast<long double>(frameDelta) * speed;
 
-        unsigned executed = 0;
-        while (executed < kMaxBurst && controls(layer)) {
-            bool ready = r.frameMode
-                ? r.frameBudget > 0
-                : r.debt + quantum * 1e-10L >= quantum;
+            long double ticks =
+                r.debt * static_cast<long double>(s.tps);
 
-            if (!ready || r.dead || r.play->m_isPaused)
+            if (ticks >= 1.0L) {
+                budget = static_cast<std::uint64_t>(
+                    std::min<long double>(
+                        ticks, static_cast<long double>(kMaxBurst)
+                    )
+                );
+                r.debt -= static_cast<long double>(budget) /
+                          static_cast<long double>(s.tps);
+                if (r.debt < 0.0L)
+                    r.debt = 0.0L;
+            }
+        }
+
+        for (std::uint64_t i = 0; i < budget && controls(layer); ++i) {
+            if (r.dead || r.play->m_isPaused)
                 break;
+
+            if (r.stopRequested) {
+                flushStop();
+                break;
+            }
 
             if (r.step >= std::numeric_limits<std::uint32_t>::max() - 1) {
                 requestStop("Достигнут предел длины макроса.", false, true);
@@ -1846,62 +2095,112 @@ namespace gdbot {
             }
 
             if (r.mode == Mode::Playback && r.step >= s.buffer.length) {
-                requestStop("Макрос завершён.");
+                finishPlayback();
                 flushStop();
                 break;
             }
-
-            if (r.frameMode)
-                --r.frameBudget;
-            else
-                r.debt = std::max(0.0L, r.debt - quantum);
 
             auto* play = r.play;
             auto session = r.session;
             auto epoch = r.epoch;
-            auto step = r.step;
-            bool wasRecording = r.mode == Mode::Record;
 
             r.inTick = true;
-            r.inSlice = false;
-            r.commandsDone = false;
-            r.commandCalls = 0;
-            r.badKernel = false;
+            r.stepHandled = false;
             r.discardCurrentStep = false;
+            r.commandCalls = 0;
+            r.queuedCalls = 0;
+            r.commandsDone = false;
             r.beforeTick = physicsStamp();
+            ++r.telemetry.ticks;
 
-            original(static_cast<float>(quantum));
+            int const stepBefore = play->m_currentStep;
 
+            r.forceOneStep = true;
+            r.forcedDelta = quantum;
+            play->m_extraDelta = 0.0;
+
+            original(quantum);
+
+            r.forceOneStep = false;
             r.inTick = false;
             r.inSlice = false;
-            ++executed;
 
             if (r.play != play || r.session != session)
                 return;
 
-            if (r.epoch != epoch) {
-                flushStop();
+            // Нативный update НЕ обязан производить шаг: во время интро уровня
+            // и заморозки после выхода из паузы (m_started / m_resumeTimer,
+            // оба есть в GJBaseGameLayer 2.2081) физических шагов нет.
+            // Признак реального шага — сработал наш хук ИЛИ шагнул m_currentStep.
+            bool const stepHappened =
+                r.stepHandled || play->m_currentStep != stepBefore;
+
+            r.telemetry.maxCommandsPerTick =
+                std::max(r.telemetry.maxCommandsPerTick, r.commandCalls);
+            r.telemetry.maxQueuedPerTick =
+                std::max(r.telemetry.maxQueuedPerTick, r.queuedCalls);
+
+            if (!stepHappened) {
+                // КЛЮЧЕВОЕ: номер шага не сжигаем и шаг не коммитим.
+                // Иначе при записи ввод уезжает на шаг вперёд, а при
+                // воспроизведении события этого шага молча теряются —
+                // прогон расходится и бот умирает.
+                ++r.telemetry.ticksWithoutStep;
+                if (r.frameMode)
+                    ++r.frameBudget;   // вернуть неизрасходованный кадр
+                r.debt = 0.0L;         // не копить долг -> без рывка после окна
+                // ~120 кадров без шага — это уже не штатное интро, а признак
+                // того, что игра вообще не симулирует (или наши хуки не
+                // срабатывают). Номер шага при этом не сгорает.
+                if (r.telemetry.ticksWithoutStep == 120 &&
+                    !r.telemetry.warnedNoStep) {
+                    r.telemetry.warnedNoStep = true;
+                    postNotice(
+                        "Игра уже около двух секунд не производит физических "
+                        "шагов. Бот ждёт первого шага, номер шага не сжигается.",
+                        true
+                    );
+                }
                 break;
             }
-            if (r.discardCurrentStep) {
-                if (wasRecording)
-                    trimRecording(step);
 
-                requestStop(
-                    "Достигнут предел числа действий. Бот остановлен.",
-                    wasRecording, true
+            r.telemetry.nativeStepDrift +=
+                static_cast<long long>(play->m_currentStep - stepBefore) - 1;
+
+            if (!r.stepHandled) {
+                // Шаг был, но ни один хук ввода не сработал: применить события
+                // шага было негде. Номер шага увеличиваем — иначе разойдёмся с
+                // игрой навсегда; потерянное уйдёт в macroEventsDropped.
+                ++r.telemetry.stepsNoHook;
+                if (!r.telemetry.warnedNoHook) {
+                    r.telemetry.warnedNoHook = true;
+                    postNotice(
+                        "Физический шаг прошёл без хука ввода: ни processCommands, "
+                        "ни processQueuedButtons не вызвались. События этого шага "
+                        "потеряны. Проверьте, не перехватил ли эти функции другой мод.",
+                        true
+                    );
+                }
+            }
+
+            if (r.telemetry.nativeStepDrift != 0 &&
+                !r.telemetry.warnedDrift) {
+                r.telemetry.warnedDrift = true;
+                postNotice(
+                    "Нативных шагов на тик не ровно один — расхождение с "
+                    "m_currentStep. Проверьте m_timeWarp и другие моды физики.",
+                    true
                 );
+            }
+
+            if (r.epoch != epoch) {
+                r.stepEvents.clear();
                 flushStop();
                 break;
             }
 
-            ++r.step;
-            if (wasRecording)
-                s.buffer.length = r.step;
+            commitStep();
 
-            if (!r.rawInputs.empty() && !r.dead && !r.stopRequested) {
-                mapRawInputs(0.0, inputTimestamp(), true);
-            }
             if (r.markPending && !r.dead && !r.stopRequested) {
                 r.markPending = false;
                 r.drainingMark = true;
@@ -1910,7 +2209,7 @@ namespace gdbot {
             }
 
             if (r.mode == Mode::Playback && r.step >= s.buffer.length)
-                requestStop("Макрос завершён.");
+                finishPlayback();
 
             flushStop();
 
@@ -1918,7 +2217,6 @@ namespace gdbot {
                 break;
         }
     }
-
     void attach(PlayLayer* play, GJGameLevel* level) {
         ensureConfiguration();
         restoreAudio();
@@ -1929,13 +2227,21 @@ namespace gdbot {
         s.run.session = ++s.nextSession;
         s.run.level = levelID(level);
         s.run.paused = play->m_isPaused;
-        s.run.inputAnchor = inputTimestamp();
+        play->m_extraDelta = 0.0;
         s.deathQuestion = false;
 
         if (Loader::get()->isModLoaded("syzzi.click_between_frames")) {
             postNotice(
-                "Загружен внешний мод кликов между кадрами. "
-                "Для проверки бота рекомендуется его отключить.",
+                "Загружен Click Between Frames. Он режет физику на суб-шаги, "
+                "а бот работает по целым шагам 1/240. Для точного "
+                "воспроизведения отключите CBF или переведите его в soft-toggle.",
+                true
+            );
+        }
+        if (Loader::get()->isModLoaded("qimiko.click_on_steps")) {
+            postNotice(
+                "Загружен Click on Steps: он тоже перехватывает очередь ввода. "
+                "Два владельца m_queuedButtons дадут расхождение.",
                 true
             );
         }
@@ -1963,7 +2269,8 @@ namespace gdbot {
         r.frameMode = enabled;
         r.frameBudget = 0;
         r.debt = 0.0L;
-        r.inputAnchor = inputTimestamp();
+        r.pendingInputs.clear();
+        r.play->m_extraDelta = 0.0;
 
         if (enabled)
             installNativeFlags();
@@ -1984,7 +2291,6 @@ namespace gdbot {
             r.frameBudget + s.frameSize, 1'000'000
         );
     }
-
     CCRect safeRect() {
         auto window = CCDirector::sharedDirector()->getWinSize();
 
@@ -2564,8 +2870,8 @@ public:
 
             setButtonText(
                 m_blockInputButton,
-                std::string("Блокировать ввод: ") +
-                    (state().blockInput ? "да" : "нет")
+                std::string("Живой ввод: ") +
+                    (state().blockInput ? "заблокирован" : "РАЗРЕШЁН")
             );
 
             setButtonText(
@@ -2624,13 +2930,15 @@ public:
             );
 
             m_blockInputButton = textButton(
-                m_fixedMenu, "Блокировать ввод",
+                m_fixedMenu, "Живой ввод",
                 {12.0f + half / 2, top - 60.0f},
                 {half, 26.0f},
                 [this] {
                     auto& current = state();
                     current.blockInput = !current.blockInput;
-                    Mod::get()->setSavedValue("block-input", current.blockInput);
+                    Mod::get()->setSavedValue(
+                        "block-live-input", current.blockInput
+                    );
                     if (active() && !current.run.dead)
                         sendMask(effectiveHeld());
                     refreshFixedButtons();
@@ -2778,14 +3086,17 @@ public:
             );
 
             inputRow(
-                "Физических шагов/с",
+                "Темп, шагов/с",
                 std::to_string(s.tps),
                 "0123456789",
                 [this](std::string const& text) {
                     std::uint32_t tps = 0;
                     if (!parseUnsigned(text, kMinTPS, kMaxTPS, tps)) {
                         if (m_tpsHint)
-                            m_tpsHint->setString("Допустимо от 30 до 2000.");
+                            m_tpsHint->setString(
+                                "Допустимо от 30 до 240. Выше 240 шагов в "
+                                "секунду в физике GD не существует."
+                            );
                         return;
                     }
                     if (active() || state().run.pendingStart) {
@@ -2798,11 +3109,18 @@ public:
                         "physics-tps", static_cast<int>(tps)
                     );
                     if (m_tpsHint)
-                        m_tpsHint->setString("Частота изменена. Макрос должен иметь ту же частоту.");
+                        m_tpsHint->setString(
+                            tps == kNativeTPS
+                                ? "240 = обычная скорость уровня."
+                                : "Замедление: уровень идёт медленнее, макрос "
+                                  "всё равно хранится в нативных шагах 1/240."
+                        );
                 }
             );
             m_tpsHint = line(
-                "Меняется только при полностью выключенном боте.", 11.0f
+                "240 = обычная скорость, меньше — замедление. Макрос хранится "
+                "в нативных шагах 1/240 и от темпа не зависит.",
+                11.0f
             );
 
             inputRow(
@@ -2878,11 +3196,21 @@ public:
                 "Обновить список", [] { changed(); },
                 "Ограничения", [] {
                     ask(
-                        "Запись и запуск начинаются с начала уровня.\n"
-                        "Кнопка в паузе перетаскивается мышью или пальцем.\n"
-                        "Покадровый режим экспериментальный. Шаг назад отключён.\n"
-                        "Локальные уровни без номера нельзя различить по заголовку.\n"
-                        "Отправка результатов и прогресса не изменяется.",
+                        "Запись и запуск — с начала уровня. Шаг макроса = "
+                        "нативный шаг физики 1/240 c; темп меняет только "
+                        "скорость проигрывания, не единицы записи.\n"
+                        "Живой ввод при воспроизведении заблокирован по "
+                        "умолчанию: случайное нажатие поверх макроса "
+                        "расходится с записью и роняет прогон.\n"
+                        "Чекпоинты practice-режима восстанавливаются; "
+                        "чекпоинты от триггеров уровня — нет, они создаются "
+                        "внутри шага.\n"
+                        "Диагностика в статусе: хуков/тик 1, drift 0, "
+                        "без хука 0, потери 0. «без шага» растёт в интро "
+                        "уровня и после паузы — это норма, номер шага при "
+                        "этом не сжигается.\n"
+                        "Шаг назад отключён. Отправка результатов и прогресса "
+                        "не изменяется.",
                         {{"Понятно", [] {}}}
                     );
                 }
@@ -3031,9 +3359,21 @@ public:
                 r.mode == Mode::Playback ? "Воспроизведение" :
                 r.frameMode ? "Покадровый режим" : "Выключен";
 
+            auto const& t = r.telemetry;
+            // Здоровые значения: хуков/тик 1, drift 0, без хука 0, потери 0.
+            // «без шага» растёт в интро уровня и после паузы — это нормально,
+            // номер шага при этом не сжигается.
             auto text = fmt::format(
-                "{} · шаг {} · действий {}",
-                mode, r.step, s.hasBuffer ? s.buffer.actions.size() : 0
+                "{} · шаг {} · соб. {} · хуков/тик {} · drift {} · "
+                "без хука {} · без шага {} · потери {}",
+                mode,
+                r.step,
+                s.hasBuffer ? s.buffer.actions.size() : 0,
+                t.maxCommandsPerTick,
+                t.nativeStepDrift,
+                t.stepsNoHook,
+                t.ticksWithoutStep,
+                t.macroEventsDropped
             );
             m_status->setString(text.c_str());
             fitLabel(
@@ -3320,87 +3660,36 @@ public:
 
 class $modify(GDBotBaseLayer, GJBaseGameLayer) {
     static void onModify(auto& self) {
-        // NOTE:
-        // GJBaseGameLayer::queueButton and GJBaseGameLayer::shouldUseSubstepForButton
-        // have inline definitions in Geode 5.11.2 / GD 2.2081 bindings and cannot
-        // be hooked through $modify. Their hooks were removed.
-
+        // getModifiedDelta — последним, чтобы наше значение было итоговым.
         if (!self.setHookPriorityPost(
                 "GJBaseGameLayer::getModifiedDelta", Priority::Last)) {
-            log::warn("Не удалось установить последний приоритет шага физики.");
+            log::warn("Не удалось установить последний приоритет getModifiedDelta.");
         }
-
+        // Хуки шага — первыми, чтобы забрать ввод до нативной обработки.
         if (!self.setHookPriorityPre(
                 "GJBaseGameLayer::processCommands", Priority::First)) {
-            log::warn("Не удалось установить приоритет собственных подшагов.");
+            log::warn("Не удалось установить приоритет processCommands.");
         }
-
         if (!self.setHookPriorityPre(
                 "GJBaseGameLayer::processQueuedButtons", Priority::First)) {
-            log::warn("Не удалось установить приоритет обработки очереди.");
+            log::warn("Не удалось установить приоритет processQueuedButtons.");
         }
-
         if (!self.setHookPriorityPre(
                 "GJBaseGameLayer::handleButton", Priority::First)) {
-            log::warn("Не удалось установить приоритет прямого ввода.");
+            log::warn("Не удалось установить приоритет handleButton.");
         }
-    }
-
-    void handleButton(bool down, int button, bool isPlayer1) {
-        if (!gdbot::controls(this)) {
-            GJBaseGameLayer::handleButton(down, button, isPlayer1);
-            return;
-        }
-
-        auto& r = gdbot::state().run;
-
-        if (r.injecting || r.resetDepth || r.loadDepth) {
-            GJBaseGameLayer::handleButton(down, button, isPlayer1);
-            return;
-        }
-
-        if (r.pauseGuard || r.paused ||
-            (r.play && r.play->m_isPaused) || r.dead) {
-            return;
-        }
-
-        // Capture both direct calls and calls dispatched from the native queue.
-        // Native application is intentionally suppressed while bot is active.
-        gdbot::enqueueRaw(
-            down, button, !isPlayer1, gdbot::inputTimestamp()
-        );
-    }
-
-    void processQueuedButtons(float dt, bool clearInputQueue) {
-        if (!gdbot::controls(this)) {
-            GJBaseGameLayer::processQueuedButtons(dt, clearInputQueue);
-            return;
-        }
-
-        auto& r = gdbot::state().run;
-
-        // While resetting/loading/injecting or paused, do not let queued native
-        // input reach physics. Drop it safely.
-        if (r.resetDepth || r.loadDepth || r.injecting ||
-            r.pauseGuard || r.paused ||
-            (r.play && r.play->m_isPaused) || r.dead) {
-            m_queuedButtons.clear();
-            return;
-        }
-
-        // Dispatch the native queue. Each queued event reaches handleButton(),
-        // where gdbot::enqueueRaw() captures it and native handling is suppressed.
-        GJBaseGameLayer::processQueuedButtons(dt, clearInputQueue);
-        m_queuedButtons.clear();
     }
 
     double getModifiedDelta(float dt) {
-        double native = GJBaseGameLayer::getModifiedDelta(dt);
+        auto const& r = gdbot::state().run;
 
-        if (!gdbot::controls(this))
-            return native;
+        // Нативный getModifiedDelta не вызываем: он работает с m_extraDelta,
+        // а аккумулятором владеем мы (r.debt) и обнуляем m_extraDelta каждый
+        // тик. Лишний вызов давал бы двойной учёт остатка.
+        if (r.forceOneStep && gdbot::controls(this))
+            return static_cast<double>(r.forcedDelta);
 
-        return 1.0 / static_cast<double>(gdbot::state().tps);
+        return GJBaseGameLayer::getModifiedDelta(dt);
     }
 
     void update(float dt) {
@@ -3411,16 +3700,87 @@ class $modify(GDBotBaseLayer, GJBaseGameLayer) {
     }
 
     void processCommands(float dt, bool isHalfTick, bool isLastTick) {
-        gdbot::splitCommands(
-            this, dt, isHalfTick, isLastTick,
-            [this](float slice, bool half, bool last) {
-                GJBaseGameLayer::processCommands(slice, half, last);
-            }
-        );
+        auto& r = gdbot::state().run;
+        bool tracked = gdbot::controls(this) && r.inTick;
+
+        if (tracked) {
+            ++r.commandCalls;
+            ++r.telemetry.commandsCalls;
+            gdbot::runStepInputs(this);
+        }
+
+        GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
+
+        if (tracked) {
+            r.commandsDone = true;
+            r.afterCommands = gdbot::physicsStamp();
+        }
     }
 
-};
+    void processQueuedButtons(float dt, bool clearInputQueue) {
+        auto& r = gdbot::state().run;
 
+        if (!gdbot::controls(this)) {
+            GJBaseGameLayer::processQueuedButtons(dt, clearInputQueue);
+            return;
+        }
+
+        if (r.inTick) {
+            ++r.queuedCalls;
+            ++r.telemetry.queuedCalls;
+            // Если processCommands в этом шаге не вызывался — разбираем здесь.
+            gdbot::runStepInputs(this);
+        }
+        else if (r.resetDepth || r.loadDepth || r.injecting ||
+                 r.pauseGuard || r.paused ||
+                 (r.play && r.play->m_isPaused) || r.dead) {
+            m_queuedButtons.clear();
+            return;
+        }
+        else {
+            // Вне шага: переносим на следующий шаг, а не применяем сразу.
+            gdbot::deferQueued(this);
+        }
+
+        // Очередь уже разобрана нами; нативная обработка пустой очереди
+        // сохраняет штатный bookkeeping игры.
+        GJBaseGameLayer::processQueuedButtons(dt, clearInputQueue);
+        m_queuedButtons.clear();
+    }
+
+    void handleButton(bool down, int button, bool isPlayer1) {
+        auto& r = gdbot::state().run;
+
+        if (!gdbot::controls(this) || r.injecting ||
+            r.resetDepth || r.loadDepth) {
+            GJBaseGameLayer::handleButton(down, button, isPlayer1);
+            return;
+        }
+
+        if (r.pauseGuard || r.paused ||
+            (r.play && r.play->m_isPaused) || r.dead) {
+            ++r.telemetry.droppedButtons;
+            return;
+        }
+
+        if (!r.inTick) {
+            // Вне шага: событие принадлежит следующему шагу.
+            gdbot::deferInput(down, button, !isPlayer1);
+            return;
+        }
+
+        // Прямой вызов внутри шага, мимо нативной очереди.
+        ++r.telemetry.directButtons;
+        gdbot::noteDirectInput(down, button, !isPlayer1);
+
+        if (r.mode == gdbot::Mode::Playback && gdbot::state().blockInput) {
+            ++r.telemetry.droppedButtons;
+            return;
+        }
+
+        GJBaseGameLayer::handleButton(down, button, isPlayer1);
+    }
+};
 class $modify(GDBotPlayLayer, PlayLayer) {
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
         if (!PlayLayer::init(level, useReplay, dontCreateObjects))
@@ -3448,8 +3808,19 @@ class $modify(GDBotPlayLayer, PlayLayer) {
 
     CheckpointObject* markCheckpoint() {
         auto& r = gdbot::state().run;
+        // Откладываем на границу шага в ЛЮБОЙ момент внутри тика, а не только
+        // до processCommands. Иначе чекпоинт, запрошенный во второй половине
+        // шага, снимался бы посреди шага, captureCheckpointData() помечала бы
+        // его небезопасным (inTick == true), восстановление отказывало — и в
+        // practice-режиме это означало конец прогона вместо респавна.
+        //
+        // Возврат nullptr безопасен: practice-ветка идёт через
+        // queueCheckpoint()/m_tryPlaceCheckpoint и результат не разыменовывает.
+        // Отложенный вызов выполняется в driveUpdate под флагом drainingMark,
+        // уже после commitStep(), поэтому снапшот попадает ровно на границу
+        // шага и nextStep согласован.
         if (gdbot::owns(this) && gdbot::active() &&
-            r.inTick && !r.commandsDone && !r.drainingMark) {
+            r.inTick && !r.drainingMark) {
             r.markPending = true;
             return nullptr;
         }
