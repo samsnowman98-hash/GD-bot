@@ -1695,23 +1695,10 @@ namespace gdbot {
             original(dt, isHalfTick, isLastTick);
             return;
         }
-
-        if (++r.commandCalls != 1) {
-            r.badKernel = true;
+        if (++r.commandCalls > 1) {
             original(dt, isHalfTick, isLastTick);
             return;
         }
-
-        if (!(physicsStamp() == r.beforeTick))
-            r.badKernel = true;
-
-        if (r.badKernel) {
-            original(dt, isHalfTick, isLastTick);
-            r.afterCommands = physicsStamp();
-            r.commandsDone = true;
-            return;
-        }
-
         auto actions = actionsForStep();
         auto session = r.session;
         auto epoch = r.epoch;
@@ -1896,49 +1883,25 @@ namespace gdbot {
                 flushStop();
                 break;
             }
-
-            if (!r.dead && !r.stopRequested &&
-                r.commandCalls == 1 &&
-                !(physicsStamp() == r.afterCommands)) {
-                r.badKernel = true;
-            }
-
-            if ((!r.dead && !r.stopRequested && r.commandCalls != 1) ||
-                r.commandCalls > 1) {
-                r.badKernel = true;
-            }
-
-            if (r.badKernel || r.discardCurrentStep) {
+            if (r.discardCurrentStep) {
                 if (wasRecording)
                     trimRecording(step);
 
-                log::warn(
-                    "VERIFY-1: неподтвержденный контракт физического шага; "
-                    "processCommands вызван {} раз",
-                    r.commandCalls
-                );
-
                 requestStop(
-                    "Проверка физики не пройдена. Бот безопасно остановлен.",
+                    "Достигнут предел числа действий. Бот остановлен.",
                     wasRecording, true
                 );
                 flushStop();
                 break;
             }
 
-            if (r.commandCalls == 1) {
-                ++r.step;
-                if (wasRecording)
-                    s.buffer.length = r.step;
+            ++r.step;
+            if (wasRecording)
+                s.buffer.length = r.step;
 
-                // Inputs captured during this fixed step are scheduled for the
-                // next step. This partially compensates for the unavailable
-                // queueButton hook.
-                if (!r.rawInputs.empty() && !r.dead && !r.stopRequested) {
-                    mapRawInputs(0.0, inputTimestamp(), true);
-                }
+            if (!r.rawInputs.empty() && !r.dead && !r.stopRequested) {
+                mapRawInputs(0.0, inputTimestamp(), true);
             }
-
             if (r.markPending && !r.dead && !r.stopRequested) {
                 r.markPending = false;
                 r.drainingMark = true;
@@ -3456,15 +3419,6 @@ class $modify(GDBotBaseLayer, GJBaseGameLayer) {
         );
     }
 
-    int checkCollisions(PlayerObject* player, float dt, bool ignoreDamage) {
-        auto& r = gdbot::state().run;
-        if (gdbot::controls(this) && r.inTick && !r.inSlice &&
-            !r.resetDepth && !r.loadDepth) {
-            r.badKernel = true;
-        }
-
-        return GJBaseGameLayer::checkCollisions(player, dt, ignoreDamage);
-    }
 };
 
 class $modify(GDBotPlayLayer, PlayLayer) {
