@@ -103,6 +103,12 @@ namespace {
     constexpr std::uint32_t kFooterSize = 4;
     constexpr std::size_t kListLimit = 128;
     constexpr std::size_t kPendingInputLimit = 4096;
+
+    // Сколько кадров подряд без единого физического шага считаются аварией:
+    // после этого бот переходит на нативный темп (см. driveUpdate).
+    constexpr unsigned kNoStepFramesLimit = 20;
+    // Сколько кадров можно «держать» в ожидании отложенного рестарта уровня.
+    constexpr unsigned kStartHoldFrames = 5;
 }
 
     constexpr std::array<std::uint8_t, 8> kMagic{
@@ -233,6 +239,24 @@ namespace {
         // Отложенный рестарт уровня (см. driveUpdate).
         bool startQueued = false;
         unsigned startQueuedFrames = 0;
+
+        // АВАРИЙНЫЙ РЕЖИМ. Если форсирование одного шага по какой-то причине
+        // не даёт игре произвести ни одного шага (формула stepCount в этой
+        // сборке другая, чужой мод физики, неожиданное m_timeWarp, dt == 0),
+        // уровень встаёт намертво. Чтобы это было невозможно в принципе, после
+        // kNoStepFramesLimit таких кадров переключаемся на нативный драйвер:
+        // кадр отдаётся игре целиком, getModifiedDelta не форсируется, границы
+        // шагов берутся из наших хуков. Запись и воспроизведение продолжают
+        // работать; теряются только управление темпом и покадровый режим.
+        bool nativeFallback = false;
+        bool stepOpen = false;        // в нативном режиме: шаг открыт хуком
+        int lastNativeStep = 0;
+        unsigned noStepFrames = 0;
+
+        // Эскалация запуска уровня: сколько кадров подряд m_started всё ещё
+        // false. 0 = не эскалируем.
+        unsigned startEscalation = 0;
+        bool startGameCalled = false;
 
         // Диагностика «игра не идёт»: сколько кадров подряд не было ни шага.
         unsigned idleFrames = 0;
@@ -1515,6 +1539,26 @@ namespace {
         }
         r.internalRestart = false;
 
+        // ГЛАВНАЯ ПРИЧИНА «УРОВЕНЬ НЕ ДВИГАЕТСЯ».
+        //
+        // GD не симулирует уровень, пока не выставлен GJBaseGameLayer::
+        // m_started. Доказательства из биндингов 2.2081:
+        //   * PlayLayer::isGameplayActive() { return !m_hasCompletedLevel &&
+        //     m_started && !m_player1->m_isDead; }
+        //   * реконструкция getModifiedDelta/stepCount считается только
+        //     при if (m_started);
+        //   * у PlayLayer есть startGame() (win 0x3a7a20) и
+        //     startGameDelayed() (win 0x3a7a70) — больше выставлять
+        //     m_started некому.
+        //
+        // Штатный рестарт из меню паузы идёт через resumeAndRestart(bool),
+        // который этот запуск выполняет. Голый resetLevelFromStart() — нет,
+        // поэтому уровень оставался незапущенным навсегда: снаружи это ровно
+        // «возобновил игру, а персонаж не двигается, что бы я ни делал».
+        r.startEscalation = 0;
+        if (!play->m_started)
+            play->startGameDelayed();
+
         r.paused = play->m_isPaused;
         r.mode = mode;
 
@@ -1537,6 +1581,25 @@ namespace {
 
         r.idleFrames = 0;
         r.warnedIdle = false;
+        r.noStepFrames = 0;
+        r.stepOpen = false;
+        // Каждый новый прогон заново пробует форсированный шаг 1/240.
+        r.nativeFallback = false;
+
+        // Темп ниже 30 шагов/с визуально неотличим от зависшего уровня —
+        // говорим об этом сразу, а не через «почему не двигается».
+        double const startRate = static_cast<double>(s.tps) *
+            (mode == Mode::Record ? s.recordingSpeed : 1.0);
+        if (startRate < 30.0) {
+            postNotice(
+                fmt::format(
+                    "Темп {:.1f} шагов/с (Темп {} × Скорость записи {:.2f}) — "
+                    "уровень будет идти очень медленно и выглядеть зависшим.",
+                    startRate, s.tps, s.recordingSpeed
+                ),
+                true
+            );
+        }
 
         // Покадровый режим переживает requestStart() намеренно, но тогда
         // уровень НЕ идёт сам — это надо сказать вслух, иначе выглядит как
@@ -1803,6 +1866,36 @@ namespace {
             s.buffer.length = r.step;
     }
 
+    // Вызывается из каждого хука шага (processCommands / processQueuedButtons).
+    //
+    // В форсированном режиме один тик == один шаг, поэтому шаг открывается
+    // один раз (флаг stepHandled внутри runStepInputs).
+    //
+    // В аварийном нативном режиме игра сама решает, сколько шагов сделать за
+    // кадр, поэтому границу шага определяем здесь: по вызову processCommands
+    // и/или по изменению m_currentStep. Предыдущий шаг при этом коммитится.
+    void onStepHook(GJBaseGameLayer* layer, bool fromProcessCommands) {
+        auto& r = state().run;
+        if (!r.inTick)
+            return;
+
+        if (r.nativeFallback) {
+            int const cs = layer->m_currentStep;
+            bool const newStep = fromProcessCommands || cs != r.lastNativeStep;
+
+            if (newStep) {
+                if (r.stepOpen)
+                    commitStep();
+
+                r.stepOpen = true;
+                r.stepHandled = false;
+                r.lastNativeStep = cs;
+            }
+        }
+
+        runStepInputs(layer);
+    }
+
     // --- чекпоинты ---------------------------------------------------------
 
     CheckpointData captureCheckpointData() {
@@ -2028,6 +2121,13 @@ namespace {
         if (r.pendingStart || r.startQueued)
             return "ожидание отложенного перезапуска уровня с начала.";
 
+        if (!r.play->m_started)
+            return fmt::format(
+                "уровень не запущен: m_started == false (кадров подряд: {}). "
+                "GD не симулирует уровень до PlayLayer::startGame().",
+                r.startEscalation
+            );
+
         if (r.frameMode && r.frameBudget == 0)
             return "включён покадровый режим — уровень стоит, пока не нажата "
                    "«Вправо». Выключите его для обычной записи.";
@@ -2046,13 +2146,22 @@ namespace {
             );
 
         if (attemptedTicks)
-            return "тик был, но игра не произвела физический шаг "
-                   "(интро уровня или заморозка после паузы/респавна).";
+            return fmt::format(
+                "тик был, но игра не произвела физический шаг "
+                "(m_started={}, m_resumeTimer={}, m_currentStep={}, шаг бота={}, "
+                "dt шага={:.6f}, timeWarp={:.3f}).",
+                r.play->m_started ? 1 : 0,
+                r.play->m_resumeTimer,
+                r.play->m_currentStep,
+                r.step,
+                nativeStepDelta(),
+                r.play->m_gameState.m_timeWarp
+            );
 
         return fmt::format(
-            "за кадр не набирается ни одного тика: темп {:.0f} шагов/с "
-            "меньше частоты кадров.",
-            rate
+            "за кадр не набирается ни одного тика: темп {:.1f} шагов/с "
+            "(Темп {} × Скорость записи {:.2f}).",
+            rate, s.tps, s.recordingSpeed
         );
     }
 
@@ -2131,6 +2240,11 @@ namespace {
                     r.warnedIdle = true;
                     postNotice("Игра не идёт: " + idleReason(false), true);
                 }
+                // Держим кадр не дольше kStartHoldFrames: дальше отдаём его
+                // игре, чтобы ожидание отложенного рестарта ни при каких
+                // условиях не превращалось в вечную заморозку.
+                if (r.idleFrames > kStartHoldFrames)
+                    original(incomingDelta);
                 return;
             }
 
@@ -2146,7 +2260,39 @@ namespace {
             r.pendingInputs.clear();
             layer->m_queuedButtons.clear();
             restoreAudio();
+            // Кадр игре всё равно отдаём: нативный update сам разбирается с
+            // паузой, а мы гарантированно не «морим» его голодом.
+            original(incomingDelta);
             return;
+        }
+
+        // Эскалация запуска: startGameDelayed() мог не сработать (например,
+        // действие не дошло до менеджера). Тогда дёргаем startGame() напрямую,
+        // а если и это не помогло — говорим прямо, в чём дело.
+        if (!r.play->m_started) {
+            ++r.startEscalation;
+
+            if (r.startEscalation == 30 && !r.startGameCalled) {
+                r.startGameCalled = true;
+                r.play->startGame();
+                postNotice(
+                    "Уровень не запустился сам: вызываю PlayLayer::startGame() "
+                    "напрямую.",
+                    true
+                );
+            }
+            else if (r.startEscalation == 120) {
+                postNotice(fmt::format(
+                    "Уровень так и не запустился: m_started == false уже {} "
+                    "кадров после рестарта. Симуляция не пойдёт. Перезапустите "
+                    "попытку вручную (Esc -> Restart) и начните запись заново.",
+                    r.startEscalation
+                ), true);
+            }
+        }
+        else {
+            r.startEscalation = 0;
+            r.startGameCalled = false;
         }
 
         double frameDelta =
@@ -2187,6 +2333,60 @@ namespace {
             flushStop();
             if (!controls(layer))
                 return;
+        }
+
+        // --- АВАРИЙНЫЙ РЕЖИМ: нативный темп --------------------------------
+        if (r.nativeFallback) {
+            r.inTick = true;
+            r.forceOneStep = false;
+            r.stepOpen = false;
+            r.commandCalls = 0;
+            r.queuedCalls = 0;
+            r.commandsDone = false;
+            ++r.telemetry.ticks;
+
+            int const stepBefore = layer->m_currentStep;
+            r.lastNativeStep = stepBefore;
+
+            // m_extraDelta не трогаем: аккумулятором снова владеет игра.
+            original(incomingDelta);
+
+            r.inTick = false;
+
+            if (r.stepOpen) {
+                commitStep();
+                r.stepOpen = false;
+            }
+
+            if (r.markPending && !r.dead && !r.stopRequested && r.play) {
+                r.markPending = false;
+                r.drainingMark = true;
+                r.play->markCheckpoint();
+                r.drainingMark = false;
+            }
+
+            bool const stepped = layer->m_currentStep != stepBefore;
+
+            if (stepped) {
+                r.idleFrames = 0;
+                r.noStepFrames = 0;
+                r.warnedIdle = false;
+            }
+            else {
+                ++r.idleFrames;
+                if (r.idleFrames == 60 && !r.warnedIdle) {
+                    r.warnedIdle = true;
+                    postNotice(
+                        "Игра не шагает даже в нативном режиме: " +
+                            idleReason(false),
+                        true
+                    );
+                }
+            }
+
+            if (r.stopRequested)
+                flushStop();
+            return;
         }
 
         float const quantum = nativeStepDelta();
@@ -2367,11 +2567,38 @@ namespace {
         // почему. Однократно на «эпизод» простоя, ~0.5 с.
         if (steppedThisFrame) {
             r.idleFrames = 0;
+            r.noStepFrames = 0;
             r.warnedIdle = false;
         }
         else {
             ++r.idleFrames;
-            if (r.idleFrames == 30 && !r.warnedIdle) {
+
+            // Интро уровня и заморозка после паузы/респавна — законное окно
+            // без шагов, аварией не считается.
+            bool const introWindow =
+                !r.play->m_started || r.play->m_resumeTimer > 0;
+
+            if (introWindow)
+                r.noStepFrames = 0;
+            else
+                ++r.noStepFrames;
+
+            if (r.noStepFrames >= kNoStepFramesLimit) {
+                r.nativeFallback = true;
+                r.noStepFrames = 0;
+                r.idleFrames = 0;
+                r.warnedIdle = false;
+                postNotice(
+                    "Форсированный шаг 1/240 не даёт игре шагать "
+                    "(" + std::to_string(kNoStepFramesLimit) +
+                    " кадров подряд). Переключился на нативный темп: уровень "
+                    "идёт как обычно, запись и воспроизведение работают, но "
+                    "замедление записи и покадровый режим недоступны. "
+                    "Подробности: " + idleReason(attemptedTicks),
+                    true
+                );
+            }
+            else if (r.idleFrames == 30 && !r.warnedIdle) {
                 r.warnedIdle = true;
                 postNotice("Игра не идёт: " + idleReason(attemptedTicks), true);
             }
@@ -3874,7 +4101,7 @@ class $modify(GDBotBaseLayer, GJBaseGameLayer) {
         if (tracked) {
             ++r.commandCalls;
             ++r.telemetry.commandsCalls;
-            gdbot::runStepInputs(this);
+            gdbot::onStepHook(this, true);
         }
 
         GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
@@ -3897,7 +4124,7 @@ class $modify(GDBotBaseLayer, GJBaseGameLayer) {
             ++r.queuedCalls;
             ++r.telemetry.queuedCalls;
             // Если processCommands в этом шаге не вызывался — разбираем здесь.
-            gdbot::runStepInputs(this);
+            gdbot::onStepHook(this, false);
         }
         else if (r.resetDepth || r.loadDepth || r.injecting ||
                  r.pauseGuard || r.paused ||
