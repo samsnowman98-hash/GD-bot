@@ -230,6 +230,14 @@ namespace {
         bool forceOneStep = false;
         float forcedDelta = 1.0f / static_cast<float>(kNativeTPS);
 
+        // Отложенный рестарт уровня (см. driveUpdate).
+        bool startQueued = false;
+        unsigned startQueuedFrames = 0;
+
+        // Диагностика «игра не идёт»: сколько кадров подряд не было ни шага.
+        unsigned idleFrames = 0;
+        bool warnedIdle = false;
+
         bool paused = false;
         bool dead = false;
         bool frameMode = false;
@@ -1527,6 +1535,20 @@ namespace {
         // же down-события. macroHeld отслеживает их только для sendMask().
         r.macroHeld = 0;
 
+        r.idleFrames = 0;
+        r.warnedIdle = false;
+
+        // Покадровый режим переживает requestStart() намеренно, но тогда
+        // уровень НЕ идёт сам — это надо сказать вслух, иначе выглядит как
+        // зависшая игра.
+        if (r.frameMode) {
+            postNotice(
+                "Покадровый режим включён: уровень не идёт сам, шагайте "
+                "кнопкой «Вправо». Для обычной записи выключите его.",
+                true
+            );
+        }
+
         installNativeFlags();
         // Не force: sentHeld ведёт sendButton() и после clearTimeline() он 0,
         // а resetLevelFromStart() нативно отпустил все кнопки. Force-вариант
@@ -1987,6 +2009,53 @@ namespace {
 
     // --- главный цикл ------------------------------------------------------
 
+    // Диагностика простоя: уровень включён, бот активен, а физических шагов
+    // нет. Без этого «игра не идёт» выглядит как мистика — причина всегда одна
+    // из перечисленных, и её можно назвать прямо.
+    std::string idleReason(bool attemptedTicks) {
+        auto const& s = state();
+        auto const& r = s.run;
+
+        if (!r.play)
+            return "слой уровня исчез.";
+
+        if (r.play->m_isPaused || r.paused)
+            return "игра на паузе.";
+
+        if (r.dead)
+            return "смерть — ожидание респавна или чекпоинта.";
+
+        if (r.pendingStart || r.startQueued)
+            return "ожидание отложенного перезапуска уровня с начала.";
+
+        if (r.frameMode && r.frameBudget == 0)
+            return "включён покадровый режим — уровень стоит, пока не нажата "
+                   "«Вправо». Выключите его для обычной записи.";
+
+        double rate = static_cast<double>(s.tps) *
+            (r.mode == Mode::Record ? s.recordingSpeed : 1.0);
+
+        if (!(rate > 0.0))
+            return "темп равен нулю — проверьте «Темп» и «Скорость записи».";
+
+        if (rate < 30.0)
+            return fmt::format(
+                "темп всего {:.1f} шагов/с (Темп {} × Скорость записи {:.2f}) — "
+                "уровень почти стоит.",
+                rate, s.tps, s.recordingSpeed
+            );
+
+        if (attemptedTicks)
+            return "тик был, но игра не произвела физический шаг "
+                   "(интро уровня или заморозка после паузы/респавна).";
+
+        return fmt::format(
+            "за кадр не набирается ни одного тика: темп {:.0f} шагов/с "
+            "меньше частоты кадров.",
+            rate
+        );
+    }
+
     template <class Original>
     void driveUpdate(
         GJBaseGameLayer* layer, float incomingDelta, Original&& original
@@ -1999,10 +2068,72 @@ namespace {
             return;
         }
 
-        if (r.pendingStart && !r.play->m_isPaused)
-            beginPendingStart();
+        // ПОЛНЫЙ РЕСТАРТ УРОВНЯ НЕЛЬЗЯ ДЕЛАТЬ ИЗНУТРИ update().
+        //
+        // Мы находимся в стеке GJBaseGameLayer::update (его вызывает
+        // PlayLayer::update). Синхронный resetLevelFromStart() в этой точке
+        // рвёт последовательность запуска уровня: m_started остаётся false,
+        // стартовый отсчёт не доходит до конца, и после возвращения из паузы
+        // уровень не начинает симуляцию — снаружи это выглядит ровно как
+        // «возобновил игру, а персонаж не двигается».
+        //
+        // GD сам никогда не сбрасывает уровень синхронно: для этого есть
+        // PlayLayer::delayedResetLevel() и delayedFullReset(), которые
+        // делают CCCallFunc через runAction. Мы откладываем тем же способом —
+        // через geode::queueInMainThread, то есть вне стека update().
+        //
+        // Пока рестарт не выполнен, mode == Off, controls() == false и кадр
+        // уходит игре нативно, поэтому ничего не теряется.
+        if (r.pendingStart && !r.play->m_isPaused) {
+            if (!r.startQueued) {
+                r.startQueued = true;
+                r.startQueuedFrames = 0;
+
+                auto* play = r.play;
+                auto session = r.session;
+
+                geode::queueInMainThread([play, session] {
+                    auto& queued = state().run;
+                    queued.startQueued = false;
+                    queued.startQueuedFrames = 0;
+
+                    if (queued.play != play || queued.session != session)
+                        return;
+
+                    beginPendingStart();
+                });
+            }
+            else if (++r.startQueuedFrames > 120) {
+                // Страховка: очередь главного потока за ~2 с не сработала
+                // (например, диспетчер остановлен). Тогда делаем рестарт здесь
+                // же — это хуже, чем отложенный вызов, но лучше вечного
+                // «ожидания запуска».
+                r.startQueued = false;
+                r.startQueuedFrames = 0;
+                postNotice(
+                    "Отложенный перезапуск уровня не сработал за 2 секунды, "
+                    "выполняю синхронно.",
+                    true
+                );
+                beginPendingStart();
+            }
+        }
 
         if (!controls(layer)) {
+            // Старт запрошен, но рестарт уровня ещё отложен. Кадр «держим»:
+            // уровень всё равно будет перезапущен с начала, а нативный кадр до
+            // рестарта только применил бы ввод, который resetLevelFromStart()
+            // затем сотрёт. Заодно диагностикой видно, если отложенный вызов
+            // почему-то не сработал.
+            if (r.pendingStart) {
+                ++r.idleFrames;
+                if (r.idleFrames == 30 && !r.warnedIdle) {
+                    r.warnedIdle = true;
+                    postNotice("Игра не идёт: " + idleReason(false), true);
+                }
+                return;
+            }
+
             original(incomingDelta);
             return;
         }
@@ -2022,6 +2153,15 @@ namespace {
             std::isfinite(incomingDelta) && incomingDelta > 0.0f
                 ? static_cast<double>(incomingDelta)
                 : 0.0;
+
+        // Защита от dt == 0 / NaN: без неё аккумулятор не растёт, бюджет
+        // навсегда ноль, и уровень стоит, хотя бот «включён». Берём штатный
+        // интервал кадра cocos, но не больше 1/4 с, чтобы не делать рывок.
+        if (frameDelta <= 0.0) {
+            double fallback = CCDirector::sharedDirector()->getAnimationInterval();
+            if (std::isfinite(fallback) && fallback > 0.0)
+                frameDelta = std::min(fallback, 0.25);
+        }
 
         if (r.paused) {
             r.paused = false;
@@ -2079,7 +2219,12 @@ namespace {
             }
         }
 
+        bool steppedThisFrame = false;
+        bool attemptedTicks = false;
+
         for (std::uint64_t i = 0; i < budget && controls(layer); ++i) {
+            attemptedTicks = true;
+
             if (r.dead || r.play->m_isPaused)
                 break;
 
@@ -2200,6 +2345,7 @@ namespace {
             }
 
             commitStep();
+            steppedThisFrame = true;
 
             if (r.markPending && !r.dead && !r.stopRequested) {
                 r.markPending = false;
@@ -2215,6 +2361,20 @@ namespace {
 
             if (r.dead)
                 break;
+        }
+
+        // Если бот активен, но ни одного шага за кадр не случилось — говорим
+        // почему. Однократно на «эпизод» простоя, ~0.5 с.
+        if (steppedThisFrame) {
+            r.idleFrames = 0;
+            r.warnedIdle = false;
+        }
+        else {
+            ++r.idleFrames;
+            if (r.idleFrames == 30 && !r.warnedIdle) {
+                r.warnedIdle = true;
+                postNotice("Игра не идёт: " + idleReason(attemptedTicks), true);
+            }
         }
     }
     void attach(PlayLayer* play, GJGameLevel* level) {
@@ -3363,11 +3523,19 @@ public:
             // Здоровые значения: хуков/тик 1, drift 0, без хука 0, потери 0.
             // «без шага» растёт в интро уровня и после паузы — это нормально,
             // номер шага при этом не сжигается.
+            // «темп» — сколько шагов физики в реальную секунду сейчас даёт
+            // бот. При записи это Темп × Скорость записи. Если число маленькое
+            // (единицы-десятки), уровень визуально стоит — это не баг запуска,
+            // а настройка скорости.
+            double const rate = static_cast<double>(s.tps) *
+                (r.mode == Mode::Record ? s.recordingSpeed : 1.0);
+
             auto text = fmt::format(
-                "{} · шаг {} · соб. {} · хуков/тик {} · drift {} · "
+                "{} · шаг {} · темп {:.0f} · соб. {} · хуков/тик {} · drift {} · "
                 "без хука {} · без шага {} · потери {}",
                 mode,
                 r.step,
+                rate,
                 s.hasBuffer ? s.buffer.actions.size() : 0,
                 t.maxCommandsPerTick,
                 t.nativeStepDrift,
