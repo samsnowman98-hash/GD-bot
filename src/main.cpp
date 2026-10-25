@@ -13,10 +13,10 @@
 #include <Geode/ui/ScrollLayer.hpp>
 #include <Geode/ui/TextInput.hpp>
 #include <Geode/ui/Notification.hpp>
-#include <Geode/fmod/fmod.hpp>   // FIX: правильный путь для FMOD в Geode
+#include <Geode/fmod/fmod.hpp>
 
 #include <algorithm>
-#include <cctype>                // FIX: std::toupper
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -26,7 +26,7 @@
 #include <fstream>
 #include <limits>
 #include <string>
-#include <system_error>          // FIX: std::error_code
+#include <system_error>
 #include <unordered_map>
 #include <vector>
 
@@ -335,11 +335,12 @@ namespace bot {
         return true;
     }
 
+    // FIX: handleButton в bindings принимает int, а не PlayerButton
     inline void applyInput(PlayLayer* pl, StepSub const& s, uint32_t st, double frac) {
         ++applying;
         applyStep = st;
         applyFrac = std::clamp(frac, 0.0, 1.0);
-        pl->handleButton(s.push, static_cast<PlayerButton>(s.button), s.p1);
+        pl->handleButton(s.push, s.button, s.p1);
         --applying;
     }
 
@@ -347,8 +348,8 @@ namespace bot {
         if (!pl) return;
         ++silent;
         for (int b = 1; b <= 3; ++b) {
-            pl->handleButton(false, static_cast<PlayerButton>(b), true);
-            pl->handleButton(false, static_cast<PlayerButton>(b), false);
+            pl->handleButton(false, b, true);
+            pl->handleButton(false, b, false);
         }
         --silent;
     }
@@ -371,8 +372,8 @@ namespace bot {
 
         ++silent;
         for (int b = 1; b <= 3; ++b) {
-            if (held[b][0]) pl->handleButton(true, static_cast<PlayerButton>(b), true);
-            if (held[b][1]) pl->handleButton(true, static_cast<PlayerButton>(b), false);
+            if (held[b][0]) pl->handleButton(true, b, true);
+            if (held[b][1]) pl->handleButton(true, b, false);
         }
         --silent;
     }
@@ -422,10 +423,10 @@ class $modify(BotScheduler, CCScheduler) {
 
 // ---------------------------------------------------------------------------
 // Перехват нажатий.
-// FIX: сигнатура handleButton в 2.2081 — (bool, PlayerButton, bool)
+// FIX: сигнатура в bindings — (bool down, int button, bool isPlayer1)
 // ---------------------------------------------------------------------------
 class $modify(BotBaseGameLayer, GJBaseGameLayer) {
-    void handleButton(bool down, PlayerButton button, bool isPlayer1) {
+    void handleButton(bool down, int button, bool isPlayer1) {
         using namespace bot;
 
         if (mode == Mode::Off || silent > 0 || !isPlayLayer(this)) {
@@ -439,7 +440,7 @@ class $modify(BotBaseGameLayer, GJBaseGameLayer) {
         }
 
         if (mode == Mode::Record) {
-            recordRawInput(static_cast<int>(button), down, isPlayer1, getCurrentTimestamp());
+            recordRawInput(button, down, isPlayer1, getCurrentTimestamp());
             return;
         }
 
@@ -589,7 +590,6 @@ class $modify(BotPlayerObject, PlayerObject) {
             if (substepDelta > 1e-9f) {
                 PlayerObject::update(substepDelta);
                 if (i == 0 && ((this->m_yVelocity < 0) ^ this->m_isUpsideDown)) this->m_isOnGround = p1StartedOnGround;
-                // FIX: для P1 третий параметр checkCollisions должен быть false (isPlayer2)
                 pl->checkCollisions(this, substepDelta, false);
                 PlayerObject::updateRotation(substepDelta);
 
@@ -611,7 +611,6 @@ class $modify(BotPlayerObject, PlayerObject) {
 
         if (remainingDelta > 1e-9f) {
             PlayerObject::update(remainingDelta);
-            // FIX: P1 -> false
             pl->checkCollisions(this, remainingDelta, false);
             PlayerObject::updateRotation(remainingDelta);
 
@@ -623,8 +622,6 @@ class $modify(BotPlayerObject, PlayerObject) {
         }
 
         midStep = false;
-        // FIX: сбрасываем флаги split после завершения шага,
-        // иначе updateRotation может применить устаревший rotationDelta
         p1Split = false;
         p2Split = false;
         g_stepStartTime = stepEndTime;
@@ -659,8 +656,6 @@ class $modify(BotPlayLayer, PlayLayer) {
         bot::playIndex = 0;
         bot::checkpoints.clear();
         bot::resetEngine();
-        // FIX: принудительно сбрасываем timescale и питч, чтобы не унаследовать
-        // состояние от предыдущей инициализации PlayLayer
         bot::setTimeScale(1.0f);
         bot::restoreAudioPitch();
 
@@ -682,6 +677,7 @@ class $modify(BotPlayLayer, PlayLayer) {
         bot::setTimeScale(1.0f);
         bot::restoreAudioPitch();
         bot::resetEngine();
+        bot::checkpoints.clear();
         PlayLayer::onQuit();
     }
 
@@ -821,7 +817,6 @@ class $modify(BotPauseLayer, PauseLayer) {
         std::vector<std::filesystem::path> files;
         std::error_code ec;
         auto dir = bot::getMacroDir();
-        // FIX: ручной обход с error_code — range-based for может бросить на Android
         std::filesystem::directory_iterator it(dir, ec);
         std::filesystem::directory_iterator end;
         for (; !ec && it != end; it.increment(ec)) {
