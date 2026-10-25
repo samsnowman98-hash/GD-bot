@@ -4,35 +4,49 @@
 //
 // ---------------------------------------------------------------------------
 // Fixes applied:
-//   1. CCCircleWave has NO update(float) in 2.2081 -> hook draw() instead.
+//   1. CCCircleWave has NO update(float) in 2.2081 -> hook draw().
 //   2. PlayerObject has NO m_lastPosition (that's GameObject) -> removed.
-//   3. CCMenuItemExt callbacks take CCMenuItemSpriteExtra*, not CCObject*.
+//   3. CCMenuItemExt callbacks take CCMenuItemSpriteExtra*.
 //   4. geode::ListView is the correct list widget; CCScrollLayerExt has no
 //      bound static create() in 2.2081 -> use ListView.
 //   5. Missing closing brace in refreshMacroList().
 //   6. ButtonSprite absolute-width misuse -> absolute=false everywhere.
-//   7. Wall-clock timestamps desync on stalls -> scheduler-driven game clock
-//      that freezes while paused/dead/idle.
+//   7. Scheduler-driven game clock that freezes while paused/dead/idle.
 //   8. Bot does not stomp the global time scale to 1.0 while Mode::Off.
 //   9. Checkpoint bookkeeping: stale pointers cleared.
 //  10. Macro files carry format version + level ID and are validated.
 //  11. getSaveDir() requires "save-data" -> use getConfigDir().
-//  12. Sub-frame timestamps:
-//        * OS event times are queued FIFO by markOsTimestamp; each queued
-//          entry is consumed by exactly one handleButton call via
-//          recordRawInput.
-//        * The queue is cleared at the end of BotScheduler::update.
-//        * frac is computed against the *current physics step* (g_stepTs /
-//          g_stepDt captured in processCommands), not the frame.
-//  13. setTimeScale verifies the scheduler's actual time scale.
-//  14. Record mode forwards the physical handleButton call.
-//  15. processCommands signature is (float dt, bool isHalfTick, bool isLastTick)
-//      in 2.2081. g_stepDt is divided by appliedScale because dt arrives
-//      already scaled by the speedhack, while OS timestamps are real seconds.
+//  12. setTimeScale verifies the scheduler's actual time scale.
+//  13. Record mode forwards the physical handleButton call.
+//  14. FRAC MODEL REWRITTEN. The old formula
+//          frac = (clickTimestamp - g_stepStartTime) / stepDuration
+//      compared two clocks that only met at a resync: g_botTime advances
+//      once per FRAME (rawDt), g_stepStartTime once per STEP (stepDuration).
+//      After the first click the two drift apart, so frac pinned to ~1.0 for
+//      the first click and clamped to 0 for every other. That matches the
+//      observed "one click at 0.999, rest at 0".
 //
-// Android note: gameplay touches carry no sub-frame timestamp in 2.2081.
-// Live sub-frame capture is PC-keyboard-only. On Android the bot records at
-// frame granularity; nudge frac by hand via the EDIT menu.
+//      The replacement tracks an accumulator of *game* time (scaled by the
+//      speedhack) exactly the way GD's physics loop does:
+//          g_accum += rawDt * appliedScale      (once per frame)
+//          g_accum -= stepDelta                 (once per step)
+//      The click's position inside its step is the accumulator's value at
+//      capture time, normalised by the current step:
+//          leftover = g_frameLeftover - g_stepsThisFrame * g_lastStepDelta
+//          frac     = clamp(leftover / stepDelta, 0, 0.9999)
+//      No wall clock is involved, so stalls, alt-tab and speedhack changes
+//      cannot desync it.
+//
+//      NOTE: this is NOT true sub-frame click-between-frames. Live OS event
+//      timestamps are only available on PC keyboard (Android touches carry
+//      none). What the accumulator gives you is the click's real position
+//      inside the physics step, and that varies across frames whenever the
+//      frame length in game time is not an exact multiple of stepDelta.
+//      At 1.0x/60fps (4 steps per frame exactly) the leftover stays ~0 and
+//      frac remains ~0. Record at 0.1..0.3x to get meaningful spread; at
+//      0.1x/60fps you should see frac step by ~0.4 modulo 1.
+//
+//      Use the EDIT menu to nudge a single action's frac by hand.
 // ---------------------------------------------------------------------------
 
 #include <Geode/Geode.hpp>
@@ -50,7 +64,6 @@
 #include <Geode/modify/PauseLayer.hpp>
 #include <Geode/modify/PlayLayer.hpp>
 #include <Geode/modify/PlayerObject.hpp>
-#include <Geode/modify/UILayer.hpp>
 
 #include <Geode/binding/ButtonSprite.hpp>
 #include <Geode/binding/CCMenuItemSpriteExtra.hpp>
@@ -61,9 +74,7 @@
 #include <Geode/binding/GJGameLevel.hpp>
 #include <Geode/binding/PauseLayer.hpp>
 #include <Geode/binding/PlayLayer.hpp>
-#include <Geode/binding/GJUINode.hpp>
 #include <Geode/binding/PlayerObject.hpp>
-#include <Geode/binding/UILayer.hpp>
 
 #include <Geode/ui/ListView.hpp>
 #include <Geode/ui/Notification.hpp>
@@ -75,7 +86,6 @@
 #include <cmath>
 #include <cstdint>
 #include <ctime>
-#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -142,9 +152,10 @@ namespace bot {
         int button = 1;
         bool push = false;
         bool p1 = true;
-        double timestamp = 0.0;
-        double osTs = 0.0;
-        bool hasOsTs = false;
+        // Position of this click inside the step it will be consumed by,
+        // in game-time seconds. Computed at capture time from the accumulator
+        // (see g_accum below); converted to a fraction in PlayerObject::update.
+        double leftover = 0.0;
     };
 
     inline Mode mode = Mode::Off;
@@ -163,29 +174,32 @@ namespace bot {
 
     inline std::vector<RawInput> pendingRecordInputs;
 
-    // FIFO of OS event timestamps. handleKeypress runs before the scheduler
-    // tick that will call handleButton, so "last timestamp" is always one
-    // frame stale. A FIFO pairs them 1:1 in order.
-    inline std::deque<double> g_osTsQueue;
-    constexpr size_t kMaxOsTsQueue = 128;
+    // --- accumulator (game-time seconds) ---------------------------------
+    // Tracks how much scaled game time has accumulated but not yet been
+    // consumed by physics steps. Mirrors GD's own loop:
+    //     g_accum += rawDt * appliedScale   (per frame, in onFrameStart)
+    //     g_accum -= stepDelta              (per step, in PlayerObject::update)
+    // g_frameLeftover snapshots g_accum right at the start of the frame (after
+    // adding the new dt), so that a click recorded during the frame can be
+    // placed at its exact game-time offset from the frame's start.
+    inline double g_accum = 0.0;
+    inline double g_frameLeftover = 0.0;
+    inline double g_lastStepDelta = 0.0;
+    inline uint32_t g_stepsThisFrame = 0;
 
-    // Physics-step time base, captured in GJBaseGameLayer::processCommands.
-    // PlayerObject::update reads these to place clicks inside the current
-    // step rather than inside the whole frame.
-    inline double g_stepTs = 0.0;
-    inline double g_stepDt = 0.0;
-
-    // frac calibration.
+    // frac calibration counters, shown in the pause-menu status line.
     inline double g_fracMin = 1.0;
     inline double g_fracMax = 0.0;
     inline uint32_t g_fracClamped = 0;
     inline uint32_t g_fracSamples = 0;
-    inline uint32_t g_fracFallback = 0;
 
-    // game clock.
+    // frame raw dt, kept for the diagnostic log in PlayerObject::update.
+    inline float g_frameRawDt = 0.f;
+
+    // game clock (used to gate the speedhack and to keep the bot's own
+    // notion of "is a level being simulated" authoritative for the accumulator).
     inline double g_botTime = 0.0;
     inline bool g_clockActive = false;
-    inline double g_stepStartTime = 0.0;
 
     inline bool inputThisStep = false;
     inline bool p1Split = false;
@@ -200,7 +214,7 @@ namespace bot {
         return pl && static_cast<GJBaseGameLayer*>(pl) == l;
     }
 
-    // pause cache.
+    // --- pause cache -------------------------------------------------------
     inline bool g_pauseCached = false;
     inline int g_pauseCachedChildCount = -1;
 
@@ -245,10 +259,10 @@ namespace bot {
 
     inline void resetEngine() {
         pendingRecordInputs.clear();
-        g_osTsQueue.clear();
-        g_stepStartTime = 0.0;
-        g_stepTs = 0.0;
-        g_stepDt = 0.0;
+        g_accum = 0.0;
+        g_frameLeftover = 0.0;
+        g_lastStepDelta = 0.0;
+        g_stepsThisFrame = 0;
         inputThisStep = false;
         p1Split = false;
         p2Split = false;
@@ -261,7 +275,6 @@ namespace bot {
         g_fracMax = 0.0;
         g_fracClamped = 0;
         g_fracSamples = 0;
-        g_fracFallback = 0;
     }
 
     inline void applyClickFlags() {
@@ -286,7 +299,6 @@ namespace bot {
                               || std::fabs(s - current) > 1e-6f;
         if (!needsUpdate) return;
 
-        g_stepStartTime = 0.0;
         appliedScale = s;
         scheduler->setTimeScale(s);
         updateAudioPitch();
@@ -306,28 +318,18 @@ namespace bot {
         }
     }
 
-    inline void markOsTimestamp(double ts) {
-        if (mode != Mode::Record) return;
-        g_osTsQueue.push_back(ts);
-        if (g_osTsQueue.size() > kMaxOsTsQueue) g_osTsQueue.pop_front();
-    }
-
+    // Capture the click's offset from the start of the current frame inside
+    // the accumulator, in game-time seconds. This is the number PlayerObject
+    // turns into frac once it knows the step length.
     inline void recordRawInput(int button, bool push, bool isPlayer1) {
         RawInput raw;
         raw.button = button;
         raw.push = push;
         raw.p1 = isPlayer1;
-        raw.timestamp = g_botTime;
-        if (!g_osTsQueue.empty()) {
-            raw.osTs = g_osTsQueue.front();
-            g_osTsQueue.pop_front();
-            raw.hasOsTs = true;
-        }
+        raw.leftover = std::max(0.0, g_frameLeftover - g_stepsThisFrame * g_lastStepDelta);
         pendingRecordInputs.push_back(raw);
     }
 
-    // ... parseSpeedString, parseFracString, getMacroDir, generateTimestampName,
-    //     sanitizeFileName, saveMacro, loadMacro, currentLevelID — without changes.
     inline double parseSpeedString(std::string const& str) {
         std::string s = str;
         for (char& c : s) if (c == ',') c = '.';
@@ -534,21 +536,41 @@ namespace bot {
     }
 
     inline void onFrameStart(float rawDt) {
+        g_frameRawDt = rawDt;
+
         bool const levelActive = (mode != Mode::Off) && isLevelActive();
         auto pl = PlayLayer::get();
         bool const simulating = levelActive && pl && !pl->m_playerDied && !pl->m_hasCompletedLevel;
 
         if (simulating && !g_clockActive) {
             pendingRecordInputs.clear();
-            g_stepStartTime = 0.0;
+            g_accum = 0.0;
         }
         else if (!simulating && g_clockActive) {
             pendingRecordInputs.clear();
         }
         g_clockActive = simulating;
 
+        g_stepsThisFrame = 0;
+
         if (simulating) {
+            // Safety net against drift from our mirrored accumulator: if it
+            // somehow exceeded one step, fold it back into [0, stepDelta).
+            if (g_lastStepDelta > 1e-9 && g_accum >= g_lastStepDelta) {
+                g_accum = std::fmod(g_accum, g_lastStepDelta);
+            }
+            // Snapshot BEFORE adding this frame's worth of dt; that's the
+            // "distance from the start of the frame to the start of the step"
+            // that a click in this frame will need.
+            g_frameLeftover = g_accum;
+            double const scaledDt =
+                std::clamp(static_cast<double>(rawDt), 0.0, 0.25)
+                * static_cast<double>(appliedScale);
+            g_accum += scaledDt;
             g_botTime += std::clamp(static_cast<double>(rawDt), 0.0, 0.25);
+        }
+        else {
+            g_frameLeftover = 0.0;
         }
 
         if (mode == Mode::Record) {
@@ -577,22 +599,12 @@ class $modify(BotScheduler, CCScheduler) {
     void update(float dt) {
         bot::onFrameStart(dt);
         CCScheduler::update(dt);
-        bot::g_osTsQueue.clear();
         bot::updateAudioPitch();
     }
 };
 
 // ---------------------------------------------------------------------------
-// Input interception + per-step time base
-//
-// GJBaseGameLayer::handleButton(bool down, int button, bool isPlayer1) is the
-// only declaration in 2.2081.
-//
-// processCommands(float dt, bool isHalfTick, bool isLastTick) is where GD
-// drains its own button queue. m_timestamp is the step's start in game time,
-// and dt arrives already multiplied by the scheduler time scale (speedhack),
-// so it must be divided by appliedScale to match the real-seconds OS
-// timestamps queued in g_osTsQueue.
+// Input interception
 // ---------------------------------------------------------------------------
 class $modify(BotBaseGameLayer, GJBaseGameLayer) {
     void handleButton(bool down, int button, bool isPlayer1) {
@@ -604,45 +616,14 @@ class $modify(BotBaseGameLayer, GJBaseGameLayer) {
         }
 
         if (mode == Mode::Record) {
+            // Capture the click and forward the physical press so the player
+            // reacts immediately. Playback re-applies at the sub-step frac.
             recordRawInput(button, down, isPlayer1);
             GJBaseGameLayer::handleButton(down, button, isPlayer1);
             return;
         }
 
         // Mode::Play: human input is ignored on purpose.
-    }
-
-    void processCommands(float dt, bool isHalfTick, bool isLastTick) {
-        if (bot::mode != bot::Mode::Off && bot::isPlayLayer(this)) {
-            float const scale = (bot::appliedScale > 0.0001f) ? bot::appliedScale : 1.0f;
-            bot::g_stepTs = this->m_timestamp;
-            // dt arrives already scaled by the speedhack; divide it out so
-            // frac is computed in the same real-seconds base as osTs.
-            bot::g_stepDt = static_cast<double>(dt) / scale;
-
-            // TEMPORARY DIAGNOSTIC. Uncomment to verify the time base and the
-            // isHalfTick cadence:
-            //   log::info("ts={} dt={} half={} last={} osq={}",
-            //             this->m_timestamp, dt, isHalfTick, isLastTick,
-            //             bot::g_osTsQueue.size());
-            //
-            // If processCommands is called twice per physics step (once with
-            // isHalfTick=true), g_stepDt will describe only half a step.
-            // In that case either skip recording on the half-tick call or
-            // double g_stepDt for it, depending on which half carries the
-            // queued commands.
-        }
-        GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
-    }
-};
-
-// ---------------------------------------------------------------------------
-// OS event timestamps (keyboard only; touches carry no timestamp on Android)
-// ---------------------------------------------------------------------------
-class $modify(BotUILayer, UILayer) {
-    void handleKeypress(cocos2d::enumKeyCodes key, bool down, double timestamp) {
-        bot::markOsTimestamp(timestamp);
-        UILayer::handleKeypress(key, down, timestamp);
     }
 };
 
@@ -678,18 +659,13 @@ class $modify(BotPlayerObject, PlayerObject) {
         }
 
         uint32_t const cur = step;
+
+        // --- accumulator: consume one step's worth of game time ---------
+        g_lastStepDelta = stepDelta;
+        ++g_stepsThisFrame;
+        g_accum = std::max(0.0, g_accum - static_cast<double>(stepDelta));
+
         std::vector<StepSub> subs;
-
-        float const scale = (appliedScale > 0.0001f) ? appliedScale : 1.0f;
-        double const stepDuration = static_cast<double>(stepDelta) / static_cast<double>(scale);
-        double const now = g_botTime;
-
-        if (g_stepStartTime <= 0.0 || (now - g_stepStartTime) > (stepDuration * 4.0)) {
-            g_stepStartTime = now - stepDuration;
-        }
-
-        double const stepStartTime = g_stepStartTime;
-        double const stepEndTime = stepStartTime + stepDuration;
 
         if (mode == Mode::Play) {
             while (playIndex < macro.size() && macro[playIndex].step <= cur) {
@@ -703,40 +679,26 @@ class $modify(BotPlayerObject, PlayerObject) {
             }
         }
         else { // Record
-            std::vector<RawInput> remaining;
-            remaining.reserve(pendingRecordInputs.size());
+            // Every click captured this frame carries `leftover`, its exact
+            // offset from the start of the frame inside the accumulator.
+            // Convert that to a step-relative frac and consume the click.
+            //
+            // DIAGNOSTIC (uncomment once, then record at 0.1x speed to
+            // confirm the accumulator is behaving):
+            //   log::info("sd={} rawDt={} scale={} L={}",
+            //             stepDelta, g_frameRawDt, appliedScale, g_frameLeftover);
             for (auto const& in : pendingRecordInputs) {
-                bool take = false;
-                double frac = 0.0;
-
-                if (in.hasOsTs && g_stepDt > 1e-9) {
-                    take = in.osTs < g_stepTs + g_stepDt;
-                    if (take) {
-                        double f = (in.osTs - g_stepTs) / g_stepDt;
-                        if (f < 0.0 || f > 1.0) ++g_fracClamped;
-                        f = std::clamp(f, 0.0, 0.9999999);
-                        g_fracMin = std::min(g_fracMin, f);
-                        g_fracMax = std::max(g_fracMax, f);
-                        ++g_fracSamples;
-                        frac = f;
-                    }
-                }
-                else {
-                    take = in.timestamp <= stepEndTime;
-                    if (take) {
-                        double rel = in.timestamp - stepStartTime;
-                        frac = std::clamp(rel / stepDuration, 0.0, 0.9999);
-                        ++g_fracFallback;
-                    }
-                }
-
-                if (!take) { remaining.push_back(in); continue; }
-
                 StepSub s;
                 s.button = in.button;
                 s.push = in.push;
                 s.p1 = in.p1;
-                s.frac = frac;
+                double f = in.leftover / static_cast<double>(stepDelta);
+                if (f < 0.0 || f > 1.0) ++g_fracClamped;
+                f = std::clamp(f, 0.0, 0.9999);
+                g_fracMin = std::min(g_fracMin, f);
+                g_fracMax = std::max(g_fracMax, f);
+                ++g_fracSamples;
+                s.frac = f;
                 subs.push_back(s);
 
                 Action a;
@@ -747,7 +709,7 @@ class $modify(BotPlayerObject, PlayerObject) {
                 a.p1 = s.p1;
                 macro.push_back(a);
             }
-            pendingRecordInputs.swap(remaining);
+            pendingRecordInputs.clear();
         }
 
         inputThisStep = !subs.empty();
@@ -756,7 +718,6 @@ class $modify(BotPlayerObject, PlayerObject) {
             p1Split = false;
             p2Split = false;
             PlayerObject::update(stepDelta);
-            g_stepStartTime = stepEndTime;
             ++step;
             return;
         }
@@ -832,7 +793,6 @@ class $modify(BotPlayerObject, PlayerObject) {
         midStep = false;
         p1Split = false;
         p2Split = false;
-        g_stepStartTime = stepEndTime;
         ++step;
     }
 
@@ -937,7 +897,6 @@ class $modify(BotPlayLayer, PlayLayer) {
         }
 
         bot::step = it->second;
-        bot::g_stepStartTime = 0.0;
         bot::pendingRecordInputs.clear();
 
         if (bot::mode == bot::Mode::Record) {
@@ -966,7 +925,7 @@ class $modify(BotPlayLayer, PlayLayer) {
 };
 
 // ---------------------------------------------------------------------------
-// Pause-menu UI
+// Pause-menu UI (unchanged; full source follows)
 // ---------------------------------------------------------------------------
 class $modify(BotPauseLayer, PauseLayer) {
     struct Fields {
@@ -1004,10 +963,9 @@ class $modify(BotPauseLayer, PauseLayer) {
                 fs = "frac: no clicks yet";
             }
             else {
-                fs = fmt::format("frac {:.4f}..{:.4f}  os {}  fb {}  clamp {}",
+                fs = fmt::format("frac {:.4f}..{:.4f}  n {}  clamp {}",
                                  bot::g_fracMin, bot::g_fracMax,
-                                 bot::g_fracSamples, bot::g_fracFallback,
-                                 bot::g_fracClamped);
+                                 bot::g_fracSamples, bot::g_fracClamped);
             }
             f->m_fracLabel->setString(fs.c_str());
         }
