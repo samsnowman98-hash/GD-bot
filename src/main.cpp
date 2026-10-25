@@ -17,16 +17,28 @@
 //   9. Checkpoint bookkeeping: stale pointers cleared.
 //  10. Macro files carry format version + level ID and are validated.
 //  11. getSaveDir() requires "save-data" -> use getConfigDir().
-//  12. markOsTimestamp now samples g_frameTs (start of *current* frame),
-//      not pl->m_timestamp (still previous frame during OS event dispatch).
+//  12. Sub-frame timestamps:
+//        * OS event times are queued FIFO by markOsTimestamp; each queued
+//          entry is consumed by exactly one handleButton call via
+//          recordRawInput. The "last timestamp" hack is gone: it was wrong
+//          because handleKeypress only enqueues the button and handleButton
+//          runs one frame later.
+//        * The queue is cleared at the end of BotScheduler::update so stale
+//          entries (e.g. Esc) can't bleed into the next frame.
+//        * frac is computed against the *current physics step*, not the
+//          frame. processCommands captures g_stepTs / g_stepDt; PlayerObject
+//          uses those numbers, so multi-step frames stay correct.
 //  13. setTimeScale verifies the scheduler's actual time scale, so an
 //      external reset cannot leave the speedhack silently unapplied.
 //  14. Record mode forwards the physical handleButton call, so the player
 //      reacts immediately. The recorded action is re-applied at the correct
 //      sub-step during PlayerObject::update.
-//  15. BotUILayer now hooks ccTouchBegan so that Android gameplay touches
-//      (which carry no sub-frame timestamp) don't inherit stale OS timestamps
-//      from previous keyboard events.
+//
+// Android note: gameplay touches carry no sub-frame timestamp in 2.2081
+// (cocos2d::CCTouch has no time field, and nativeTouchesBegin doesn't
+// receive one). Live sub-frame capture is PC-keyboard-only. On Android the
+// bot still records at frame granularity and you can nudge frac by hand via
+// the EDIT menu.
 // ---------------------------------------------------------------------------
 
 #include <Geode/Geode.hpp>
@@ -69,6 +81,7 @@
 #include <cmath>
 #include <cstdint>
 #include <ctime>
+#include <deque>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -135,10 +148,8 @@ namespace bot {
         int button = 1;
         bool push = false;
         bool p1 = true;
-        double timestamp = 0.0;
-        double osTs = 0.0;
-        double refTs = 0.0;
-        float refDt = 0.f;
+        double timestamp = 0.0;   // g_botTime at capture (frame granularity)
+        double osTs = 0.0;        // OS event timestamp, sub-frame precision
         bool hasOsTs = false;
     };
 
@@ -158,17 +169,33 @@ namespace bot {
 
     inline std::vector<RawInput> pendingRecordInputs;
 
-    // --- sub-frame input timestamps ------------------------------------
-    inline double g_lastOsTs = 0.0;
-    inline uint64_t g_lastOsTsFrame = 0;
-    inline uint64_t g_frameCounter = 0;
+    // --- FIFO of OS event timestamps ------------------------------------
+    // handleKeypress is called from the OS event pump *before* the scheduler
+    // tick that will actually drain the button queue and call handleButton.
+    // So "most recent OS timestamp" is always the *previous* frame's by the
+    // time handleButton runs. A FIFO preserves the pairing: one entry pushed
+    // per keyboard event, one entry popped per handleButton call. The queue
+    // is cleared at the end of BotScheduler::update so keys that never map
+    // to a button (Esc, etc.) cannot poison later clicks.
+    inline std::deque<double> g_osTsQueue;
+    constexpr size_t kMaxOsTsQueue = 128;
 
-    inline double g_frameTs = 0.0;
-    inline float g_frameRawDt = 0.f;
+    // --- physics-step time base ------------------------------------------
+    // Captured in GJBaseGameLayer::processCommands, i.e. *inside* the step
+    // that will consume the queued commands. PlayerObject::update runs in
+    // the same step and reads these to compute frac relative to the step
+    // rather than to the frame.
+    //
+    // TEMPORARY DIAGNOSTIC: uncomment the log line in
+    // BotBaseGameLayer::processCommands to confirm m_timestamp and the
+    // handleKeypress timestamp share a time base. If they are orders of
+    // magnitude apart, m_timestamp is game-time and handleKeypress' value
+    // is OS-time; in that case subtract `dt` from g_stepTs and/or add an
+    // offset normaliser once you know the true relationship.
+    inline double g_stepTs = 0.0;
+    inline double g_stepDt = 0.0;
 
-    inline double g_lastRefTs = 0.0;
-    inline float g_lastRefDt = 0.f;
-
+    // --- frac calibration -------------------------------------------------
     inline double g_fracMin = 1.0;
     inline double g_fracMax = 0.0;
     inline uint32_t g_fracClamped = 0;
@@ -238,11 +265,10 @@ namespace bot {
 
     inline void resetEngine() {
         pendingRecordInputs.clear();
+        g_osTsQueue.clear();
         g_stepStartTime = 0.0;
-        g_lastOsTs = 0.0;
-        g_lastOsTsFrame = 0;
-        g_lastRefTs = 0.0;
-        g_lastRefDt = 0.f;
+        g_stepTs = 0.0;
+        g_stepDt = 0.0;
         inputThisStep = false;
         p1Split = false;
         p2Split = false;
@@ -272,8 +298,6 @@ namespace bot {
         }
     }
 
-    // FIX #13: verify the scheduler's *actual* time scale, not just our own
-    // cached value. An external mod can reset it without telling us.
     inline void setTimeScale(float s) {
         auto scheduler = CCDirector::sharedDirector()->getScheduler();
         if (!scheduler) return;
@@ -302,15 +326,14 @@ namespace bot {
         }
     }
 
-    // FIX #12: sample the reference timestamp from g_frameTs (start of the
-    // *current* frame, captured in onFrameStart), not pl->m_timestamp, which
-    // still belongs to the previous frame while the OS event batch is being
-    // dispatched ahead of drawScene().
+    // Called from BotUILayer::handleKeypress, BEFORE the button is enqueued
+    // into GD's command queue. Order of pushes matches order of enqueues,
+    // which in turn matches order of handleButton calls inside
+    // processCommands, so a plain FIFO pairs them 1:1.
     inline void markOsTimestamp(double ts) {
-        g_lastOsTs = ts;
-        g_lastOsTsFrame = g_frameCounter;
-        g_lastRefTs = g_frameTs;
-        g_lastRefDt = g_frameRawDt;
+        if (mode != Mode::Record) return;
+        g_osTsQueue.push_back(ts);
+        if (g_osTsQueue.size() > kMaxOsTsQueue) g_osTsQueue.pop_front();
     }
 
     inline void recordRawInput(int button, bool push, bool isPlayer1) {
@@ -319,22 +342,12 @@ namespace bot {
         raw.push = push;
         raw.p1 = isPlayer1;
         raw.timestamp = g_botTime;
-        raw.osTs = g_lastOsTs;
-        raw.refTs = g_lastRefTs;
-        raw.refDt = g_lastRefDt;
-        raw.hasOsTs = (g_lastOsTsFrame == g_frameCounter);
+        if (!g_osTsQueue.empty()) {
+            raw.osTs = g_osTsQueue.front();
+            g_osTsQueue.pop_front();
+            raw.hasOsTs = true;
+        }
         pendingRecordInputs.push_back(raw);
-    }
-
-    inline double osTsToFrac(RawInput const& in) {
-        if (!in.hasOsTs || in.refDt <= 1e-9f || in.refTs <= 0.0) return -1.0;
-        double f = (in.osTs - in.refTs) / static_cast<double>(in.refDt);
-        ++g_fracSamples;
-        if (f < 0.0 || f > 1.0) ++g_fracClamped;
-        f = std::clamp(f, 0.0, 0.9999999);
-        g_fracMin = std::min(g_fracMin, f);
-        g_fracMax = std::max(g_fracMax, f);
-        return f;
     }
 
     inline double parseSpeedString(std::string const& str) {
@@ -543,10 +556,6 @@ namespace bot {
     }
 
     inline void onFrameStart(float rawDt) {
-        ++g_frameCounter;
-        g_frameRawDt = rawDt;
-        if (auto plf = PlayLayer::get()) g_frameTs = plf->m_timestamp;
-
         bool const levelActive = (mode != Mode::Off) && isLevelActive();
         auto pl = PlayLayer::get();
         bool const simulating = levelActive && pl && !pl->m_playerDied && !pl->m_hasCompletedLevel;
@@ -590,12 +599,26 @@ class $modify(BotScheduler, CCScheduler) {
     void update(float dt) {
         bot::onFrameStart(dt);
         CCScheduler::update(dt);
+        // The current frame's button queue has been fully drained by now, so
+        // any leftover OS timestamps belong to keys that never mapped to a
+        // button (Esc, F-keys, etc). Drop them so they cannot poison the
+        // next frame's clicks.
+        bot::g_osTsQueue.clear();
         bot::updateAudioPitch();
     }
 };
 
 // ---------------------------------------------------------------------------
-// Input interception
+// Input interception + per-step time base
+//
+// GJBaseGameLayer::handleButton(bool down, int button, bool isPlayer1) is the
+// only declaration in 2.2081 (PlayLayer does not override it).
+//
+// processCommands(float dt) is the funnel where GD drains its own queueButton
+// queue and calls handleButton for each queued command. Capturing
+// m_timestamp / dt there gives us the *step's* start time and length, which
+// is what frac must be measured against -- a single frame can contain several
+// physics steps, and per-frame timing is off by a step at each boundary.
 // ---------------------------------------------------------------------------
 class $modify(BotBaseGameLayer, GJBaseGameLayer) {
     void handleButton(bool down, int button, bool isPlayer1) {
@@ -607,8 +630,9 @@ class $modify(BotBaseGameLayer, GJBaseGameLayer) {
         }
 
         if (mode == Mode::Record) {
-            // FIX #14: record the action but forward the real press so the
-            // player reacts immediately. Playback re-applies at the sub-step.
+            // Record the click but still forward the physical press so the
+            // player reacts immediately. Playback re-applies the recorded
+            // action at the sub-step frac inside PlayerObject::update.
             recordRawInput(button, down, isPlayer1);
             GJBaseGameLayer::handleButton(down, button, isPlayer1);
             return;
@@ -616,34 +640,39 @@ class $modify(BotBaseGameLayer, GJBaseGameLayer) {
 
         // Mode::Play: human input is ignored on purpose.
     }
+
+    void processCommands(float dt) {
+        if (bot::mode != bot::Mode::Off && bot::isPlayLayer(this)) {
+            bot::g_stepTs = this->m_timestamp;
+            bot::g_stepDt = static_cast<double>(dt);
+
+            // TEMPORARY DIAGNOSTIC. Uncomment while verifying that
+            // handleKeypress' timestamp and m_timestamp share a time base.
+            // Healthy PC keyboard recording looks like:
+            //   ts=12.345 dt=0.00417 osq=0        (between clicks)
+            //   ts=12.350 dt=0.00417 osq=1        (click enqueued)
+            // If ts and osq timestamps are orders of magnitude apart the
+            // bases differ and g_stepTs needs a normaliser.
+            // log::info("ts={} dt={} osq={}", this->m_timestamp, dt, bot::g_osTsQueue.size());
+        }
+        GJBaseGameLayer::processCommands(dt);
+    }
 };
 
 // ---------------------------------------------------------------------------
-// Sub-frame input timestamps
+// OS event timestamps (keyboard only; touches have no timestamp on Android)
+//
+// UILayer::handleKeypress(enumKeyCodes, bool down, double timestamp) is the
+// only path that carries a real sub-frame OS event time. We push it into the
+// FIFO; recordRawInput pops it from the matching handleButton call inside
+// processCommands. Deliberately NOT hooking ccTouchBegan / pushButton /
+// processUINodeTouch: touches carry no timestamp, and hooking them just to
+// reset state (as an earlier draft did) was worse than useless.
 // ---------------------------------------------------------------------------
 class $modify(BotUILayer, UILayer) {
     void handleKeypress(cocos2d::enumKeyCodes key, bool down, double timestamp) {
         bot::markOsTimestamp(timestamp);
         UILayer::handleKeypress(key, down, timestamp);
-    }
-
-    bool processUINodeTouch(GJUITouchEvent event, int touchID, cocos2d::CCPoint position,
-                            GJUINode* node, double timestamp) {
-        bot::markOsTimestamp(timestamp);
-        return UILayer::processUINodeTouch(event, touchID, position, node, timestamp);
-    }
-
-    // FIX #15: Android gameplay touches arrive through ccTouchBegan without a
-    // sub-frame timestamp. Invalidate any stale OS timestamp from previous
-    // keyboard events so hasOsTs correctly falls back to frame granularity.
-    bool ccTouchBegan(cocos2d::CCTouch* touch, cocos2d::CCEvent* event) {
-        if (bot::mode != bot::Mode::Off) {
-            bot::g_lastOsTs = 0.0;
-            bot::g_lastOsTsFrame = 0;
-            bot::g_lastRefTs = bot::g_frameTs;
-            bot::g_lastRefDt = bot::g_frameRawDt;
-        }
-        return UILayer::ccTouchBegan(touch, event);
     }
 };
 
@@ -707,34 +736,53 @@ class $modify(BotPlayerObject, PlayerObject) {
             std::vector<RawInput> remaining;
             remaining.reserve(pendingRecordInputs.size());
             for (auto const& in : pendingRecordInputs) {
-                if (in.timestamp <= stepEndTime) {
-                    StepSub s;
-                    s.button = in.button;
-                    s.push = in.push;
-                    s.p1 = in.p1;
+                bool take = false;
+                double frac = 0.0;
 
-                    double osFrac = osTsToFrac(in);
-                    if (osFrac >= 0.0) {
-                        s.frac = osFrac;
+                if (in.hasOsTs && g_stepDt > 1e-9) {
+                    // Sub-frame path: measure against the current physics
+                    // step, not the enclosing frame. `in.osTs < g_stepTs`
+                    // means the event slipped behind the step boundary
+                    // (queue backlog after a lag spike); take it now with
+                    // frac clamped to 0 so we don't lose the click.
+                    take = in.osTs < g_stepTs + g_stepDt;
+                    if (take) {
+                        double f = (in.osTs - g_stepTs) / g_stepDt;
+                        if (f < 0.0 || f > 1.0) ++g_fracClamped;
+                        f = std::clamp(f, 0.0, 0.9999999);
+                        g_fracMin = std::min(g_fracMin, f);
+                        g_fracMax = std::max(g_fracMax, f);
+                        ++g_fracSamples;
+                        frac = f;
                     }
-                    else {
-                        double rel = in.timestamp - stepStartTime;
-                        s.frac = std::clamp(rel / stepDuration, 0.0, 0.9999);
-                        ++g_fracFallback;
-                    }
-                    subs.push_back(s);
-
-                    Action a;
-                    a.step = cur;
-                    a.frac = s.frac;
-                    a.button = static_cast<uint8_t>(s.button);
-                    a.down = s.push;
-                    a.p1 = s.p1;
-                    macro.push_back(a);
                 }
                 else {
-                    remaining.push_back(in);
+                    // Frame-granularity fallback (Android touches, or no OS
+                    // timestamp for some reason).
+                    take = in.timestamp <= stepEndTime;
+                    if (take) {
+                        double rel = in.timestamp - stepStartTime;
+                        frac = std::clamp(rel / stepDuration, 0.0, 0.9999);
+                        ++g_fracFallback;
+                    }
                 }
+
+                if (!take) { remaining.push_back(in); continue; }
+
+                StepSub s;
+                s.button = in.button;
+                s.push = in.push;
+                s.p1 = in.p1;
+                s.frac = frac;
+                subs.push_back(s);
+
+                Action a;
+                a.step = cur;
+                a.frac = s.frac;
+                a.button = static_cast<uint8_t>(s.button);
+                a.down = s.push;
+                a.p1 = s.p1;
+                macro.push_back(a);
             }
             pendingRecordInputs.swap(remaining);
         }
