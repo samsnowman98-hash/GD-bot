@@ -1,35 +1,38 @@
 // CBF-style TAS bot for Geometry Dash 2.2081 / Geode 4.x (Windows, macOS, Android)
 //
-// Verified against geode-sdk/bindings @ bindings/2.2081/GeometryDash.bro
+// Revision 3 (clean rewrite of the pasted file):
+//   * ONE copy of the code; namespace bot is closed; MenuLayer.hpp is included.
+//   * Record mode SWALLOWS the physical click. The click is applied only once,
+//     by PlayerObject::update at its recorded frac (record == playback).
+//     While the level is not simulating (dead / paused) clicks pass through
+//     untouched and are not recorded.
+//   * Android timestamps come through a FIFO (mutex + deque), not one slot:
+//     several events per frame cannot steal each other's stamp. Stale stamps
+//     (> 0.25 s) are dropped when popped; the queue is flushed whenever the
+//     level is not simulating (pause-menu taps cannot misalign game clicks).
+//   * Correct frac math. The anchor is the PREVIOUS frame tick (the event
+//     happened in the interval that became this frame's dt):
+//         T     = m_extraDelta + (osTs - prevTick) * timeScale   // accumulator pos
+//         local = T - stepsThisFrame * stepDelta                 // pos in this step
+//         local >= stepDelta -> click belongs to a later step: keep it pending
+//         local <  0         -> clamp to 0 (counted in "clamp")
+//     A pending click that survives a frame boundary is applied at frac 0
+//     (age rule), so a wrong time model can never freeze input.
+//   * No OS-clock fallback at handleButton time (it carried no sub-frame
+//     information). Without a stamp frac is an honest 0.0 and "fb" counts it.
+//   * JNI bridge: logs every step, and is retried from MenuLayer::init and
+//     PlayLayer::init (those run on the Java-attached GL thread, where
+//     FindClass can see the launcher classes).
+//   * processCommands hook, UILayer hooks, EDIT menu and the old accumulator
+//     are gone.
 //
-// ---------------------------------------------------------------------------
-// Fixes applied:
-//   1. CCCircleWave has NO update(float) in 2.2081 -> hook draw().
-//   2. PlayerObject has NO m_lastPosition (that's GameObject) -> removed.
-//   3. CCMenuItemExt callbacks take CCMenuItemSpriteExtra*.
-//   4. geode::ListView is the correct list widget; CCScrollLayerExt has no
-//      bound static create() in 2.2081 -> use ListView.
-//   5. Missing closing brace in refreshMacroList().
-//   6. ButtonSprite absolute-width misuse -> absolute=false everywhere.
-//   7. Scheduler-driven game clock that freezes while paused/dead/idle.
-//   8. Bot does not stomp the global time scale to 1.0 while Mode::Off.
-//   9. Checkpoint bookkeeping: stale pointers cleared.
-//  10. Macro files carry format version + level ID and are validated.
-//  11. getSaveDir() requires "save-data" -> use getConfigDir().
-//  12. setTimeScale verifies the scheduler's actual time scale.
-//  13. Record mode forwards the physical handleButton call.
-//  14. REAL sub-frame input on Android via JNI bridge (CBF architecture):
-//      - Native method setNextInputTimestamp is registered on
-//        com.geode.launcher.utils.GeodeUtils during mod load.
-//      - Java launcher calls it with nanosecond event time right before
-//        dispatching the touch/key event to Cocos2d.
-//      - The stored timestamp is read in handleButton and used to compute frac.
-//  15. frac is computed against the *current physics step* using
-//      GJBaseGameLayer::m_extraDelta (the leftover accumulator at the start
-//      of the frame). This matches GD's own step-slicing model, so frac
-//      stays valid across frames of different lengths.
-//  16. EDIT mode removed. Only the frac read-out is kept so you can verify
-//      that sub-frame timestamps are arriving and producing a spread.
+// Java side contract (launcher must be patched):
+//     package com.geode.launcher.utils;
+//     public final class GeodeUtils {
+//         public static native void setNextInputTimestamp(long nanos);
+//     }
+//     // once per input event, right before it is forwarded to cocos2d:
+//     GeodeUtils.setNextInputTimestamp(SystemClock.elapsedRealtimeNanos());
 // ---------------------------------------------------------------------------
 
 #include <Geode/Geode.hpp>
@@ -37,7 +40,6 @@
 #include <Geode/Enums.hpp>
 #include <Geode/utils/cocos.hpp>
 #include <Geode/utils/file.hpp>
-#include <Geode/utils/AndroidEvent.hpp>
 
 #include <Geode/modify/CCCircleWave.hpp>
 #include <Geode/modify/CCScheduler.hpp>
@@ -70,8 +72,10 @@
 #include <cmath>
 #include <cstdint>
 #include <ctime>
+#include <deque>
 #include <filesystem>
 #include <fstream>
+#include <mutex>
 #include <string>
 #include <system_error>
 #include <unordered_map>
@@ -79,6 +83,15 @@
 
 #ifdef GEODE_IS_ANDROID
 #include <jni.h>
+#include <cocos2d.h>
+// JniHelper lives in different places depending on the SDK checkout.
+#if __has_include(<Geode/cocos/platform/android/jni/JniHelper.h>)
+#include <Geode/cocos/platform/android/jni/JniHelper.h>
+#define GDBOT_HAVE_JNIHELPER 1
+#elif __has_include(<platform/android/jni/JniHelper.h>)
+#include <platform/android/jni/JniHelper.h>
+#define GDBOT_HAVE_JNIHELPER 1
+#endif
 #endif
 
 using namespace geode::prelude;
@@ -95,29 +108,18 @@ class $modify(BotGameStatsManager, GameStatsManager) {
     bool isItemUnlocked(UnlockType type, int id) { return true; }
 };
 
-namespace bot {
-    inline bool disableDeathEffects = true;
-}
-
-class $modify(BotMenuLayer, MenuLayer) {
-    bool init() {
-        if (!MenuLayer::init()) return false;
-        if (auto mod = Mod::get()) {
-            bot::disableDeathEffects = mod->getSavedValue<bool>("disableDeathEffects", true);
-        }
-        return true;
-    }
-};
-
 // ---------------------------------------------------------------------------
 // Bot core
 // ---------------------------------------------------------------------------
 namespace bot {
 
+    inline bool disableDeathEffects = true;
+
     constexpr uint32_t kMagic = 0x33544F42; // "BOT3"
     constexpr uint32_t kFormat = 3;
     constexpr uint32_t kMaxActions = 2'000'000;
     constexpr std::uintmax_t kMaxFileSize = 64ull * 1024ull * 1024ull; // 64 MB
+    constexpr double kStampMaxAge = 0.25; // seconds
 
     enum class Mode { Off, Record, Play };
 
@@ -140,9 +142,9 @@ namespace bot {
         int button = 1;
         bool push = false;
         bool p1 = true;
-        double osTs = 0.0;        // OS event timestamp in seconds (sub-frame)
+        double osTs = 0.0;      // OS event time, seconds, monotonic (see osNowSec)
         bool hasOsTs = false;
-        double leftover = 0.0;    // fallback: m_extraDelta at capture time
+        uint32_t age = 0;       // frame ticks survived while pending
     };
 
     inline Mode mode = Mode::Off;
@@ -152,8 +154,6 @@ namespace bot {
     inline size_t playIndex = 0;
     inline int applying = 0;
     inline int silent = 0;
-    inline uint32_t applyStep = 0;
-    inline double applyFrac = 0.0;
     inline bool cpLoaded = false;
     inline std::unordered_map<CheckpointObject*, uint32_t> checkpoints;
     inline double recSpeed = 1.0;
@@ -161,48 +161,125 @@ namespace bot {
 
     inline std::vector<RawInput> pendingRecordInputs;
 
-    // --- JNI timestamp bridge (Android only) -----------------------------
+    // --- OS clock -----------------------------------------------------------
+    // One monotonic timebase for the frame anchors AND the Java stamps.
+    //   Android: CLOCK_BOOTTIME == SystemClock.elapsedRealtimeNanos()
+    //   others : steady_clock
+    inline double osNowSec() {
 #ifdef GEODE_IS_ANDROID
-    inline jlong g_pendingInputTimestampNanos = 0;
+        struct timespec ts {};
+        clock_gettime(CLOCK_BOOTTIME, &ts);
+        return static_cast<double>(ts.tv_sec) + static_cast<double>(ts.tv_nsec) / 1e9;
+#else
+        using namespace std::chrono;
+        return duration<double>(steady_clock::now().time_since_epoch()).count();
+#endif
+    }
 
-    inline void JNI_setNextInputTimestamp(JNIEnv*, jobject, jlong timestamp) {
-        g_pendingInputTimestampNanos = timestamp;
+    // --- timestamp FIFO (filled by the JNI call, drained by handleButton) ---
+    inline std::mutex g_stampMutex;
+    inline std::deque<double> g_stamps;
+
+    inline void pushStamp(int64_t nanos) {
+        std::lock_guard<std::mutex> lk(g_stampMutex);
+        g_stamps.push_back(static_cast<double>(nanos) / 1e9);
+        if (g_stamps.size() > 64) g_stamps.pop_front();
+    }
+
+    inline void clearStamps() {
+        std::lock_guard<std::mutex> lk(g_stampMutex);
+        g_stamps.clear();
+    }
+
+    // Pops the oldest NON-stale stamp.
+    inline bool popStamp(double& out) {
+        double const now = osNowSec();
+        std::lock_guard<std::mutex> lk(g_stampMutex);
+        while (!g_stamps.empty()) {
+            double const s = g_stamps.front();
+            g_stamps.pop_front();
+            if (now - s > kStampMaxAge) continue; // stale
+            out = s;
+            return true;
+        }
+        return false;
+    }
+
+    // --- JNI bridge (Android) ----------------------------------------------
+    inline bool g_bridgeRegistered = false;
+
+#ifdef GEODE_IS_ANDROID
+    inline void JNI_setNextInputTimestamp(JNIEnv*, jclass, jlong timestamp) {
+        pushStamp(static_cast<int64_t>(timestamp));
     }
 
     inline void registerTimestampBridge() {
-        auto vm = cocos2d::JniHelper::getJavaVM();
+        if (g_bridgeRegistered) return;
+#ifdef GDBOT_HAVE_JNIHELPER
+        JavaVM* vm = cocos2d::JniHelper::getJavaVM();
+        if (!vm) {
+            log::warn("[gdbot] JNI bridge: no JavaVM");
+            return;
+        }
         JNIEnv* env = nullptr;
-        if (vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6) != JNI_OK) return;
-
+        jint const rc = vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_6);
+        if (rc != JNI_OK || !env) {
+            // JNI_EDETACHED: this thread is not Java-attached. We do not attach
+            // it on purpose (FindClass would use the wrong class loader);
+            // registration is retried later from the GL thread.
+            log::warn("[gdbot] JNI bridge: GetEnv rc={} (will retry)", static_cast<int>(rc));
+            return;
+        }
         jclass clazz = env->FindClass("com/geode/launcher/utils/GeodeUtils");
-        if (!clazz) return;
-
+        if (!clazz) {
+            if (env->ExceptionCheck()) env->ExceptionClear();
+            log::warn("[gdbot] JNI bridge: GeodeUtils not found (launcher not patched? will retry)");
+            return;
+        }
         JNINativeMethod methods[] = {
             { "setNextInputTimestamp", "(J)V",
               reinterpret_cast<void*>(&JNI_setNextInputTimestamp) }
         };
-        env->RegisterNatives(clazz, methods, 1);
+        jint const rr = env->RegisterNatives(clazz, methods, 1);
+        if (rr != JNI_OK) {
+            if (env->ExceptionCheck()) env->ExceptionClear();
+            log::warn("[gdbot] JNI bridge: RegisterNatives failed rc={}", static_cast<int>(rr));
+        }
+        else {
+            g_bridgeRegistered = true;
+            log::info("[gdbot] JNI bridge OK");
+        }
         env->DeleteLocalRef(clazz);
+#else
+        log::warn("[gdbot] JNI bridge: JniHelper header not found at build time");
+#endif
     }
 #endif
 
-    // --- physics-step time base ------------------------------------------
-    // m_extraDelta is the leftover accumulator at the start of the frame.
-    // It is captured in onFrameStart and used as the click's position inside
-    // the first step that consumes it.
-    inline double g_frameLeftover = 0.0;
-    inline float g_frameRawDt = 0.f;
+    inline char const* bridgeState() {
+#ifdef GEODE_IS_ANDROID
+        return g_bridgeRegistered ? "ok" : "NO";
+#else
+        return "n/a";
+#endif
+    }
 
-    // --- frac calibration -------------------------------------------------
+    // --- per-frame time base ------------------------------------------------
+    inline double g_frameLeftover = 0.0;     // m_extraDelta at the start of this frame
+    inline double g_frameStartMono = 0.0;    // OS time of this frame's tick
+    inline double g_prevFrameStartMono = 0.0;// OS time of the previous frame's tick
+    inline uint32_t g_stepsThisFrame = 0;    // completed p1 steps in this frame
+
+    // --- frac calibration ---------------------------------------------------
     inline double g_fracMin = 1.0;
     inline double g_fracMax = 0.0;
-    inline uint32_t g_fracClamped = 0;
-    inline uint32_t g_fracSamples = 0;
-    inline uint32_t g_fracFallback = 0;
+    inline uint32_t g_fracClamped = 0;   // stamped clicks with frac < 0
+    inline uint32_t g_fracSamples = 0;   // stamped clicks recorded
+    inline uint32_t g_fracFallback = 0;  // clicks without a usable stamp (frac 0)
+    inline uint32_t g_fracDeferred = 0;  // times a click was pushed to a later step
+    inline int g_logBudget = 40;         // REC log lines per recording
 
-    // --- game clock -------------------------------------------------------
-    inline double g_botTime = 0.0;
-    inline bool g_clockActive = false;
+    inline bool g_clockActive = false;   // level is being simulated right now
 
     inline bool inputThisStep = false;
     inline bool p1Split = false;
@@ -217,7 +294,7 @@ namespace bot {
         return pl && static_cast<GJBaseGameLayer*>(pl) == l;
     }
 
-    // --- pause cache -------------------------------------------------------
+    // --- pause cache --------------------------------------------------------
     inline bool g_pauseCached = false;
     inline int g_pauseCachedChildCount = -1;
 
@@ -262,15 +339,16 @@ namespace bot {
 
     inline void resetEngine() {
         pendingRecordInputs.clear();
+        clearStamps();
         g_frameLeftover = 0.0;
+        g_stepsThisFrame = 0;
         inputThisStep = false;
         p1Split = false;
         p2Split = false;
         midStep = false;
         rotationDelta = 0.f;
-#ifdef GEODE_IS_ANDROID
-        g_pendingInputTimestampNanos = 0;
-#endif
+        // g_frameStartMono / g_prevFrameStartMono are deliberately kept: they
+        // are refreshed every tick and resetLevel() runs mid-frame.
     }
 
     inline void resetFracStats() {
@@ -279,6 +357,8 @@ namespace bot {
         g_fracClamped = 0;
         g_fracSamples = 0;
         g_fracFallback = 0;
+        g_fracDeferred = 0;
+        g_logBudget = 40;
     }
 
     inline void applyClickFlags() {
@@ -327,20 +407,12 @@ namespace bot {
         raw.button = button;
         raw.push = push;
         raw.p1 = isPlayer1;
-#ifdef GEODE_IS_ANDROID
-        if (g_pendingInputTimestampNanos != 0) {
-            raw.osTs = static_cast<double>(g_pendingInputTimestampNanos) / 1'000'000.0;
+
+        double ts = 0.0;
+        if (popStamp(ts)) {
+            raw.osTs = ts;
             raw.hasOsTs = true;
-            g_pendingInputTimestampNanos = 0;
         }
-        else {
-            raw.leftover = g_frameLeftover;
-        }
-#else
-        // On non-Android platforms the bot still works via the frame-leftover
-        // fallback until a platform-specific timestamp source is wired in.
-        raw.leftover = g_frameLeftover;
-#endif
         pendingRecordInputs.push_back(raw);
     }
 
@@ -488,10 +560,8 @@ namespace bot {
         return static_cast<int>(pl->m_level->m_levelID);
     }
 
-    inline void applyInput(PlayLayer* pl, StepSub const& s, uint32_t st, double frac) {
+    inline void applyInput(PlayLayer* pl, StepSub const& s) {
         ++applying;
-        applyStep = st;
-        applyFrac = std::clamp(frac, 0.0, 1.0);
         pl->handleButton(s.push, s.button, s.p1);
         --applying;
     }
@@ -530,32 +600,39 @@ namespace bot {
         --silent;
     }
 
+    // Called from the CCScheduler hook, before the scheduler scales dt.
     inline void onFrameStart(float rawDt) {
-        g_frameRawDt = rawDt;
+        (void)rawDt;
+
+        // Frame anchors. The click stamps are compared against the PREVIOUS
+        // tick: the click happened in the interval that became this frame's dt.
+        g_prevFrameStartMono = g_frameStartMono;
+        g_frameStartMono = osNowSec();
+        g_stepsThisFrame = 0;
 
         bool const levelActive = (mode != Mode::Off) && isLevelActive();
         auto pl = PlayLayer::get();
         bool const simulating = levelActive && pl && !pl->m_playerDied && !pl->m_hasCompletedLevel;
 
-        if (simulating && !g_clockActive) {
-            pendingRecordInputs.clear();
-        }
-        else if (!simulating && g_clockActive) {
+        if (simulating != g_clockActive) {
             pendingRecordInputs.clear();
         }
         g_clockActive = simulating;
 
-        if (simulating && pl) {
-            // m_extraDelta is the leftover accumulator at the start of this
-            // frame: exactly the offset a click captured now should have
-            // relative to the start of the first step that consumes it.
-            g_frameLeftover = static_cast<double>(pl->m_extraDelta);
-            g_botTime += std::clamp(static_cast<double>(rawDt), 0.0, 0.25);
-        }
-        else {
-            g_frameLeftover = 0.0;
+        if (!simulating) {
+            // Nothing will consume stamps now (pause menu, death, level off):
+            // UI taps must not leak into the next game click.
+            clearStamps();
         }
 
+        // Pending clicks that survived a frame boundary are no longer timed.
+        for (auto& in : pendingRecordInputs) ++in.age;
+
+        // m_extraDelta = accumulator leftover at the start of this frame, i.e.
+        // the position of the previous tick inside the step stream.
+        g_frameLeftover = (simulating && pl) ? static_cast<double>(pl->m_extraDelta) : 0.0;
+
+        // Speedhack: held while the level is on screen (death/respawn included).
         if (mode == Mode::Record) {
             setTimeScale(levelActive ? static_cast<float>(recSpeed) : 1.0f);
         }
@@ -563,7 +640,20 @@ namespace bot {
             setTimeScale(1.0f);
         }
     }
-}
+} // namespace bot
+
+class $modify(BotMenuLayer, MenuLayer) {
+    bool init() {
+        if (!MenuLayer::init()) return false;
+        if (auto mod = Mod::get()) {
+            bot::disableDeathEffects = mod->getSavedValue<bool>("disableDeathEffects", true);
+        }
+#ifdef GEODE_IS_ANDROID
+        bot::registerTimestampBridge(); // retry on the GL thread
+#endif
+        return true;
+    }
+};
 
 // ---------------------------------------------------------------------------
 // Death / spawn visual effects
@@ -576,7 +666,7 @@ class $modify(BotCircleWave, CCCircleWave) {
 };
 
 // ---------------------------------------------------------------------------
-// Frame driver + JNI bridge registration
+// Frame driver
 // ---------------------------------------------------------------------------
 class $modify(BotScheduler, CCScheduler) {
     void update(float dt) {
@@ -605,8 +695,14 @@ class $modify(BotBaseGameLayer, GJBaseGameLayer) {
         }
 
         if (mode == Mode::Record) {
+            if (!g_clockActive) {
+                // Dead / paused / finished: not part of the run, let it through.
+                GJBaseGameLayer::handleButton(down, button, isPlayer1);
+                return;
+            }
+            // Swallow the real click. It is applied exactly once, at its
+            // recorded frac, from PlayerObject::update.
             recordRawInput(button, down, isPlayer1);
-            GJBaseGameLayer::handleButton(down, button, isPlayer1);
             return;
         }
 
@@ -638,6 +734,7 @@ class $modify(BotPlayerObject, PlayerObject) {
             return;
         }
 
+        // Only player 1 drives the step counter / slicing.
         if (this != pl->m_player1) {
             if (!inputThisStep || this != pl->m_player2) {
                 PlayerObject::update(stepDelta);
@@ -660,44 +757,64 @@ class $modify(BotPlayerObject, PlayerObject) {
             }
         }
         else { // Record
+            std::vector<RawInput> remaining;
+            double const sd = static_cast<double>(stepDelta);
+            double const scale = static_cast<double>(appliedScale);
+
             for (auto const& in : pendingRecordInputs) {
+                double f = 0.0;
+
+                if (in.hasOsTs && in.age == 0 && g_prevFrameStartMono > 0.0) {
+                    // Position of the click in this frame's accumulator.
+                    double const T = g_frameLeftover
+                        + (in.osTs - g_prevFrameStartMono) * scale;
+                    // ...and inside the step that is running right now.
+                    double const local = T - static_cast<double>(g_stepsThisFrame) * sd;
+
+                    if (local >= sd) {
+                        // Belongs to a later step of this frame.
+                        ++g_fracDeferred;
+                        remaining.push_back(in);
+                        continue;
+                    }
+
+                    f = local / sd;
+                    ++g_fracSamples;
+                    if (f < 0.0) ++g_fracClamped;
+
+                    if (g_logBudget > 0) {
+                        --g_logBudget;
+                        log::info("[gdbot] REC T={:.6f} local={:.6f} sd={:.6f} extra={:.6f} scale={:.3f} frac={:.6f}",
+                                  T, local, sd, g_frameLeftover, scale, f);
+                    }
+                }
+                else {
+                    // No usable stamp (or the click is older than one frame):
+                    // honest zero instead of an invented number.
+                    ++g_fracFallback;
+                    f = 0.0;
+                }
+
+                f = std::clamp(f, 0.0, 0.9999);
+                g_fracMin = std::min(g_fracMin, f);
+                g_fracMax = std::max(g_fracMax, f);
+
                 StepSub s;
                 s.button = in.button;
                 s.push = in.push;
                 s.p1 = in.p1;
-
-                double f;
-                if (in.hasOsTs) {
-                    // Real sub-frame path: osTs is in seconds.
-                    // frac = (osTs - stepStart) / stepDuration.
-                    // stepStart is derived from the accumulator snapshot
-                    // (g_frameLeftover) and how many steps were already
-                    // consumed this frame.
-                    double stepStart = g_frameLeftover + g_stepsThisFrame * stepDelta;
-                    f = (in.osTs - stepStart) / static_cast<double>(stepDelta);
-                    ++g_fracSamples;
-                    if (f < 0.0 || f > 1.0) ++g_fracClamped;
-                }
-                else {
-                    // Frame-leftover fallback.
-                    f = in.leftover / static_cast<double>(stepDelta);
-                    ++g_fracFallback;
-                }
-                f = std::clamp(f, 0.0, 0.9999);
-                g_fracMin = std::min(g_fracMin, f);
-                g_fracMax = std::max(g_fracMax, f);
                 s.frac = f;
                 subs.push_back(s);
 
                 Action a;
                 a.step = cur;
-                a.frac = s.frac;
+                a.frac = f;
                 a.button = static_cast<uint8_t>(s.button);
                 a.down = s.push;
                 a.p1 = s.p1;
                 macro.push_back(a);
             }
-            pendingRecordInputs.clear();
+            pendingRecordInputs.swap(remaining);
         }
 
         inputThisStep = !subs.empty();
@@ -706,7 +823,7 @@ class $modify(BotPlayerObject, PlayerObject) {
             p1Split = false;
             p2Split = false;
             PlayerObject::update(stepDelta);
-            g_stepsThisFrame++;
+            ++g_stepsThisFrame;
             ++step;
             return;
         }
@@ -715,6 +832,7 @@ class $modify(BotPlayerObject, PlayerObject) {
             return a.frac < b.frac;
         });
 
+        // Keep sub-steps strictly ordered and non-degenerate.
         for (size_t i = 1; i < subs.size(); ++i) {
             if (subs[i].frac <= subs[i - 1].frac + 1e-5) {
                 subs[i].frac = std::min(0.9999, subs[i - 1].frac + 1e-5);
@@ -743,7 +861,7 @@ class $modify(BotPlayerObject, PlayerObject) {
 
             if (substepDelta > 1e-9f) {
                 PlayerObject::update(substepDelta);
-                if (i == 0 && ((this->m_yVelocity < 0.0) ^ this->m_isUpsideDown)) {
+                if (i == 0 && ((this->m_yVelocity < 0.0) != (this->m_isUpsideDown != false))) {
                     this->m_isOnGround = p1StartedOnGround;
                 }
                 pl->checkCollisions(this, substepDelta, false);
@@ -751,7 +869,7 @@ class $modify(BotPlayerObject, PlayerObject) {
 
                 if (p2Split && p2) {
                     p2->update(substepDelta);
-                    if (i == 0 && ((p2->m_yVelocity < 0.0) ^ p2->m_isUpsideDown)) {
+                    if (i == 0 && ((p2->m_yVelocity < 0.0) != (p2->m_isUpsideDown != false))) {
                         p2->m_isOnGround = p2StartedOnGround;
                     }
                     pl->checkCollisions(p2, substepDelta, true);
@@ -759,7 +877,7 @@ class $modify(BotPlayerObject, PlayerObject) {
                 }
             }
 
-            applyInput(pl, s, cur, s.frac);
+            applyInput(pl, s);
             lastFrac = s.frac;
         }
 
@@ -782,10 +900,12 @@ class $modify(BotPlayerObject, PlayerObject) {
         midStep = false;
         p1Split = false;
         p2Split = false;
-        g_stepsThisFrame++;
+        ++g_stepsThisFrame;
         ++step;
     }
 
+    // While a step is being split we already advanced rotation by the sub-step
+    // delta, so swallow the outer updateRotation call instead of rotating twice.
     void updateRotation(float t) {
         auto pl = PlayLayer::get();
         if (pl && bot::mode != bot::Mode::Off && !bot::midStep) {
@@ -823,6 +943,10 @@ class $modify(BotPlayLayer, PlayLayer) {
 
         bot::applyClickFlags();
 
+#ifdef GEODE_IS_ANDROID
+        bot::registerTimestampBridge(); // retry on the GL thread
+#endif
+
         if (Loader::get()->isModLoaded("syzzi.click_between_frames")) {
             Notification::create(
                 "Disable 'Click Between Frames': it conflicts with the bot",
@@ -848,11 +972,11 @@ class $modify(BotPlayLayer, PlayLayer) {
         if (this->m_player1) this->m_player1->setVisible(true);
         if (this->m_player2) this->m_player2->setVisible(true);
 
-        if (bot::cpLoaded) return;
+        if (bot::cpLoaded) return; // loadFromCheckpoint already fixed everything up
 
         bot::step = 0;
         bot::playIndex = 0;
-        bot::checkpoints.clear();
+        bot::checkpoints.clear(); // those CheckpointObject pointers are gone
         if (bot::mode == bot::Mode::Record) {
             bot::macro.clear();
             bot::macroLevelID = bot::currentLevelID();
@@ -887,7 +1011,6 @@ class $modify(BotPlayLayer, PlayLayer) {
         }
 
         bot::step = it->second;
-        bot::pendingRecordInputs.clear();
 
         if (bot::mode == bot::Mode::Record) {
             uint32_t const s = bot::step;
@@ -896,6 +1019,7 @@ class $modify(BotPlayLayer, PlayLayer) {
                 std::remove_if(m.begin(), m.end(), [s](bot::Action const& a) { return a.step >= s; }),
                 m.end()
             );
+            // The macro prefix is the source of truth for what is held here.
             bot::syncPlayback(this);
         }
         else if (bot::mode == bot::Mode::Play) {
@@ -915,7 +1039,7 @@ class $modify(BotPlayLayer, PlayLayer) {
 };
 
 // ---------------------------------------------------------------------------
-// Pause-menu UI (frac read-out kept, EDIT mode removed)
+// Pause-menu UI
 // ---------------------------------------------------------------------------
 class $modify(BotPauseLayer, PauseLayer) {
     struct Fields {
@@ -942,16 +1066,22 @@ class $modify(BotPauseLayer, PauseLayer) {
             else if (!bot::macro.empty()) st = fmt::format("OFF  {} acts loaded", bot::macro.size());
             f->m_statusLabel->setString(st.c_str());
         }
+        // br  = JNI bridge state (ok / NO / n/a)
+        // n   = clicks recorded from a real stamp
+        // fb  = clicks without a usable stamp (frac 0)
+        // dfr = times a click was pushed to a later step
+        // clamp = stamped clicks that landed before the step start (frac < 0)
         if (f->m_fracLabel) {
             std::string fs;
-            if (bot::g_fracSamples == 0) {
-                fs = "frac: no clicks yet";
+            if (bot::g_fracSamples == 0 && bot::g_fracFallback == 0) {
+                fs = fmt::format("br {}  no clicks yet", bot::bridgeState());
             }
             else {
-                fs = fmt::format("frac {:.4f}..{:.4f}  n {}  fb {}  clamp {}",
-                                 bot::g_fracMin, bot::g_fracMax,
+                fs = fmt::format("br {} n{} fb{} dfr{} clamp{}  {:.3f}..{:.3f}",
+                                 bot::bridgeState(),
                                  bot::g_fracSamples, bot::g_fracFallback,
-                                 bot::g_fracClamped);
+                                 bot::g_fracDeferred, bot::g_fracClamped,
+                                 bot::g_fracMin, bot::g_fracMax);
             }
             f->m_fracLabel->setString(fs.c_str());
         }
@@ -965,6 +1095,8 @@ class $modify(BotPauseLayer, PauseLayer) {
             f->m_fxSprite->setColor(bot::disableDeathEffects ? ccColor3B{ 255, 180, 80 } : ccColor3B{ 255, 255, 255 });
     }
 
+    // We are inside a CCMenu activate callback when a row button fires, so the
+    // list cannot be torn down synchronously. Bounce it through an action.
     void onDeferredRefresh() {
         m_fields->m_refreshScheduled = false;
         this->refreshMacroList();
@@ -1061,6 +1193,7 @@ class $modify(BotPauseLayer, PauseLayer) {
             }
         }
 
+        // Newest first: the generated names are timestamp-prefixed.
         std::sort(files.begin(), files.end(), [](std::filesystem::path const& a, std::filesystem::path const& b) {
             return a.filename().string() > b.filename().string();
         });
@@ -1101,8 +1234,8 @@ class $modify(BotPauseLayer, PauseLayer) {
         m_fields->m_statusLabel->setPosition(CCPoint{ panelW / 2.f, panelH - 34.f });
         panel->addChild(m_fields->m_statusLabel);
 
-        m_fields->m_fracLabel = CCLabelBMFont::create("frac: no clicks yet", "chatFont.fnt");
-        m_fields->m_fracLabel->setScale(0.38f);
+        m_fields->m_fracLabel = CCLabelBMFont::create("", "chatFont.fnt");
+        m_fields->m_fracLabel->setScale(0.36f);
         m_fields->m_fracLabel->setPosition(CCPoint{ panelW / 2.f, panelH - 48.f });
         panel->addChild(m_fields->m_fracLabel);
 
@@ -1153,6 +1286,7 @@ class $modify(BotPauseLayer, PauseLayer) {
         playBtn->setPosition(CCPoint{ panelW * 0.8f, 12.f });
         modeMenu->addChild(playBtn);
 
+        // Speed row
         auto speedLbl = CCLabelBMFont::create("Speed:", "chatFont.fnt");
         speedLbl->setScale(0.45f);
         speedLbl->setAnchorPoint(CCPoint{ 0.f, 0.5f });
@@ -1189,6 +1323,7 @@ class $modify(BotPauseLayer, PauseLayer) {
         fxBtn->setPosition(CCPoint{ 20.f, 12.f });
         fxMenu->addChild(fxBtn);
 
+        // Name row
         auto nameLbl = CCLabelBMFont::create("Name:", "chatFont.fnt");
         nameLbl->setScale(0.45f);
         nameLbl->setAnchorPoint(CCPoint{ 0.f, 0.5f });
