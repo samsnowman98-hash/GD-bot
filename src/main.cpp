@@ -1,4358 +1,1041 @@
-// src/main.cpp
-// Geometry Dash 2.2081 / Geode 5.11.2 / C++23
-//
-// Полный rewrite UI-слоя:
-// - Popup<> не используется.
-// - Модальные окна собраны на локальном ModalLayer.
-// - Меню внутри модалок используют ModalMenu с повышенным touch priority.
-// - ScrollLayer внутри модалки использует ModalScrollLayer.
-// - getSafeAreaRect() вызывается как простое имя.
-// - fs::u8path() заменён на std::u8string.
-//
-// Никаких изменений отправки результатов, прогресса, античита или рекордов.
-// Шаг назад намеренно недоступен.
-//
-// Compile-fix for Geode 5.11.2 / GD 2.2081:
-// - ModalScrollLayer: no implicit default ctor.
-// - Removed non-hookable inline hooks:
-//   GJBaseGameLayer::queueButton
-//   GJBaseGameLayer::shouldUseSubstepForButton
-// - Input capture adapted to handleButton + processQueuedButtons.
-//
-// Timing core v2 (шаговая точность):
-// - один тик бота == ровно один нативный шаг физики (getModifiedDelta ->
-//   min(1, m_timeWarp)/240, m_extraDelta обнуляется, stepCount всегда 1);
-// - макрос хранит поток событий (step, order, button, down, player2),
-//   формат v2, файлы v1 читаются с пересортировкой фаз в order;
-// - ввод забирается из m_queuedButtons в первом хуке шага и применяется самим
-//   ботом — в одной и той же точке при записи и при воспроизведении;
-// - слайсирование processCommands и wall-clock интерполяция фаз удалены:
-//   суб-тик точность в GD даёт разбиение PlayerObject::update, а не
-//   processCommands, поэтому фаза физически ничего не решала;
-// - tps теперь темп воспроизведения (240 = нормально), а не частота физики,
-//   и на совместимость макроса не влияет.
-// Подробности и обоснование: docs/ACCURACY.md, проверки: tests/.
+// CBF-style TAS bot for Geometry Dash 2.2081 / Geode 5.x (Android & PC)
 
 #include <Geode/Geode.hpp>
-#include <Geode/modify/GJBaseGameLayer.hpp>
 #include <Geode/modify/PlayLayer.hpp>
+#include <Geode/modify/PlayerObject.hpp>
+#include <Geode/modify/GJBaseGameLayer.hpp>
 #include <Geode/modify/PauseLayer.hpp>
-
-#include <Geode/binding/CheckpointObject.hpp>
-#include <Geode/binding/FMODAudioEngine.hpp>
-#include <Geode/binding/GJGameLevel.hpp>
-#include <Geode/binding/GJGameState.hpp>
-#include <Geode/binding/PlayerButtonCommand.hpp>
-#include <Geode/binding/PlayerObject.hpp>
-
+#include <Geode/modify/CCScheduler.hpp>
+#include <Geode/modify/CCCircleWave.hpp>
+#include <Geode/modify/GameManager.hpp>
+#include <Geode/modify/GameStatsManager.hpp>
+#include <Geode/modify/MenuLayer.hpp>
 #include <Geode/ui/ScrollLayer.hpp>
 #include <Geode/ui/TextInput.hpp>
 #include <Geode/ui/Notification.hpp>
-
-#include <Geode/utils/async.hpp>
-#include <Geode/utils/cocos.hpp>
-#include <Geode/utils/file.hpp>
-
-#if __has_include(<Geode/fmod/fmod.hpp>)
-# include <Geode/fmod/fmod.hpp>
-#elif __has_include(<fmod.hpp>)
-# include <fmod.hpp>
-#else
-# error "Проверьте путь к FMOD C++ headers в Geode SDK"
-#endif
+#include <Geode/fmod/fmod.hpp>   // FIX: правильный путь для FMOD в Geode
 
 #include <algorithm>
-#include <array>
-#include <bit>
-#include <charconv>
+#include <cctype>                // FIX: std::toupper
+#include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <ctime>
+#include <deque>
 #include <filesystem>
 #include <fstream>
-#include <functional>
 #include <limits>
-#include <locale>
-#include <map>
-#include <optional>
-#include <sstream>
 #include <string>
-#include <string_view>
-#include <type_traits>
-#include <utility>
+#include <system_error>          // FIX: std::error_code
+#include <unordered_map>
 #include <vector>
 
 using namespace geode::prelude;
 
-namespace gdbot {
-    namespace fs = std::filesystem;
-
-namespace {
-    constexpr std::uint32_t kNativeTPS = 240;   // нативная частота шага физики GD 2.2
-    constexpr std::uint32_t kDefaultTPS = 240;  // темп бота по умолчанию = нативный
-    constexpr std::uint32_t kMinTPS = 30;
-    // Больше 240 шагов в секунду не существует: нативный stepCount =
-    // round(max(1, modifiedDelta*240/min(1,timeWarp))) и всегда >= 1.
-    constexpr std::uint32_t kMaxTPS = kNativeTPS;
-
-    constexpr std::uint32_t kMaxBurst = 512;
-    constexpr std::uint64_t kMaxEvents = 2'000'000;
-    constexpr std::uint32_t kHeaderSize = 48;
-    constexpr std::uint32_t kRecordSize = 16;
-    constexpr std::uint32_t kFormatVersion = 2;
-    constexpr std::uint32_t kLegacyFormatVersion = 1;
-    constexpr std::uint32_t kFooterSize = 4;
-    constexpr std::size_t kListLimit = 128;
-    constexpr std::size_t kPendingInputLimit = 4096;
-
-    // Сколько кадров подряд без единого физического шага считаются аварией:
-    // после этого бот переходит на нативный темп (см. driveUpdate).
-    constexpr unsigned kNoStepFramesLimit = 20;
-    // Сколько кадров можно «держать» в ожидании отложенного рестарта уровня.
-    constexpr unsigned kStartHoldFrames = 5;
-}
-
-    constexpr std::array<std::uint8_t, 8> kMagic{
-        'G', 'D', 'B', 'O', 'T', '\r', '\n', 0x1a
-    };
-
-    static_assert(sizeof(double) == 8);
-    static_assert(std::numeric_limits<double>::is_iec559);
-
-    enum class Mode {
-        Off,
-        Record,
-        Playback
-    };
-
-    enum class Source {
-        Macro,
-        Manual
-    };
-
-    // Одно событие ввода. Шаг — нативный шаг физики (1/240 с с поправкой на
-    // timeWarp), order — порядок события внутри шага.
-    struct Action {
-        std::uint32_t step = 0;
-        std::uint32_t order = 0;
-        std::uint8_t button = 1;   // PlayerButton: 1=Jump, 2=Left, 3=Right
-        bool down = false;
-        bool player2 = false;
-
-        bool operator==(Action const&) const = default;
-    };
-
-    // Событие, подготовленное к применению внутри шага.
-    struct StepEvent {
-        std::uint32_t order = 0;
-        std::uint8_t button = 1;
-        bool down = false;
-        bool player2 = false;
-        Source source = Source::Manual;
-        bool alreadyApplied = false;   // прямой handleButton мимо очереди
-    };
-    struct Macro {
-        std::uint32_t tps = kDefaultTPS;
-        std::uint64_t level = 0;
-        std::uint32_t length = 0;
-        std::uint8_t initialHeld = 0;
-        std::vector<Action> actions;
-    };
-
-
-    struct CheckpointData {
-        std::uint32_t nextStep = 0;
-        std::uint8_t manualHeld = 0;
-        std::uint8_t macroHeld = 0;
-        std::uint8_t effectiveHeld = 0;
-        bool safeBoundary = false;
-    };
-
-    struct PlayerStamp {
-        bool exists = false;
-        float x = 0.0f;
-        float y = 0.0f;
-        double velocity = 0.0;
-        bool grounded = false;
-        bool upsideDown = false;
-        bool dart = false;
-
-        bool operator==(PlayerStamp const&) const = default;
-    };
-
-    struct PhysicsStamp {
-        PlayerStamp p1;
-        PlayerStamp p2;
-        bool dual = false;
-
-        bool operator==(PhysicsStamp const&) const = default;
-    };
-
-    struct Telemetry {
-        std::uint64_t ticks = 0;
-        std::uint64_t stepsNoHook = 0;        // тик без единого хука шага
-        std::uint64_t commandsCalls = 0;      // всего вызовов processCommands
-        std::uint64_t queuedCalls = 0;        // всего вызовов processQueuedButtons
-        std::uint32_t maxCommandsPerTick = 0; // должно быть 1
-        std::uint32_t maxQueuedPerTick = 0;
-        std::uint64_t directButtons = 0;      // handleButton внутри шага мимо очереди
-        std::uint64_t deferredButtons = 0;    // handleButton вне шага -> отложен
-        std::uint64_t droppedButtons = 0;     // подавлено (пауза/смерть/block-input)
-        std::uint64_t eventsRecorded = 0;
-        std::uint64_t eventsPlayed = 0;
-        // События макроса, которые не были применены: шаг прошёл без хука,
-        // либо курсор перескочил их. Любой nonzero здесь = потерянный клик.
-        std::uint64_t macroEventsDropped = 0;
-        // Тик, не давший физического шага (интро уровня, m_resumeTimer).
-        // Номер шага при этом НЕ сжигается — см. driveUpdate.
-        std::uint64_t ticksWithoutStep = 0;
-        long long nativeStepDrift = 0;        // native steps - committed steps
-        bool warnedNoHook = false;
-        bool warnedDrift = false;
-        bool warnedNoStep = false;
-        bool warnedDropped = false;
-    };
-
-    struct Runtime {
-        PlayLayer* play = nullptr;
-        std::uint64_t session = 0;
-        std::uint64_t epoch = 0;
-        std::uint64_t level = 0;
-
-        Mode mode = Mode::Off;
-        std::optional<Mode> pendingStart;
-
-        // --- шаговые часы ---
-        std::uint32_t step = 0;              // шаг, который выполняется сейчас
-        std::size_t playbackCursor = 0;
-        long double debt = 0.0L;             // аккумулятор РЕАЛЬНОГО времени, сек
-
-        bool inTick = false;                 // внутри original(q)
-        bool stepHandled = false;            // ввод этого шага уже разобран
-        std::uint32_t orderInStep = 0;
-        std::vector<StepEvent> stepEvents;   // живой ввод текущего шага
-        std::vector<StepEvent> pendingInputs;// ввод, пришедший вне шага
-
-        // --- форсирование ровно одного нативного шага ---
-        bool forceOneStep = false;
-        float forcedDelta = 1.0f / static_cast<float>(kNativeTPS);
-
-        // Отложенный рестарт уровня (см. driveUpdate).
-        bool startQueued = false;
-        unsigned startQueuedFrames = 0;
-
-        // АВАРИЙНЫЙ РЕЖИМ. Если форсирование одного шага по какой-то причине
-        // не даёт игре произвести ни одного шага (формула stepCount в этой
-        // сборке другая, чужой мод физики, неожиданное m_timeWarp, dt == 0),
-        // уровень встаёт намертво. Чтобы это было невозможно в принципе, после
-        // kNoStepFramesLimit таких кадров переключаемся на нативный драйвер:
-        // кадр отдаётся игре целиком, getModifiedDelta не форсируется, границы
-        // шагов берутся из наших хуков. Запись и воспроизведение продолжают
-        // работать; теряются только управление темпом и покадровый режим.
-        bool nativeFallback = false;
-        bool stepOpen = false;        // в нативном режиме: шаг открыт хуком
-        int lastNativeStep = 0;
-        unsigned noStepFrames = 0;
-
-        // Эскалация запуска уровня: сколько кадров подряд m_started всё ещё
-        // false. 0 = не эскалируем.
-        unsigned startEscalation = 0;
-        bool startGameCalled = false;
-
-        // Диагностика «игра не идёт»: сколько кадров подряд не было ни шага.
-        unsigned idleFrames = 0;
-        bool warnedIdle = false;
-
-        bool paused = false;
-        bool dead = false;
-        bool frameMode = false;
-        std::uint64_t frameBudget = 0;
-
-        std::uint8_t manualHeld = 0;
-        std::uint8_t macroHeld = 0;
-        std::uint8_t sentHeld = 0;
-
-        bool flagsSaved = false;
-        bool oldBetweenSteps = false;
-        bool oldOnSteps = false;
-
-        bool injecting = false;
-        bool pauseGuard = false;
-        bool inSlice = false;          // оставлено: используется чекпоинтами
-        bool commandsDone = false;
-        bool badKernel = false;
-        unsigned commandCalls = 0;
-        unsigned queuedCalls = 0;
-
-        PhysicsStamp beforeTick;
-        PhysicsStamp afterCommands;
-
-        int resetDepth = 0;
-        int loadDepth = 0;
-        bool internalRestart = false;
-        bool loadedDuringReset = false;
-        std::optional<CheckpointData> restoreAfterReset;
-
-        bool markPending = false;
-        bool drainingMark = false;
-
-        std::map<CheckpointObject*, CheckpointData> checkpoints;
-
-        bool stopRequested = false;
-        bool disableFramesOnStop = false;
-        bool discardCurrentStep = false;
-        bool questionAfterStop = false;
-        std::string stopMessage;
-
-        Telemetry telemetry;
-    };
-    struct AudioState {
-        bool pitchOwned = false;
-        bool pauseOwned = false;
-        bool previousMasterPause = false;
-        bool failureWarned = false;
-    };
-
-    struct Notice {
-        std::string text;
-        bool warning = false;
-    };
-
-    using ChoiceAction = std::pair<std::string, std::function<void()>>;
-
-    struct State {
-        bool configured = false;
-        std::uint32_t tps = kDefaultTPS;
-        double recordingSpeed = 1.0;
-        // По умолчанию живой ввод при воспроизведении ЗАБЛОКИРОВАН: любое
-        // случайное нажатие поверх макроса расходится с записью и роняет прогон.
-        bool blockInput = true;
-        std::uint32_t frameSize = 1;
-
-        fs::path directory;
-        std::string fileStem = "macro";
-
-        Macro buffer;
-        bool hasBuffer = false;
-
-        Runtime run;
-        AudioState audio;
-
-        std::uint64_t nextSession = 0;
-        std::uint64_t temporarySequence = 0;
-        std::uint64_t uiRevision = 0;
-
-        int modalCount = 0;
-        bool deathQuestion = false;
-        std::uint64_t deathQuestionSession = 0;
-
-        std::vector<Notice> notices;
-    };
-
-    State& state() {
-        static State value;
-        return value;
-    }
-
-    void showNotice(std::string const& text, bool warning = false);
-    void ask(std::string text, std::vector<ChoiceAction> actions);
-    void openPanel();
-    void chooseFolder();
-    void useModFolder();
-    void pumpUI();
-    void syncAudio();
-    void stopNow(bool disableFrames);
-    void flushStop();
-    void finishPlayback();
-    void beginPendingStart();
-
-    void changed() {
-        ++state().uiRevision;
-    }
-
-    void postNotice(std::string text, bool warning = false) {
-        auto& messages = state().notices;
-        if (messages.size() < 16)
-            messages.push_back({std::move(text), warning});
-    }
-
-    std::string pathText(fs::path const& path) {
-        auto value = path.u8string();
-        return std::string(
-            reinterpret_cast<char const*>(value.data()), value.size()
-        );
-    }
-
-    fs::path utf8Path(std::string const& text) {
-        if (text.empty())
-            return {};
-
-        return fs::path(std::u8string(
-            reinterpret_cast<char8_t const*>(text.data()),
-            text.size()
-        ));
-    }
-
-    std::string shorten(std::string const& text, std::size_t maxBytes) {
-        if (text.size() <= maxBytes)
-            return text;
-
-        auto count = maxBytes;
-        while (count > 0 &&
-               (static_cast<unsigned char>(text[count]) & 0xc0) == 0x80) {
-            --count;
-        }
-        return text.substr(0, count) + "…";
-    }
-
-    bool parseUnsigned(
-        std::string const& text,
-        std::uint32_t minimum,
-        std::uint32_t maximum,
-        std::uint32_t& result
-    ) {
-        if (text.empty())
-            return false;
-
-        std::uint32_t value = 0;
-        auto parsed = std::from_chars(
-            text.data(), text.data() + text.size(), value
-        );
-        if (parsed.ec != std::errc{} ||
-            parsed.ptr != text.data() + text.size() ||
-            value < minimum || value > maximum) {
-            return false;
-        }
-        result = value;
+// ---------------------------------------------------------------------------
+// Разблокировка предметов (сохранение игры не модифицируется)
+// ---------------------------------------------------------------------------
+class $modify(BotGameManager, GameManager) {
+    bool isIconUnlocked(int id, IconType type) {
         return true;
     }
 
-    bool parseSpeed(std::string text, double& result) {
-        std::replace(text.begin(), text.end(), ',', '.');
-
-        std::istringstream stream(text);
-        stream.imbue(std::locale::classic());
-
-        double value = 0.0;
-        stream >> value;
-        if (!stream || !stream.eof() ||
-            !std::isfinite(value) || value < 0.01 || value > 2.0) {
-            return false;
-        }
-        result = value;
+    bool isColorUnlocked(int id, UnlockType type) {
         return true;
-    }
-
-    bool active() {
-        auto const& r = state().run;
-        return r.play && (r.mode != Mode::Off || r.frameMode);
-    }
-
-    bool controls(GJBaseGameLayer const* layer) {
-        auto const& r = state().run;
-        return active() &&
-               static_cast<GJBaseGameLayer const*>(r.play) == layer;
-    }
-
-    bool owns(PlayLayer const* layer) {
-        return state().run.play == layer;
-    }
-
-
-    std::uint64_t levelID(GJGameLevel* level) {
-        if (!level)
-            return 0;
-
-        auto value = level->m_levelID.value();
-        return value > 0 ? static_cast<std::uint64_t>(value) : 0;
-    }
-
-    std::uint8_t buttonBit(int button, bool player2) {
-        if (button < 1 || button > 3)
-            return 0;
-
-        auto index = static_cast<unsigned>(button - 1) + (player2 ? 3u : 0u);
-        return static_cast<std::uint8_t>(1u << index);
-    }
-
-    constexpr auto makeCRCTable() {
-        std::array<std::uint32_t, 256> result{};
-        for (std::uint32_t i = 0; i < 256; ++i) {
-            std::uint32_t value = i;
-            for (unsigned bit = 0; bit < 8; ++bit)
-                value = (value >> 1) ^
-                        ((value & 1) ? 0xedb88320u : 0u);
-            result[i] = value;
-        }
-        return result;
-    }
-
-    constexpr auto kCRCTable = makeCRCTable();
-
-    std::uint32_t crcByte(std::uint32_t crc, std::uint8_t value) {
-        return (crc >> 8) ^ kCRCTable[(crc ^ value) & 0xffu];
-    }
-
-    class BinaryWriter {
-    public:
-        std::ofstream stream;
-        std::uint32_t crc = 0xffffffffu;
-
-        explicit BinaryWriter(fs::path const& path)
-          : stream(path, std::ios::binary | std::ios::trunc) {}
-
-        void byte(std::uint8_t value) {
-            stream.put(static_cast<char>(value));
-            crc = crcByte(crc, value);
-        }
-
-        template <class T>
-        void integer(T value) {
-            static_assert(std::is_unsigned_v<T>);
-            for (unsigned i = 0; i < sizeof(T); ++i)
-                byte(static_cast<std::uint8_t>(value >> (8 * i)));
-        }
-
-        bool finish() {
-            auto value = ~crc;
-            for (unsigned i = 0; i < 4; ++i)
-                stream.put(static_cast<char>(value >> (8 * i)));
-
-            stream.flush();
-            bool ok = static_cast<bool>(stream);
-            stream.close();
-            return ok && !stream.fail();
-        }
-    };
-
-    class BinaryReader {
-    public:
-        std::ifstream stream;
-        std::uint32_t crc = 0xffffffffu;
-
-        explicit BinaryReader(fs::path const& path)
-          : stream(path, std::ios::binary) {}
-
-        bool byte(std::uint8_t& value) {
-            int read = stream.get();
-            if (read == std::char_traits<char>::eof())
-                return false;
-            value = static_cast<std::uint8_t>(read);
-            crc = crcByte(crc, value);
-            return true;
-        }
-
-        template <class T>
-        bool integer(T& value) {
-            static_assert(std::is_unsigned_v<T>);
-            value = 0;
-            for (unsigned i = 0; i < sizeof(T); ++i) {
-                std::uint8_t b = 0;
-                if (!byte(b))
-                    return false;
-                value |= static_cast<T>(b) << (8 * i);
-            }
-            return true;
-        }
-
-        bool finish() {
-            std::uint32_t stored = 0;
-            for (unsigned i = 0; i < 4; ++i) {
-                int b = stream.get();
-                if (b == std::char_traits<char>::eof())
-                    return false;
-                stored |= static_cast<std::uint32_t>(
-                    static_cast<std::uint8_t>(b)
-                ) << (8 * i);
-            }
-            return stored == ~crc &&
-                   stream.peek() == std::char_traits<char>::eof();
-        }
-    };
-
-    bool actionLess(Action const& a, Action const& b) {
-        if (a.step != b.step)
-            return a.step < b.step;
-        return a.order < b.order;
-    }
-
-    bool validateMacro(Macro const& macro, std::string& error) {
-        if (macro.tps < kMinTPS || macro.tps > kNativeTPS ||
-            (macro.initialHeld & ~0x3fu) != 0 ||
-            macro.actions.size() > kMaxEvents) {
-            error = "Недопустимые параметры макроса.";
-            return false;
-        }
-
-        std::optional<Action> previous;
-        for (auto const& action : macro.actions) {
-            if (action.button < 1 || action.button > 3 ||
-                action.step >= macro.length) {
-                error = "Повреждена запись действия.";
-                return false;
-            }
-            if (previous && actionLess(action, *previous)) {
-                error = "Действия расположены не по порядку.";
-                return false;
-            }
-            previous = action;
-        }
-        return true;
-    }
-
-    bool writeMacro(
-        fs::path const& path, Macro const& macro, std::string& error
-    ) {
-        if (!validateMacro(macro, error))
-            return false;
-
-        BinaryWriter writer(path);
-        if (!writer.stream) {
-            error = "Не удалось создать файл.";
-            return false;
-        }
-
-        for (auto b : kMagic)
-            writer.byte(b);
-
-        writer.integer<std::uint32_t>(kFormatVersion);
-        writer.integer<std::uint32_t>(kHeaderSize);
-        writer.integer<std::uint32_t>(macro.tps);
-        writer.integer<std::uint32_t>(kRecordSize);
-        writer.integer<std::uint64_t>(macro.level);
-        writer.integer<std::uint32_t>(macro.length);
-        writer.integer<std::uint32_t>(macro.initialHeld);
-        writer.integer<std::uint64_t>(macro.actions.size());
-
-        for (auto const& action : macro.actions) {
-            writer.integer<std::uint32_t>(action.step);
-            writer.integer<std::uint64_t>(action.order);
-            writer.byte(action.button);
-            writer.byte(action.down ? 1 : 0);
-            writer.byte(action.player2 ? 1 : 0);
-            writer.byte(0);
-        }
-
-        if (!writer.finish()) {
-            error = "Ошибка записи. Проверьте свободное место и доступ.";
-            return false;
-        }
-        return true;
-    }
-
-    // Старый формат v1 хранил double phase вместо uint32 order. Порядок
-    // событий восстанавливается сортировкой по (step, phase); сами значения
-    // фаз в v2 бессмысленны (см. docs/ACCURACY.md, раздел 1), поэтому файл
-    // перечитывается в шаговую модель.
-    bool readMacro(
-        fs::path const& path, Macro& result, std::string& error,
-        bool& legacy
-    ) {
-        legacy = false;
-        error.clear();
-
-        std::error_code ec;
-        auto size = fs::file_size(path, ec);
-        constexpr auto maxSize =
-            std::uint64_t{kHeaderSize} +
-            kMaxEvents * kRecordSize + kFooterSize;
-
-        if (ec || size < kHeaderSize + kFooterSize || size > maxSize) {
-            error = "Недопустимый размер файла.";
-            return false;
-        }
-
-        BinaryReader reader(path);
-        if (!reader.stream) {
-            error = "Не удалось открыть файл.";
-            return false;
-        }
-
-        for (auto expected : kMagic) {
-            std::uint8_t actual = 0;
-            if (!reader.byte(actual) || actual != expected) {
-                error = "Это не файл макроса этого бота.";
-                return false;
-            }
-        }
-
-        std::uint32_t version = 0;
-        std::uint32_t headerSize = 0;
-        std::uint32_t recordSize = 0;
-        std::uint32_t initial = 0;
-        std::uint64_t count = 0;
-        Macro candidate;
-
-        if (!reader.integer(version) ||
-            !reader.integer(headerSize) ||
-            !reader.integer(candidate.tps) ||
-            !reader.integer(recordSize) ||
-            !reader.integer(candidate.level) ||
-            !reader.integer(candidate.length) ||
-            !reader.integer(initial) ||
-            !reader.integer(count)) {
-            error = "Заголовок обрезан.";
-            return false;
-        }
-
-        if (version != kFormatVersion && version != kLegacyFormatVersion) {
-            error = "Версия формата не поддерживается.";
-            return false;
-        }
-        if (headerSize != kHeaderSize || recordSize != kRecordSize) {
-            error = "Размер записи не совпадает с ожидаемым.";
-            return false;
-        }
-        if (initial > 0x3f || count > kMaxEvents) {
-            error = "Повреждены поля заголовка.";
-            return false;
-        }
-
-        auto expectedSize =
-            std::uint64_t{kHeaderSize} + count * kRecordSize + kFooterSize;
-        if (size != expectedSize) {
-            error = "Размер файла не соответствует заголовку.";
-            return false;
-        }
-
-        candidate.initialHeld = static_cast<std::uint8_t>(initial);
-        legacy = (version == kLegacyFormatVersion);
-
-        struct LegacyRow {
-            std::uint32_t step = 0;
-            double phase = 0.0;
-            std::uint8_t button = 1;
-            bool down = false;
-            bool player2 = false;
-        };
-        std::vector<LegacyRow> legacyRows;
-
-        try {
-            if (legacy)
-                legacyRows.reserve(static_cast<std::size_t>(count));
-            else
-                candidate.actions.reserve(static_cast<std::size_t>(count));
-        }
-        catch (std::exception const&) {
-            error = "Недостаточно памяти для этого макроса.";
-            return false;
-        }
-
-        for (std::uint64_t i = 0; i < count; ++i) {
-            std::uint32_t step = 0;
-            std::uint64_t payload = 0;
-            std::uint8_t button = 0;
-            std::uint8_t down = 0;
-            std::uint8_t player = 0;
-            std::uint8_t reserved = 0;
-
-            if (!reader.integer(step) ||
-                !reader.integer(payload) ||
-                !reader.byte(button) ||
-                !reader.byte(down) ||
-                !reader.byte(player) ||
-                !reader.byte(reserved)) {
-                error = "Файл обрезан внутри списка действий.";
-                return false;
-            }
-
-            if (button < 1 || button > 3 || down > 1 || player > 1 ||
-                reserved != 0) {
-                error = "Повреждены флаги действия.";
-                return false;
-            }
-
-            if (legacy) {
-                double phase = std::bit_cast<double>(payload);
-                if (!std::isfinite(phase) || phase < 0.0 || phase > 1.0) {
-                    error = "Повреждена фаза действия (старый формат).";
-                    return false;
-                }
-                auto rowStep = step;
-                if (phase == 1.0) {
-                    if (step == std::numeric_limits<std::uint32_t>::max()) {
-                        error = "Переполнение номера шага.";
-                        return false;
-                    }
-                    rowStep = step + 1;
-                    phase = 0.0;
-                }
-                legacyRows.push_back({rowStep, phase, button, down != 0, player != 0});
-            }
-            else {
-                Action action;
-                action.step = step;
-                action.order = payload > 0xffffffffull
-                    ? 0xffffffffu
-                    : static_cast<std::uint32_t>(payload);
-                action.button = button;
-                action.down = down != 0;
-                action.player2 = player != 0;
-                candidate.actions.push_back(action);
-            }
-        }
-
-        if (!reader.finish()) {
-            error = "Не совпала контрольная сумма или файл изменился.";
-            return false;
-        }
-
-        if (legacy) {
-            std::stable_sort(
-                legacyRows.begin(), legacyRows.end(),
-                [](LegacyRow const& a, LegacyRow const& b) {
-                    if (a.step != b.step)
-                        return a.step < b.step;
-                    return a.phase < b.phase;
-                }
-            );
-
-            bool firstRow = true;
-            std::uint32_t lastStep = 0;
-            std::uint32_t order = 0;
-
-            for (auto const& row : legacyRows) {
-                if (firstRow || row.step != lastStep) {
-                    firstRow = false;
-                    lastStep = row.step;
-                    order = 0;
-                }
-                else {
-                    ++order;
-                }
-
-                Action action;
-                action.step = row.step;
-                action.order = order;
-                action.button = row.button;
-                action.down = row.down;
-                action.player2 = row.player2;
-                candidate.actions.push_back(action);
-            }
-
-            // v1 писал «шаг» в единицах 1/tps; перечитать это в нативные шаги
-            // без полной перезаписи уровня невозможно, поэтому приводим темп к
-            // нативному и предупреждаем пользователя.
-            candidate.tps = kNativeTPS;
-        }
-
-        if (!validateMacro(candidate, error))
-            return false;
-
-        result = std::move(candidate);
-        return true;
-    }
-    std::string cleanStem(std::string const& input) {
-        std::string result;
-        result.reserve(64);
-
-        for (unsigned char c : input) {
-            bool allowed =
-                (c >= 'a' && c <= 'z') ||
-                (c >= 'A' && c <= 'Z') ||
-                (c >= '0' && c <= '9') ||
-                c == '_' || c == '-' || c == ' ';
-
-            if (allowed && result.size() < 64)
-                result.push_back(static_cast<char>(c));
-        }
-
-        while (!result.empty() && result.back() == ' ')
-            result.pop_back();
-        while (!result.empty() && result.front() == ' ')
-            result.erase(result.begin());
-
-        if (result.empty())
-            result = "macro";
-
-        std::string upper = result;
-        for (char& c : upper) {
-            if (c >= 'a' && c <= 'z')
-                c = static_cast<char>(c - 'a' + 'A');
-        }
-
-        bool reserved =
-            upper == "CON" || upper == "PRN" ||
-            upper == "AUX" || upper == "NUL";
-
-        if (upper.size() == 4 &&
-            (upper.starts_with("COM") || upper.starts_with("LPT")) &&
-            upper[3] >= '1' && upper[3] <= '9') {
-            reserved = true;
-        }
-
-        if (reserved)
-            result.insert(result.begin(), '_');
-
-        return result;
-    }
-
-    bool probeFolder(
-        fs::path const& parent, fs::path& result, std::string& error
-    ) {
-        std::error_code ec;
-        auto directory = parent / "GDBotMacros";
-
-        fs::create_directories(directory, ec);
-        if (ec) {
-            error = "Не удалось создать подпапку макросов.";
-            return false;
-        }
-
-        if (!fs::is_directory(directory, ec) || ec) {
-            error = "Путь не является доступной папкой.";
-            return false;
-        }
-
-        auto test = directory / (
-            ".gdbot-write-test-" +
-            std::to_string(++state().temporarySequence)
-        );
-
-        std::ofstream stream(test, std::ios::binary | std::ios::trunc);
-        if (!stream) {
-            error = "Система не разрешила запись в выбранную папку.";
-            return false;
-        }
-
-        stream.write("GDBOT", 5);
-        stream.flush();
-        bool ok = static_cast<bool>(stream);
-        stream.close();
-        ok = ok && !stream.fail();
-
-        std::error_code removeError;
-        fs::remove(test, removeError);
-
-        if (!ok || removeError) {
-            error = "Проверка записи и удаления тестового файла не пройдена.";
-            return false;
-        }
-
-        result = std::move(directory);
-        return true;
-    }
-
-    void ensureConfiguration() {
-        auto& s = state();
-        if (s.configured)
-            return;
-
-        s.configured = true;
-
-        auto* mod = Mod::get();
-        // Темп бота: сколько нативных шагов 1/240 проигрывать в реальную
-        // секунду. 240 = обычная скорость уровня. Выше 240 не бывает:
-        // нативный stepCount = round(max(1, modifiedDelta*240/min(1,tw))).
-        auto tps = mod->getSavedValue<int>("physics-tps", static_cast<int>(kDefaultTPS));
-        s.tps = static_cast<std::uint32_t>(
-            std::clamp(tps, static_cast<int>(kMinTPS), static_cast<int>(kMaxTPS))
-        );
-
-        s.recordingSpeed =
-            mod->getSavedValue<double>("recording-speed", 1.0);
-        if (!std::isfinite(s.recordingSpeed))
-            s.recordingSpeed = 1.0;
-        s.recordingSpeed = std::clamp(s.recordingSpeed, 0.01, 2.0);
-
-        // Ключ сменился с "block-input" на "block-live-input": старый дефолт
-        // был false, и у уже настроенных установок живой ввод молча
-        // примешивался к макросу. Новый ключ даёт безопасный дефолт всем.
-        s.blockInput = mod->getSavedValue<bool>("block-live-input", true);
-
-        auto frameSize = mod->getSavedValue<int>("frame-size", 1);
-        s.frameSize = static_cast<std::uint32_t>(
-            std::clamp(frameSize, 1, 10000)
-        );
-
-        s.fileStem = cleanStem(
-            mod->getSavedValue<std::string>("macro-name", "macro")
-        );
-
-        auto storedParent =
-            mod->getSavedValue<std::string>("macro-parent", "");
-
-        fs::path parent = storedParent.empty()
-            ? mod->getSaveDir()
-            : utf8Path(storedParent);
-
-        std::string error;
-        if (!probeFolder(parent, s.directory, error)) {
-            s.directory.clear();
-            postNotice(
-                "Папка недоступна. Выберите другую папку в панели бота.",
-                true
-            );
-        }
-    }
-
-    void saveBuffer() {
-        auto& s = state();
-        ensureConfiguration();
-
-        if (!s.hasBuffer) {
-            showNotice("В буфере нет макроса.", true);
-            return;
-        }
-        if (s.run.inTick) {
-            showNotice("Сохранение доступно между физическими шагами.", true);
-            return;
-        }
-        if (s.directory.empty()) {
-            ask(
-                "Папка макросов недоступна. Выберите другую папку "
-                "или используйте папку мода.",
-                {
-                    {"Выбрать папку", [] { chooseFolder(); }},
-                    {"Папка мода", [] { useModFolder(); }}
-                }
-            );
-            return;
-        }
-
-        std::string error;
-        fs::path verified;
-        if (!probeFolder(s.directory.parent_path(), verified, error)) {
-            ask(
-                "Запись в папку больше недоступна. На телефоне доступ "
-                "может быть отозван системой.",
-                {
-                    {"Выбрать другую", [] { chooseFolder(); }},
-                    {"Папка мода", [] { useModFolder(); }}
-                }
-            );
-            return;
-        }
-
-        auto stem = cleanStem(s.fileStem);
-        auto temporary = s.directory / (
-            ".gdbot-save-" +
-            std::to_string(++s.temporarySequence) + ".tmp"
-        );
-
-        if (!writeMacro(temporary, s.buffer, error)) {
-            std::error_code ec;
-            fs::remove(temporary, ec);
-            showNotice(error, true);
-            return;
-        }
-
-        bool saved = false;
-        fs::path target;
-        std::error_code lastError;
-
-        for (unsigned suffix = 0; suffix < 10000; ++suffix) {
-            auto name = stem;
-            if (suffix)
-                name += "_" + std::to_string(suffix);
-            target = s.directory / (name + ".gdbot");
-
-            std::error_code existsError;
-            if (fs::exists(target, existsError)) {
-                if (existsError) {
-                    lastError = existsError;
-                    break;
-                }
-                continue;
-            }
-
-            std::error_code renameError;
-            fs::rename(temporary, target, renameError);
-
-            if (!renameError) {
-                saved = true;
-                break;
-            }
-
-            lastError = renameError;
-            if (renameError != std::errc::file_exists)
-                break;
-        }
-
-        if (!saved) {
-            std::error_code cleanup;
-            fs::remove(temporary, cleanup);
-            log::warn("Не удалось сохранить макрос: {}", lastError.message());
-            showNotice("Не удалось сохранить файл. Проверьте доступ и место.", true);
-            return;
-        }
-
-        Mod::get()->setSavedValue("macro-name", stem);
-        changed();
-        showNotice("Макрос сохранён: " + pathText(target.filename()));
-    }
-
-    std::vector<fs::path> listMacros() {
-        std::vector<fs::path> result;
-        auto const& directory = state().directory;
-        if (directory.empty())
-            return result;
-
-        std::error_code ec;
-        fs::directory_iterator iterator(directory, ec);
-        fs::directory_iterator end;
-
-        while (!ec && iterator != end && result.size() < kListLimit) {
-            auto const& entry = *iterator;
-            std::error_code entryError;
-            if (entry.is_regular_file(entryError) && !entryError &&
-                entry.path().extension() == ".gdbot") {
-                result.push_back(entry.path());
-            }
-            iterator.increment(ec);
-        }
-
-        std::sort(result.begin(), result.end(), [](auto const& a, auto const& b) {
-            return pathText(a.filename()) < pathText(b.filename());
-        });
-        return result;
-    }
-
-    bool compatible(Macro const& macro, std::string& error) {
-        auto const& s = state();
-        if (!s.run.play) {
-            error = "Сначала откройте уровень.";
-            return false;
-        }
-        if (macro.level != s.run.level) {
-            error = "Макрос относится к другому уровню.";
-            return false;
-        }
-        return true;
-    }
-    bool loadFile(fs::path const& path) {
-        auto& s = state();
-
-        if (s.run.mode != Mode::Off || s.run.pendingStart) {
-            showNotice("Перед загрузкой выключите запись и воспроизведение.", true);
-            return false;
-        }
-
-        Macro candidate;
-        std::string error;
-        bool legacy = false;
-
-        if (!readMacro(path, candidate, error, legacy) ||
-            !compatible(candidate, error)) {
-            showNotice(error, true);
-            return false;
-        }
-
-        s.buffer = std::move(candidate);
-        s.hasBuffer = true;
-        s.fileStem = cleanStem(pathText(path.stem()));
-        s.run.playbackCursor = 0;
-        s.run.checkpoints.clear();
-        changed();
-
-        if (legacy) {
-            showNotice(
-                "Файл старого формата v1: фазы внутри шага пересчитаны в "
-                "порядок событий, темп приведён к 240. Для точности "
-                "перезапишите макрос.",
-                true
-            );
-        }
-
-        if (s.buffer.tps != s.tps) {
-            showNotice(
-                "Темп записи (" + std::to_string(s.buffer.tps) +
-                ") отличается от текущего (" + std::to_string(s.tps) +
-                "). Макрос хранится в нативных шагах 1/240, поэтому "
-                "воспроизведение корректно при любом темпе."
-            );
-        }
-
-        if (s.buffer.level == 0) {
-            showNotice(
-                "Макрос загружен. Локальные уровни без номера не различаются.",
-                true
-            );
-        }
-        else {
-            showNotice("Макрос загружен.");
-        }
-        return true;
-    }
-    FMOD::ChannelGroup* masterGroup() {
-        auto* engine = FMODAudioEngine::sharedEngine();
-        if (!engine || !engine->m_system)
-            return nullptr;
-
-        FMOD::ChannelGroup* group = nullptr;
-        if (engine->m_system->getMasterChannelGroup(&group) != FMOD_OK)
-            return nullptr;
-        return group;
-    }
-
-    void audioFailure() {
-        auto& audio = state().audio;
-        if (!audio.failureWarned) {
-            audio.failureWarned = true;
-            postNotice("Не удалось изменить скорость звука.", true);
-        }
-    }
-
-    void restoreAudio() {
-        auto& audio = state().audio;
-        auto* group = masterGroup();
-        if (group) {
-            if (audio.pitchOwned)
-                group->setPitch(1.0f);
-            if (audio.pauseOwned)
-                group->setPaused(audio.previousMasterPause);
-        }
-        audio.pitchOwned = false;
-        audio.pauseOwned = false;
-    }
-
-    void syncAudio() {
-        auto& s = state();
-        auto& r = s.run;
-        auto& audio = s.audio;
-
-        bool paused = !r.play || r.paused ||
-                      (r.play && r.play->m_isPaused) || r.dead;
-
-        bool recording = r.mode == Mode::Record && !paused;
-        bool playback = r.mode == Mode::Playback && !paused;
-
-        if (!recording && !playback && !r.frameMode) {
-            restoreAudio();
-            return;
-        }
-
-        auto* group = masterGroup();
-        if (!group) {
-            audioFailure();
-            return;
-        }
-
-        float pitch = recording
-            ? static_cast<float>(s.recordingSpeed)
-            : 1.0f;
-
-        if (group->setPitch(pitch) != FMOD_OK)
-            audioFailure();
-        else
-            audio.pitchOwned = true;
-
-        bool freezeAudio = r.frameMode && !paused && active();
-
-        if (freezeAudio && !audio.pauseOwned) {
-            bool previous = false;
-            if (group->getPaused(&previous) == FMOD_OK &&
-                group->setPaused(true) == FMOD_OK) {
-                audio.previousMasterPause = previous;
-                audio.pauseOwned = true;
-            }
-            else {
-                audioFailure();
-            }
-        }
-        else if (!freezeAudio && audio.pauseOwned) {
-            group->setPaused(audio.previousMasterPause);
-            audio.pauseOwned = false;
-        }
-    }
-
-    std::uint8_t effectiveHeld() {
-        auto const& s = state();
-        auto const& r = s.run;
-
-        if (r.mode == Mode::Playback) {
-            return static_cast<std::uint8_t>(
-                r.macroHeld | (s.blockInput ? 0 : r.manualHeld)
-            );
-        }
-        return r.manualHeld;
-    }
-
-    // Длительность одного нативного шага в ИГРОВОМ времени.
-    // Одновременно — значение, которое мы подсовываем в getModifiedDelta,
-    // чтобы stepCount = round(max(1, q*240/min(1,tw))) == 1 при любом timeWarp.
-    float nativeStepDelta() {
-        auto const& r = state().run;
-        constexpr float fallback = 1.0f / static_cast<float>(kNativeTPS);
-        if (!r.play)
-            return fallback;
-
-        float warp = r.play->m_gameState.m_timeWarp;
-        if (!std::isfinite(warp) || warp <= 0.0f)
-            warp = 1.0f;
-
-        float q = std::min(1.0f, warp) / static_cast<float>(kNativeTPS);
-        return q > 0.0f ? q : fallback;
-    }
-
-    void sendButton(int button, bool down, bool player2) {
-        auto& r = state().run;
-        if (!r.play)
-            return;
-
-        bool previous = r.injecting;
-        r.injecting = true;
-        r.play->handleButton(down, button, !player2);
-        r.injecting = previous;
-
-        auto bit = buttonBit(button, player2);
-        if (down)
-            r.sentHeld |= bit;
-        else
-            r.sentHeld &= static_cast<std::uint8_t>(~bit);
-    }
-
-    void sendMask(std::uint8_t desired, bool force = false) {
-        auto& r = state().run;
-        if (!r.play)
-            return;
-
-        auto difference = force
-            ? static_cast<std::uint8_t>(0x3f)
-            : static_cast<std::uint8_t>(desired ^ r.sentHeld);
-
-        for (int player = 0; player < 2; ++player) {
-            for (int button = 1; button <= 3; ++button) {
-                auto bit = buttonBit(button, player != 0);
-                if (difference & bit)
-                    sendButton(button, (desired & bit) != 0, player != 0);
-            }
-        }
-        r.sentHeld = desired;
-    }
-
-    void installNativeFlags(bool clearQueue = true) {
-        auto& r = state().run;
-        if (!r.play)
-            return;
-
-        if (!r.flagsSaved) {
-            r.oldBetweenSteps = r.play->m_clickBetweenSteps;
-            r.oldOnSteps = r.play->m_clickOnSteps;
-            r.flagsSaved = true;
-        }
-
-        // Детерминизм: никакой нативной суб-тик логики, ввод ровно по шагам.
-        r.play->m_clickBetweenSteps = false;
-        r.play->m_clickOnSteps = false;
-
-        if (clearQueue)
-            r.play->m_queuedButtons.clear();
-    }
-
-    void restoreNativeFlags() {
-        auto& r = state().run;
-        if (r.play && r.flagsSaved) {
-            r.play->m_clickBetweenSteps = r.oldBetweenSteps;
-            r.play->m_clickOnSteps = r.oldOnSteps;
-            r.play->m_queuedButtons.clear();
-        }
-        r.flagsSaved = false;
-    }
-
-    void requestStop(
-        std::string message,
-        bool question = false,
-        bool fatal = false
-    ) {
-        auto& r = state().run;
-        r.stopRequested = true;
-        r.questionAfterStop = r.questionAfterStop || question;
-        r.disableFramesOnStop = r.disableFramesOnStop || fatal;
-
-        if (r.stopMessage.empty() || fatal)
-            r.stopMessage = std::move(message);
-    }
-
-    void stopNow(bool disableFrames) {
-        auto& s = state();
-        auto& r = s.run;
-
-        r.pendingStart.reset();
-        r.mode = Mode::Off;
-        r.macroHeld = 0;
-
-        if (!r.dead && r.play)
-            sendMask(r.manualHeld);
-
-        if (disableFrames) {
-            r.frameMode = false;
-            r.frameBudget = 0;
-        }
-
-        r.stepEvents.clear();
-        r.pendingInputs.clear();
-        r.orderInStep = 0;
-        r.debt = 0.0L;
-        r.markPending = false;
-
-        if (!active())
-            restoreNativeFlags();
-
-        syncAudio();
-        changed();
-    }
-
-    void flushStop() {
-        auto& s = state();
-        auto& r = s.run;
-        if (!r.stopRequested)
-            return;
-
-        auto message = std::move(r.stopMessage);
-        bool question = r.questionAfterStop;
-        bool disableFrames = r.disableFramesOnStop;
-
-        r.stopRequested = false;
-        r.questionAfterStop = false;
-        r.disableFramesOnStop = false;
-        r.stopMessage.clear();
-
-        stopNow(disableFrames);
-
-        if (!message.empty())
-            postNotice(std::move(message), question || disableFrames);
-
-        if (question) {
-            s.deathQuestion = true;
-            s.deathQuestionSession = r.session;
-        }
-    }
-
-    // Конец воспроизведения с обязательной сверкой: сколько событий макроса
-    // реально применено и сколько потеряно. Без этого прогон мог «пройти»
-    // с молча выброшенными кликами — раньше единственной реакцией была смерть.
-    void finishPlayback() {
-        auto& s = state();
-        auto& r = s.run;
-
-        auto const total = s.buffer.actions.size();
-        auto const played = r.telemetry.eventsPlayed;
-        auto const dropped = r.telemetry.macroEventsDropped;
-        bool const exact = dropped == 0 && played == total;
-
-        if (exact) {
-            requestStop(fmt::format(
-                "Макрос завершён: применено все {} событий, потерь нет.",
-                total
-            ));
-            return;
-        }
-
-        requestStop(
-            fmt::format(
-                "Макрос завершён с расхождением: применено {} из {} событий, "
-                "потеряно {}. Прогон не был точным — смотреть «без хука» и "
-                "«без шага» в статусе.",
-                played, total, dropped
-            ),
-            false, true
-        );
-    }
-
-    void trimRecording(std::uint32_t nextStep) {
-        auto& s = state();
-        if (!s.hasBuffer)
-            return;
-
-        auto& actions = s.buffer.actions;
-        auto first = std::lower_bound(
-            actions.begin(), actions.end(), nextStep,
-            [](Action const& action, std::uint32_t step) {
-                return action.step < step;
-            }
-        );
-        actions.erase(first, actions.end());
-        s.buffer.length = nextStep;
-    }
-
-    void clearTimeline(std::uint32_t step = 0) {
-        auto& r = state().run;
-        ++r.epoch;
-        r.step = step;
-        r.playbackCursor = 0;
-        r.debt = 0.0L;
-        r.frameBudget = 0;
-        r.stepEvents.clear();
-        r.pendingInputs.clear();
-        r.orderInStep = 0;
-        r.stepHandled = false;
-        r.manualHeld = 0;
-        r.macroHeld = 0;
-        r.sentHeld = 0;
-        r.dead = false;
-        r.markPending = false;
-        r.discardCurrentStep = false;
-        if (r.play)
-            r.play->m_extraDelta = 0.0;   // аккумулятором владеем мы
-    }
-
-    void requestStart(Mode mode) {
-        auto& s = state();
-        auto& r = s.run;
-
-        if (!r.play || mode == Mode::Off)
-            return;
-
-        if (mode == Mode::Playback) {
-            std::string error;
-            if (!s.hasBuffer || s.buffer.length == 0) {
-                showNotice("В буфере нет непустого макроса.", true);
-                return;
-            }
-            if (!compatible(s.buffer, error)) {
-                showNotice(error, true);
-                return;
-            }
-        }
-
-        stopNow(false);
-        r.pendingStart = mode;
-        s.deathQuestion = false;
-        changed();
-        showNotice("Запуск с начала уровня после выхода из паузы.");
-    }
-
-    void beginPendingStart() {
-        auto& s = state();
-        auto& r = s.run;
-        if (!r.pendingStart || !r.play || r.play->m_isPaused)
-            return;
-
-        auto mode = *r.pendingStart;
-        auto* play = r.play;
-        auto session = r.session;
-        r.pendingStart.reset();
-
-        if (mode == Mode::Playback) {
-            std::string error;
-            if (!s.hasBuffer || !compatible(s.buffer, error)) {
-                postNotice(error.empty() ? "Макрос недоступен." : error, true);
-                return;
-            }
-        }
-
-        r.internalRestart = true;
-        play->resetLevelFromStart();
-        if (r.play != play || r.session != session) {
-            r.internalRestart = false;
-            return;
-        }
-        r.internalRestart = false;
-
-        // ГЛАВНАЯ ПРИЧИНА «УРОВЕНЬ НЕ ДВИГАЕТСЯ».
-        //
-        // GD не симулирует уровень, пока не выставлен GJBaseGameLayer::
-        // m_started. Доказательства из биндингов 2.2081:
-        //   * PlayLayer::isGameplayActive() { return !m_hasCompletedLevel &&
-        //     m_started && !m_player1->m_isDead; }
-        //   * реконструкция getModifiedDelta/stepCount считается только
-        //     при if (m_started);
-        //   * у PlayLayer есть startGame() (win 0x3a7a20) и
-        //     startGameDelayed() (win 0x3a7a70) — больше выставлять
-        //     m_started некому.
-        //
-        // Штатный рестарт из меню паузы идёт через resumeAndRestart(bool),
-        // который этот запуск выполняет. Голый resetLevelFromStart() — нет,
-        // поэтому уровень оставался незапущенным навсегда: снаружи это ровно
-        // «возобновил игру, а персонаж не двигается, что бы я ни делал».
-        r.startEscalation = 0;
-        if (!play->m_started)
-            play->startGameDelayed();
-
-        r.paused = play->m_isPaused;
-        r.mode = mode;
-
-        // Телеметрия — за прогон, а не за сессию уровня. Без сброса второй
-        // прогон в том же уровне сравнивал eventsPlayed с накопленным значением
-        // и finishPlayback() всегда рапортовал бы расхождение.
-        r.telemetry = Telemetry{};
-
-        if (mode == Mode::Record) {
-            s.buffer = Macro{};
-            s.buffer.tps = s.tps;
-            s.buffer.level = r.level;
-            s.hasBuffer = true;
-        }
-
-        // initialHeld из заголовка больше не применяется: макрос — поток
-        // событий, удерживаемые состояния восстанавливаются сами из первого
-        // же down-события. macroHeld отслеживает их только для sendMask().
-        r.macroHeld = 0;
-
-        r.idleFrames = 0;
-        r.warnedIdle = false;
-        r.noStepFrames = 0;
-        r.stepOpen = false;
-        // Каждый новый прогон заново пробует форсированный шаг 1/240.
-        r.nativeFallback = false;
-
-        // Темп ниже 30 шагов/с визуально неотличим от зависшего уровня —
-        // говорим об этом сразу, а не через «почему не двигается».
-        double const startRate = static_cast<double>(s.tps) *
-            (mode == Mode::Record ? s.recordingSpeed : 1.0);
-        if (startRate < 30.0) {
-            postNotice(
-                fmt::format(
-                    "Темп {:.1f} шагов/с (Темп {} × Скорость записи {:.2f}) — "
-                    "уровень будет идти очень медленно и выглядеть зависшим.",
-                    startRate, s.tps, s.recordingSpeed
-                ),
-                true
-            );
-        }
-
-        // Покадровый режим переживает requestStart() намеренно, но тогда
-        // уровень НЕ идёт сам — это надо сказать вслух, иначе выглядит как
-        // зависшая игра.
-        if (r.frameMode) {
-            postNotice(
-                "Покадровый режим включён: уровень не идёт сам, шагайте "
-                "кнопкой «Вправо». Для обычной записи выключите его.",
-                true
-            );
-        }
-
-        installNativeFlags();
-        // Не force: sentHeld ведёт sendButton() и после clearTimeline() он 0,
-        // а resetLevelFromStart() нативно отпустил все кнопки. Force-вариант
-        // слал 6 лишних событий на каждом старте — лишний «press» способен
-        // повторно триггернуть прыжок.
-        sendMask(effectiveHeld());
-        syncAudio();
-        changed();
-    }
-
-    // --- захват ввода ------------------------------------------------------
-
-    // handleButton вне шага: событие принадлежит следующему шагу.
-    void deferInput(bool down, int button, bool player2) {
-        auto& r = state().run;
-        if (!buttonBit(button, player2))
-            return;
-
-        if (r.pendingInputs.size() >= kPendingInputLimit) {
-            ++r.telemetry.droppedButtons;
-            requestStop("Переполнена очередь ввода. Бот остановлен.", false, true);
-            return;
-        }
-
-        StepEvent event;
-        event.button = static_cast<std::uint8_t>(button);
-        event.down = down;
-        event.player2 = player2;
-        event.source = Source::Manual;
-        r.pendingInputs.push_back(event);
-        ++r.telemetry.deferredButtons;
-    }
-
-    // handleButton внутри шага, но мимо нативной очереди (прямой вызов —
-    // так делают сторонние моды). Игра уже применила событие, поэтому
-    // помечаем alreadyApplied: в макрос оно попадает, повторно не шлётся.
-    //
-    // ОГРАНИЧЕНИЕ (честно): при записи такое событие применяется в момент
-    // вызова (возможно, после нативного тела processCommands), а при
-    // воспроизведении — в общей точке применения ввода шага (до тела
-    // processCommands). В пределах одного шага это может дать расхождение,
-    // если в этом же шаге сработал триггер. В норме весь пользовательский
-    // ввод идёт через m_queuedButtons и этого пути не касается; телеметрия
-    // показывает его как счётчик direct.
-    void noteDirectInput(bool down, int button, bool player2) {
-        auto& r = state().run;
-        if (!buttonBit(button, player2))
-            return;
-
-        StepEvent event;
-        event.order = r.orderInStep++;
-        event.button = static_cast<std::uint8_t>(button);
-        event.down = down;
-        event.player2 = player2;
-        event.source = Source::Manual;
-        event.alreadyApplied = true;
-        r.stepEvents.push_back(event);
-    }
-
-    // processQueuedButtons вызвался вне шага: не даём игре применить ввод
-    // в произвольный момент, переносим события на следующий шаг.
-    void deferQueued(GJBaseGameLayer* layer) {
-        auto& r = state().run;
-
-        for (auto const& command : layer->m_queuedButtons) {
-            auto button = static_cast<int>(command.m_button);
-            if (button < 1 || button > 3)
-                continue;
-
-            if (r.pendingInputs.size() >= kPendingInputLimit) {
-                ++r.telemetry.droppedButtons;
-                continue;
-            }
-
-            StepEvent event;
-            event.button = static_cast<std::uint8_t>(button);
-            event.down = command.m_isPush;
-            event.player2 = command.m_isPlayer2;
-            event.source = Source::Manual;
-            r.pendingInputs.push_back(event);
-            ++r.telemetry.deferredButtons;
-        }
-        layer->m_queuedButtons.clear();
-    }
-
-    // Снять урожай ввода этого шага: отложенные события + нативная очередь.
-    // Очередь очищается — дальше ввод применяем только мы.
-    void harvestStepInputs(GJBaseGameLayer* layer) {
-        auto& r = state().run;
-
-        for (auto& event : r.pendingInputs) {
-            event.order = r.orderInStep++;
-            r.stepEvents.push_back(event);
-        }
-        r.pendingInputs.clear();
-
-        for (auto const& command : layer->m_queuedButtons) {
-            auto button = static_cast<int>(command.m_button);
-            if (button < 1 || button > 3)
-                continue;
-
-            StepEvent event;
-            event.order = r.orderInStep++;
-            event.button = static_cast<std::uint8_t>(button);
-            event.down = command.m_isPush;
-            event.player2 = command.m_isPlayer2;
-            event.source = Source::Manual;
-            r.stepEvents.push_back(event);
-        }
-        layer->m_queuedButtons.clear();
-    }
-
-    void applyEvent(StepEvent const& event) {
-        auto& r = state().run;
-        auto bit = buttonBit(event.button, event.player2);
-        if (!bit)
-            return;
-
-        auto& mask = event.source == Source::Macro
-            ? r.macroHeld
-            : r.manualHeld;
-
-        if (event.down)
-            mask |= bit;
-        else
-            mask &= static_cast<std::uint8_t>(~bit);
-
-        if (event.alreadyApplied) {
-            // Событие применила сама игра (прямой handleButton мимо очереди).
-            // sentHeld обязан это учесть, иначе последующий sendMask() пошлёт
-            // лишние нажатия и может повторно триггернуть прыжок.
-            if (event.down)
-                r.sentHeld |= bit;
-            else
-                r.sentHeld &= static_cast<std::uint8_t>(~bit);
-            return;
-        }
-
-        if (event.source == Source::Macro)
-            ++r.telemetry.eventsPlayed;
-
-        sendButton(event.button, event.down, event.player2);
-    }
-
-    // Единственная точка применения ввода. Вызывается из первого хука шага
-    // (processCommands или processQueuedButtons — кто пришёл первым).
-    // При записи и при воспроизведении позиция внутри шага одинакова,
-    // поэтому воспроизведение совпадает с записью по построению.
-    void runStepInputs(GJBaseGameLayer* layer) {
-        auto& s = state();
-        auto& r = s.run;
-
-        if (!r.inTick || r.stepHandled)
-            return;
-        r.stepHandled = true;
-
-        harvestStepInputs(layer);
-
-        // 1) события макроса для этого шага
-        if (r.mode == Mode::Playback) {
-            auto const& actions = s.buffer.actions;
-
-            while (r.playbackCursor < actions.size() &&
-                   actions[r.playbackCursor].step < r.step) {
-                // Шаг пропущен без применения — событие макроса потеряно.
-                // Раньше это происходило молча и давало расхождение прогона.
-                ++r.playbackCursor;
-                ++r.telemetry.macroEventsDropped;
-                if (!r.telemetry.warnedDropped) {
-                    r.telemetry.warnedDropped = true;
-                    postNotice(
-                        "Событие макроса пропущено без применения: шаг прошёл "
-                        "без хука ввода. Прогон уже не точный — см. «потери» "
-                        "в статусе панели.",
-                        true
-                    );
-                }
-            }
-
-            std::size_t begin = r.playbackCursor;
-            while (r.playbackCursor < actions.size() &&
-                   actions[r.playbackCursor].step == r.step) {
-                ++r.playbackCursor;
-            }
-
-            for (std::size_t i = begin; i < r.playbackCursor; ++i) {
-                auto const& action = actions[i];
-                StepEvent event;
-                event.order = action.order;
-                event.button = action.button;
-                event.down = action.down;
-                event.player2 = action.player2;
-                event.source = Source::Macro;
-                applyEvent(event);
-            }
-        }
-
-        // 2) живой ввод этого шага
-        bool blocked = r.mode == Mode::Playback && s.blockInput;
-        for (auto const& event : r.stepEvents) {
-            if (blocked) {
-                ++r.telemetry.droppedButtons;
-                continue;
-            }
-            applyEvent(event);
-        }
-    }
-
-    // Коммит шага: события уходят в буфер, счётчик шага увеличивается.
-    void commitStep() {
-        auto& s = state();
-        auto& r = s.run;
-
-        if (r.discardCurrentStep) {
-            r.stepEvents.clear();
-        }
-        else if (r.mode == Mode::Record) {
-            std::size_t added = 0;
-            for (auto const& event : r.stepEvents)
-                if (event.source == Source::Manual)
-                    ++added;
-
-            if (s.buffer.actions.size() + added > kMaxEvents) {
-                r.discardCurrentStep = true;
-                requestStop(
-                    "Достигнут предел числа действий. Запись остановлена.",
-                    true, true
-                );
-            }
-            else {
-                for (auto const& event : r.stepEvents) {
-                    if (event.source != Source::Manual)
-                        continue;
-
-                    Action action;
-                    action.step = r.step;
-                    action.order = event.order;
-                    action.button = event.button;
-                    action.down = event.down;
-                    action.player2 = event.player2;
-                    s.buffer.actions.push_back(action);
-                    ++r.telemetry.eventsRecorded;
-                }
-            }
-        }
-
-        r.stepEvents.clear();
-        r.orderInStep = 0;
-        ++r.step;
-
-        if (s.hasBuffer && r.mode == Mode::Record)
-            s.buffer.length = r.step;
-    }
-
-    // Вызывается из каждого хука шага (processCommands / processQueuedButtons).
-    //
-    // В форсированном режиме один тик == один шаг, поэтому шаг открывается
-    // один раз (флаг stepHandled внутри runStepInputs).
-    //
-    // В аварийном нативном режиме игра сама решает, сколько шагов сделать за
-    // кадр, поэтому границу шага определяем здесь: по вызову processCommands
-    // и/или по изменению m_currentStep. Предыдущий шаг при этом коммитится.
-    void onStepHook(GJBaseGameLayer* layer, bool fromProcessCommands) {
-        auto& r = state().run;
-        if (!r.inTick)
-            return;
-
-        if (r.nativeFallback) {
-            int const cs = layer->m_currentStep;
-            bool const newStep = fromProcessCommands || cs != r.lastNativeStep;
-
-            if (newStep) {
-                if (r.stepOpen)
-                    commitStep();
-
-                r.stepOpen = true;
-                r.stepHandled = false;
-                r.lastNativeStep = cs;
-            }
-        }
-
-        runStepInputs(layer);
-    }
-
-    // --- чекпоинты ---------------------------------------------------------
-
-    CheckpointData captureCheckpointData() {
-        auto const& r = state().run;
-        CheckpointData data;
-        data.nextStep = r.step;
-        // Чекпоинт, созданный внутри шага, шагово не восстанавливаем: часть
-        // физики шага уже исполнена, а ввод шага уже применён.
-        data.safeBoundary = !r.inTick;
-        data.manualHeld = r.manualHeld;
-        data.macroHeld = r.macroHeld;
-        data.effectiveHeld = r.sentHeld;
-        return data;
-    }
-
-    void pruneCheckpoints() {
-        auto& r = state().run;
-        if (!r.play)
-            return;
-
-        auto* array = r.play->m_checkpointArray;
-        std::erase_if(r.checkpoints, [array](auto const& entry) {
-            return !array || !array->containsObject(entry.first);
-        });
-    }
-
-    bool hasUsableCheckpoint() {
-        auto const& r = state().run;
-        if (!r.play || !r.play->m_checkpointArray ||
-            r.play->m_checkpointArray->count() == 0) {
-            return false;
-        }
-
-        auto* checkpoint = static_cast<CheckpointObject*>(
-            r.play->m_checkpointArray->lastObject()
-        );
-        auto found = r.checkpoints.find(checkpoint);
-        return found != r.checkpoints.end() &&
-               found->second.safeBoundary;
-    }
-
-    void restoreCheckpointData(std::optional<CheckpointData> const& saved) {
-        auto& s = state();
-        auto& r = s.run;
-
-        if (!saved || !saved->safeBoundary) {
-            if (r.mode != Mode::Off || r.frameMode) {
-                requestStop(
-                    "Чекпоинт создан внутри шага физики (обычно так делает "
-                    "чекпоинт-триггер уровня), поэтому пошагово восстановить "
-                    "его нельзя: часть шага уже исполнена, а ввод шага уже "
-                    "применён. Бот остановлен.",
-                    r.mode == Mode::Record, true
-                );
-            }
-            r.dead = false;
-            return;
-        }
-
-        auto data = *saved;
-        clearTimeline(data.nextStep);
-
-        if (r.mode == Mode::Record)
-            trimRecording(data.nextStep);
-
-        r.manualHeld = data.manualHeld;
-        r.macroHeld = r.mode == Mode::Playback ? data.macroHeld : 0;
-        r.sentHeld = data.effectiveHeld;
-
-        r.playbackCursor = static_cast<std::size_t>(
-            std::lower_bound(
-                s.buffer.actions.begin(), s.buffer.actions.end(), data.nextStep,
-                [](Action const& action, std::uint32_t step) {
-                    return action.step < step;
-                }
-            ) - s.buffer.actions.begin()
-        );
-
-        // Не force: native loadFromCheckpoint() уже восстановил удерживаемые
-        // кнопки из снапшота, и sentHeld выставлен в data.effectiveHeld, так
-        // что разница обычно пуста. Force повторно нажимал бы то, что уже
-        // нажато, — это источник лишнего прыжка сразу после респавна.
-        sendMask(effectiveHeld());
-
-        r.dead = false;
-        syncAudio();
-        changed();
-    }
-
-    void resetBegin() {
-        auto& r = state().run;
-        if (++r.resetDepth == 1) {
-            r.loadedDuringReset = false;
-            r.restoreAfterReset.reset();
-        }
-    }
-
-    void resetEnd() {
-        auto& r = state().run;
-        if (r.resetDepth <= 0 || --r.resetDepth != 0)
-            return;
-
-        if (r.internalRestart) {
-            clearTimeline();
-            r.checkpoints.clear();
-            return;
-        }
-
-        if (r.loadedDuringReset) {
-            auto saved = r.restoreAfterReset;
-            r.restoreAfterReset.reset();
-            restoreCheckpointData(saved);
-        }
-        else {
-            if (r.mode == Mode::Record) {
-                requestStop(
-                    "Сброс без чекпоинта: запись оставлена в буфере.",
-                    true
-                );
-            }
-            else if (r.mode == Mode::Playback) {
-                requestStop("Воспроизведение остановлено сбросом уровня.");
-            }
-
-            clearTimeline();
-            r.checkpoints.clear();
-        }
-
-        if (!r.inTick)
-            flushStop();
-        syncAudio();
-    }
-
-    void onDeath() {
-        auto& r = state().run;
-        if (r.dead)
-            return;
-
-        r.dead = true;
-        r.frameBudget = 0;
-        r.stepEvents.clear();
-        r.pendingInputs.clear();
-        restoreAudio();
-
-        bool const resumable = hasUsableCheckpoint();
-
-        if (r.mode == Mode::Record && !resumable) {
-            requestStop(
-                "Смерть без чекпоинта, восстанавливаемого пошагово. "
-                "Запись оставлена в буфере.",
-                true
-            );
-        }
-        else if (r.mode == Mode::Playback) {
-            if (resumable) {
-                // practice-режим: игра сама позовёт loadFromCheckpoint(),
-                // restoreCheckpointData() вернёт шаг и курсор и снимет r.dead.
-                // Бот намеренно НЕ выключается: раньше одна смерть гасила
-                // воспроизведение, респавн шёл уже без бота и игрок просто
-                // бежал в следующее препятствие — выглядело как «бот умирает».
-                postNotice("Смерть: продолжение с последнего чекпоинта.");
-            }
-            else {
-                requestStop(
-                    "Смерть без чекпоинта, восстанавливаемого пошагово. "
-                    "Воспроизведение остановлено.",
-                    true
-                );
-            }
-        }
-
-        if (!r.inTick)
-            flushStop();
-    }
-
-    PlayerStamp stampPlayer(PlayerObject* player) {
-        if (!player)
-            return {};
-
-        auto position = player->getPosition();
-        return {
-            true,
-            position.x,
-            position.y,
-            static_cast<double>(player->m_yVelocity),
-            player->m_isOnGround,
-            player->m_isUpsideDown,
-            player->m_isDart
-        };
-    }
-
-    PhysicsStamp physicsStamp() {
-        auto const& r = state().run;
-        if (!r.play)
-            return {};
-
-        bool dual = r.play->m_gameState.m_isDualMode;
-        return {
-            stampPlayer(r.play->m_player1),
-            dual ? stampPlayer(r.play->m_player2) : PlayerStamp{},
-            dual
-        };
-    }
-
-    // --- главный цикл ------------------------------------------------------
-
-    // Диагностика простоя: уровень включён, бот активен, а физических шагов
-    // нет. Без этого «игра не идёт» выглядит как мистика — причина всегда одна
-    // из перечисленных, и её можно назвать прямо.
-    std::string idleReason(bool attemptedTicks) {
-        auto const& s = state();
-        auto const& r = s.run;
-
-        if (!r.play)
-            return "слой уровня исчез.";
-
-        if (r.play->m_isPaused || r.paused)
-            return "игра на паузе.";
-
-        if (r.dead)
-            return "смерть — ожидание респавна или чекпоинта.";
-
-        if (r.pendingStart || r.startQueued)
-            return "ожидание отложенного перезапуска уровня с начала.";
-
-        if (!r.play->m_started)
-            return fmt::format(
-                "уровень не запущен: m_started == false (кадров подряд: {}). "
-                "GD не симулирует уровень до PlayLayer::startGame().",
-                r.startEscalation
-            );
-
-        if (r.frameMode && r.frameBudget == 0)
-            return "включён покадровый режим — уровень стоит, пока не нажата "
-                   "«Вправо». Выключите его для обычной записи.";
-
-        double rate = static_cast<double>(s.tps) *
-            (r.mode == Mode::Record ? s.recordingSpeed : 1.0);
-
-        if (!(rate > 0.0))
-            return "темп равен нулю — проверьте «Темп» и «Скорость записи».";
-
-        if (rate < 30.0)
-            return fmt::format(
-                "темп всего {:.1f} шагов/с (Темп {} × Скорость записи {:.2f}) — "
-                "уровень почти стоит.",
-                rate, s.tps, s.recordingSpeed
-            );
-
-        if (attemptedTicks)
-            return fmt::format(
-                "тик был, но игра не произвела физический шаг "
-                "(m_started={}, m_resumeTimer={}, m_currentStep={}, шаг бота={}, "
-                "dt шага={:.6f}, timeWarp={:.3f}).",
-                r.play->m_started ? 1 : 0,
-                r.play->m_resumeTimer,
-                r.play->m_currentStep,
-                r.step,
-                nativeStepDelta(),
-                r.play->m_gameState.m_timeWarp
-            );
-
-        return fmt::format(
-            "за кадр не набирается ни одного тика: темп {:.1f} шагов/с "
-            "(Темп {} × Скорость записи {:.2f}).",
-            rate, s.tps, s.recordingSpeed
-        );
-    }
-
-    template <class Original>
-    void driveUpdate(
-        GJBaseGameLayer* layer, float incomingDelta, Original&& original
-    ) {
-        auto& s = state();
-        auto& r = s.run;
-
-        if (!r.play || static_cast<GJBaseGameLayer*>(r.play) != layer) {
-            original(incomingDelta);
-            return;
-        }
-
-        // ПОЛНЫЙ РЕСТАРТ УРОВНЯ НЕЛЬЗЯ ДЕЛАТЬ ИЗНУТРИ update().
-        //
-        // Мы находимся в стеке GJBaseGameLayer::update (его вызывает
-        // PlayLayer::update). Синхронный resetLevelFromStart() в этой точке
-        // рвёт последовательность запуска уровня: m_started остаётся false,
-        // стартовый отсчёт не доходит до конца, и после возвращения из паузы
-        // уровень не начинает симуляцию — снаружи это выглядит ровно как
-        // «возобновил игру, а персонаж не двигается».
-        //
-        // GD сам никогда не сбрасывает уровень синхронно: для этого есть
-        // PlayLayer::delayedResetLevel() и delayedFullReset(), которые
-        // делают CCCallFunc через runAction. Мы откладываем тем же способом —
-        // через geode::queueInMainThread, то есть вне стека update().
-        //
-        // Пока рестарт не выполнен, mode == Off, controls() == false и кадр
-        // уходит игре нативно, поэтому ничего не теряется.
-        if (r.pendingStart && !r.play->m_isPaused) {
-            if (!r.startQueued) {
-                r.startQueued = true;
-                r.startQueuedFrames = 0;
-
-                auto* play = r.play;
-                auto session = r.session;
-
-                geode::queueInMainThread([play, session] {
-                    auto& queued = state().run;
-                    queued.startQueued = false;
-                    queued.startQueuedFrames = 0;
-
-                    if (queued.play != play || queued.session != session)
-                        return;
-
-                    beginPendingStart();
-                });
-            }
-            else if (++r.startQueuedFrames > 120) {
-                // Страховка: очередь главного потока за ~2 с не сработала
-                // (например, диспетчер остановлен). Тогда делаем рестарт здесь
-                // же — это хуже, чем отложенный вызов, но лучше вечного
-                // «ожидания запуска».
-                r.startQueued = false;
-                r.startQueuedFrames = 0;
-                postNotice(
-                    "Отложенный перезапуск уровня не сработал за 2 секунды, "
-                    "выполняю синхронно.",
-                    true
-                );
-                beginPendingStart();
-            }
-        }
-
-        if (!controls(layer)) {
-            // Старт запрошен, но рестарт уровня ещё отложен. Кадр «держим»:
-            // уровень всё равно будет перезапущен с начала, а нативный кадр до
-            // рестарта только применил бы ввод, который resetLevelFromStart()
-            // затем сотрёт. Заодно диагностикой видно, если отложенный вызов
-            // почему-то не сработал.
-            if (r.pendingStart) {
-                ++r.idleFrames;
-                if (r.idleFrames == 30 && !r.warnedIdle) {
-                    r.warnedIdle = true;
-                    postNotice("Игра не идёт: " + idleReason(false), true);
-                }
-                // Держим кадр не дольше kStartHoldFrames: дальше отдаём его
-                // игре, чтобы ожидание отложенного рестарта ни при каких
-                // условиях не превращалось в вечную заморозку.
-                if (r.idleFrames > kStartHoldFrames)
-                    original(incomingDelta);
-                return;
-            }
-
-            original(incomingDelta);
-            return;
-        }
-
-        // Очередь НЕ чистим: её разбирает harvestStepInputs() внутри шага.
-        installNativeFlags(false);
-
-        if (r.play->m_isPaused) {
-            r.paused = true;
-            r.pendingInputs.clear();
-            layer->m_queuedButtons.clear();
-            restoreAudio();
-            // Кадр игре всё равно отдаём: нативный update сам разбирается с
-            // паузой, а мы гарантированно не «морим» его голодом.
-            original(incomingDelta);
-            return;
-        }
-
-        // Эскалация запуска: startGameDelayed() мог не сработать (например,
-        // действие не дошло до менеджера). Тогда дёргаем startGame() напрямую,
-        // а если и это не помогло — говорим прямо, в чём дело.
-        if (!r.play->m_started) {
-            ++r.startEscalation;
-
-            if (r.startEscalation == 30 && !r.startGameCalled) {
-                r.startGameCalled = true;
-                r.play->startGame();
-                postNotice(
-                    "Уровень не запустился сам: вызываю PlayLayer::startGame() "
-                    "напрямую.",
-                    true
-                );
-            }
-            else if (r.startEscalation == 120) {
-                postNotice(fmt::format(
-                    "Уровень так и не запустился: m_started == false уже {} "
-                    "кадров после рестарта. Симуляция не пойдёт. Перезапустите "
-                    "попытку вручную (Esc -> Restart) и начните запись заново.",
-                    r.startEscalation
-                ), true);
-            }
-        }
-        else {
-            r.startEscalation = 0;
-            r.startGameCalled = false;
-        }
-
-        double frameDelta =
-            std::isfinite(incomingDelta) && incomingDelta > 0.0f
-                ? static_cast<double>(incomingDelta)
-                : 0.0;
-
-        // Защита от dt == 0 / NaN: без неё аккумулятор не растёт, бюджет
-        // навсегда ноль, и уровень стоит, хотя бот «включён». Берём штатный
-        // интервал кадра cocos, но не больше 1/4 с, чтобы не делать рывок.
-        if (frameDelta <= 0.0) {
-            double fallback = CCDirector::sharedDirector()->getAnimationInterval();
-            if (std::isfinite(fallback) && fallback > 0.0)
-                frameDelta = std::min(fallback, 0.25);
-        }
-
-        if (r.paused) {
-            r.paused = false;
-            r.pendingInputs.clear();
-            layer->m_queuedButtons.clear();
-            layer->m_extraDelta = 0.0;
-            r.debt = 0.0L;
-            frameDelta = 0.0;
-            // Не force: пауза не меняет удерживаемые кнопки, sentHeld актуален.
-            sendMask(effectiveHeld());
-        }
-
-        syncAudio();
-
-        if (r.dead) {
-            // Нативный темп: форсирование шага выключено, анимация смерти штатная.
-            original(incomingDelta);
-            flushStop();
-            return;
-        }
-
-        if (r.stopRequested) {
-            flushStop();
-            if (!controls(layer))
-                return;
-        }
-
-        // --- АВАРИЙНЫЙ РЕЖИМ: нативный темп --------------------------------
-        if (r.nativeFallback) {
-            r.inTick = true;
-            r.forceOneStep = false;
-            r.stepOpen = false;
-            r.commandCalls = 0;
-            r.queuedCalls = 0;
-            r.commandsDone = false;
-            ++r.telemetry.ticks;
-
-            int const stepBefore = layer->m_currentStep;
-            r.lastNativeStep = stepBefore;
-
-            // m_extraDelta не трогаем: аккумулятором снова владеет игра.
-            original(incomingDelta);
-
-            r.inTick = false;
-
-            if (r.stepOpen) {
-                commitStep();
-                r.stepOpen = false;
-            }
-
-            if (r.markPending && !r.dead && !r.stopRequested && r.play) {
-                r.markPending = false;
-                r.drainingMark = true;
-                r.play->markCheckpoint();
-                r.drainingMark = false;
-            }
-
-            bool const stepped = layer->m_currentStep != stepBefore;
-
-            if (stepped) {
-                r.idleFrames = 0;
-                r.noStepFrames = 0;
-                r.warnedIdle = false;
-            }
-            else {
-                ++r.idleFrames;
-                if (r.idleFrames == 60 && !r.warnedIdle) {
-                    r.warnedIdle = true;
-                    postNotice(
-                        "Игра не шагает даже в нативном режиме: " +
-                            idleReason(false),
-                        true
-                    );
-                }
-            }
-
-            if (r.stopRequested)
-                flushStop();
-            return;
-        }
-
-        float const quantum = nativeStepDelta();
-        double const speed =
-            r.mode == Mode::Record ? s.recordingSpeed : 1.0;
-
-        std::uint64_t budget = 0;
-
-        if (r.frameMode) {
-            budget = std::min<std::uint64_t>(r.frameBudget, kMaxBurst);
-            r.frameBudget -= budget;
-            r.debt = 0.0L;
-        }
-        else {
-            r.debt += static_cast<long double>(frameDelta) * speed;
-
-            long double ticks =
-                r.debt * static_cast<long double>(s.tps);
-
-            if (ticks >= 1.0L) {
-                budget = static_cast<std::uint64_t>(
-                    std::min<long double>(
-                        ticks, static_cast<long double>(kMaxBurst)
-                    )
-                );
-                r.debt -= static_cast<long double>(budget) /
-                          static_cast<long double>(s.tps);
-                if (r.debt < 0.0L)
-                    r.debt = 0.0L;
-            }
-        }
-
-        bool steppedThisFrame = false;
-        bool attemptedTicks = false;
-
-        for (std::uint64_t i = 0; i < budget && controls(layer); ++i) {
-            attemptedTicks = true;
-
-            if (r.dead || r.play->m_isPaused)
-                break;
-
-            if (r.stopRequested) {
-                flushStop();
-                break;
-            }
-
-            if (r.step >= std::numeric_limits<std::uint32_t>::max() - 1) {
-                requestStop("Достигнут предел длины макроса.", false, true);
-                flushStop();
-                break;
-            }
-
-            if (r.mode == Mode::Playback && r.step >= s.buffer.length) {
-                finishPlayback();
-                flushStop();
-                break;
-            }
-
-            auto* play = r.play;
-            auto session = r.session;
-            auto epoch = r.epoch;
-
-            r.inTick = true;
-            r.stepHandled = false;
-            r.discardCurrentStep = false;
-            r.commandCalls = 0;
-            r.queuedCalls = 0;
-            r.commandsDone = false;
-            r.beforeTick = physicsStamp();
-            ++r.telemetry.ticks;
-
-            int const stepBefore = play->m_currentStep;
-
-            r.forceOneStep = true;
-            r.forcedDelta = quantum;
-            play->m_extraDelta = 0.0;
-
-            original(quantum);
-
-            r.forceOneStep = false;
-            r.inTick = false;
-            r.inSlice = false;
-
-            if (r.play != play || r.session != session)
-                return;
-
-            // Нативный update НЕ обязан производить шаг: во время интро уровня
-            // и заморозки после выхода из паузы (m_started / m_resumeTimer,
-            // оба есть в GJBaseGameLayer 2.2081) физических шагов нет.
-            // Признак реального шага — сработал наш хук ИЛИ шагнул m_currentStep.
-            bool const stepHappened =
-                r.stepHandled || play->m_currentStep != stepBefore;
-
-            r.telemetry.maxCommandsPerTick =
-                std::max(r.telemetry.maxCommandsPerTick, r.commandCalls);
-            r.telemetry.maxQueuedPerTick =
-                std::max(r.telemetry.maxQueuedPerTick, r.queuedCalls);
-
-            if (!stepHappened) {
-                // КЛЮЧЕВОЕ: номер шага не сжигаем и шаг не коммитим.
-                // Иначе при записи ввод уезжает на шаг вперёд, а при
-                // воспроизведении события этого шага молча теряются —
-                // прогон расходится и бот умирает.
-                ++r.telemetry.ticksWithoutStep;
-                if (r.frameMode)
-                    ++r.frameBudget;   // вернуть неизрасходованный кадр
-                r.debt = 0.0L;         // не копить долг -> без рывка после окна
-                // ~120 кадров без шага — это уже не штатное интро, а признак
-                // того, что игра вообще не симулирует (или наши хуки не
-                // срабатывают). Номер шага при этом не сгорает.
-                if (r.telemetry.ticksWithoutStep == 120 &&
-                    !r.telemetry.warnedNoStep) {
-                    r.telemetry.warnedNoStep = true;
-                    postNotice(
-                        "Игра уже около двух секунд не производит физических "
-                        "шагов. Бот ждёт первого шага, номер шага не сжигается.",
-                        true
-                    );
-                }
-                break;
-            }
-
-            r.telemetry.nativeStepDrift +=
-                static_cast<long long>(play->m_currentStep - stepBefore) - 1;
-
-            if (!r.stepHandled) {
-                // Шаг был, но ни один хук ввода не сработал: применить события
-                // шага было негде. Номер шага увеличиваем — иначе разойдёмся с
-                // игрой навсегда; потерянное уйдёт в macroEventsDropped.
-                ++r.telemetry.stepsNoHook;
-                if (!r.telemetry.warnedNoHook) {
-                    r.telemetry.warnedNoHook = true;
-                    postNotice(
-                        "Физический шаг прошёл без хука ввода: ни processCommands, "
-                        "ни processQueuedButtons не вызвались. События этого шага "
-                        "потеряны. Проверьте, не перехватил ли эти функции другой мод.",
-                        true
-                    );
-                }
-            }
-
-            if (r.telemetry.nativeStepDrift != 0 &&
-                !r.telemetry.warnedDrift) {
-                r.telemetry.warnedDrift = true;
-                postNotice(
-                    "Нативных шагов на тик не ровно один — расхождение с "
-                    "m_currentStep. Проверьте m_timeWarp и другие моды физики.",
-                    true
-                );
-            }
-
-            if (r.epoch != epoch) {
-                r.stepEvents.clear();
-                flushStop();
-                break;
-            }
-
-            commitStep();
-            steppedThisFrame = true;
-
-            if (r.markPending && !r.dead && !r.stopRequested) {
-                r.markPending = false;
-                r.drainingMark = true;
-                play->markCheckpoint();
-                r.drainingMark = false;
-            }
-
-            if (r.mode == Mode::Playback && r.step >= s.buffer.length)
-                finishPlayback();
-
-            flushStop();
-
-            if (r.dead)
-                break;
-        }
-
-        // Если бот активен, но ни одного шага за кадр не случилось — говорим
-        // почему. Однократно на «эпизод» простоя, ~0.5 с.
-        if (steppedThisFrame) {
-            r.idleFrames = 0;
-            r.noStepFrames = 0;
-            r.warnedIdle = false;
-        }
-        else {
-            ++r.idleFrames;
-
-            // Интро уровня и заморозка после паузы/респавна — законное окно
-            // без шагов, аварией не считается.
-            bool const introWindow =
-                !r.play->m_started || r.play->m_resumeTimer > 0;
-
-            if (introWindow)
-                r.noStepFrames = 0;
-            else
-                ++r.noStepFrames;
-
-            if (r.noStepFrames >= kNoStepFramesLimit) {
-                r.nativeFallback = true;
-                r.noStepFrames = 0;
-                r.idleFrames = 0;
-                r.warnedIdle = false;
-                postNotice(
-                    "Форсированный шаг 1/240 не даёт игре шагать "
-                    "(" + std::to_string(kNoStepFramesLimit) +
-                    " кадров подряд). Переключился на нативный темп: уровень "
-                    "идёт как обычно, запись и воспроизведение работают, но "
-                    "замедление записи и покадровый режим недоступны. "
-                    "Подробности: " + idleReason(attemptedTicks),
-                    true
-                );
-            }
-            else if (r.idleFrames == 30 && !r.warnedIdle) {
-                r.warnedIdle = true;
-                postNotice("Игра не идёт: " + idleReason(attemptedTicks), true);
-            }
-        }
-    }
-    void attach(PlayLayer* play, GJGameLevel* level) {
-        ensureConfiguration();
-        restoreAudio();
-
-        auto& s = state();
-        s.run = Runtime{};
-        s.run.play = play;
-        s.run.session = ++s.nextSession;
-        s.run.level = levelID(level);
-        s.run.paused = play->m_isPaused;
-        play->m_extraDelta = 0.0;
-        s.deathQuestion = false;
-
-        if (Loader::get()->isModLoaded("syzzi.click_between_frames")) {
-            postNotice(
-                "Загружен Click Between Frames. Он режет физику на суб-шаги, "
-                "а бот работает по целым шагам 1/240. Для точного "
-                "воспроизведения отключите CBF или переведите его в soft-toggle.",
-                true
-            );
-        }
-        if (Loader::get()->isModLoaded("qimiko.click_on_steps")) {
-            postNotice(
-                "Загружен Click on Steps: он тоже перехватывает очередь ввода. "
-                "Два владельца m_queuedButtons дадут расхождение.",
-                true
-            );
-        }
-        changed();
-    }
-
-    void detach(PlayLayer* play) {
-        auto& s = state();
-        if (!owns(play))
-            return;
-
-        stopNow(true);
-        restoreAudio();
-        restoreNativeFlags();
-        s.run = Runtime{};
-        s.deathQuestion = false;
-        changed();
-    }
-
-    void setFrameMode(bool enabled) {
-        auto& r = state().run;
-        if (!r.play)
-            return;
-
-        r.frameMode = enabled;
-        r.frameBudget = 0;
-        r.debt = 0.0L;
-        r.pendingInputs.clear();
-        r.play->m_extraDelta = 0.0;
-
-        if (enabled)
-            installNativeFlags();
-        else if (!active())
-            restoreNativeFlags();
-
-        syncAudio();
-        changed();
-    }
-
-    void advanceFrames() {
-        auto& s = state();
-        auto& r = s.run;
-        if (!r.play || !r.frameMode || r.play->m_isPaused || r.dead)
-            return;
-
-        r.frameBudget = std::min<std::uint64_t>(
-            r.frameBudget + s.frameSize, 1'000'000
-        );
-    }
-    CCRect safeRect() {
-        auto window = CCDirector::sharedDirector()->getWinSize();
-
-        auto area = getSafeAreaRect();
-
-        if (area.size.width <= 0.0f || area.size.height <= 0.0f)
-            area = CCRect{0.0f, 0.0f, window.width, window.height};
-
-        constexpr float padding = 8.0f;
-        area.origin.x += padding;
-        area.origin.y += padding;
-        area.size.width = std::max(1.0f, area.size.width - padding * 2);
-        area.size.height = std::max(1.0f, area.size.height - padding * 2);
-        return area;
-    }
-
-    char const* systemFont() {
-#ifdef GEODE_IS_WINDOWS
-        return "Arial";
-#else
-        return "sans-serif";
-#endif
-    }
-
-    CCLabelTTF* russianLabel(
-        std::string const& text,
-        float size = 14.0f,
-        float width = 0.0f
-    ) {
-        if (width > 0.0f) {
-            return CCLabelTTF::create(
-                text.c_str(), systemFont(), size,
-                CCSize{width, 0.0f},
-                kCCTextAlignmentLeft,
-                kCCVerticalTextAlignmentTop
-            );
-        }
-        return CCLabelTTF::create(text.c_str(), systemFont(), size);
-    }
-
-    void fitLabel(CCLabelTTF* label, float width, float height) {
-        if (!label)
-            return;
-        auto size = label->getContentSize();
-        if (size.width <= 0 || size.height <= 0)
-            return;
-        label->setScale(std::min({
-            1.0f, width / size.width, height / size.height
-        }));
-    }
-
-    class CallbackNode final : public CCNode {
-        std::function<void()> m_callback;
-
-    public:
-        static CallbackNode* create(std::function<void()> callback) {
-            auto* node = new CallbackNode;
-            if (!node->init()) {
-                delete node;
-                return nullptr;
-            }
-            node->m_callback = std::move(callback);
-            node->autorelease();
-            return node;
-        }
-
-        void invoke(CCObject*) {
-            auto callback = m_callback;
-            if (callback)
-                callback();
-        }
-    };
-
-    CCMenuItemSpriteExtra* textButton(
-        CCMenu* menu,
-        std::string const& text,
-        CCPoint position,
-        CCSize size,
-        std::function<void()> callback,
-        bool enabled = true
-    ) {
-        auto* normal = CCNode::create();
-        if (!normal)
-            return nullptr;
-        normal->setContentSize(size);
-
-        auto* background = CCLayerColor::create(
-            enabled ? ccColor4B{43, 75, 108, 235}
-                    : ccColor4B{52, 55, 61, 190},
-            size.width, size.height
-        );
-        if (background)
-            normal->addChild(background);
-
-        auto* label = russianLabel(text, 14.0f);
-        if (!label)
-            return nullptr;
-        label->setPosition({size.width / 2, size.height / 2});
-        fitLabel(label, size.width - 10, size.height - 6);
-        if (!enabled)
-            label->setColor({140, 145, 150});
-        normal->addChild(label);
-
-        auto* handler = CallbackNode::create(std::move(callback));
-        if (!handler)
-            return nullptr;
-
-        auto* item = CCMenuItemSpriteExtra::create(
-            normal, handler, menu_selector(CallbackNode::invoke)
-        );
-        if (!item)
-            return nullptr;
-
-        item->addChild(handler);
-        item->setPosition(position);
-        item->setEnabled(enabled);
-        if (menu)
-            menu->addChild(item);
-        return item;
-    }
-
-    CCLabelBMFont* findBitmapLabel(CCNode* root) {
-        if (auto* label = typeinfo_cast<CCLabelBMFont*>(root))
-            return label;
-
-        auto* children = root->getChildren();
-        if (!children)
-            return nullptr;
-
-        for (unsigned i = 0; i < children->count(); ++i) {
-            auto* child = static_cast<CCNode*>(children->objectAtIndex(i));
-            if (auto* found = findBitmapLabel(child))
-                return found;
-        }
-        return nullptr;
-    }
-
-    void showNotice(std::string const& text, bool warning) {
-        auto area = safeRect();
-
-        auto placeholderLength = static_cast<std::size_t>(
-            std::clamp(area.size.width / 14.0f, 16.0f, 32.0f)
-        );
-        auto* notification = Notification::create(
-            std::string(placeholderLength, 'W'),
-            warning ? NotificationIcon::Warning : NotificationIcon::Info,
-            3.5f
-        );
-
-        if (auto* bitmap = findBitmapLabel(notification)) {
-            auto* parent = bitmap->getParent();
-            auto* label = russianLabel(text, 13.0f);
-            if (label && parent) {
-                label->setAnchorPoint(bitmap->getAnchorPoint());
-                label->setPosition(bitmap->getPosition());
-
-                float width = std::min(
-                    area.size.width - 36.0f,
-                    bitmap->getContentSize().width * bitmap->getScaleX()
-                );
-                fitLabel(label, std::max(width, 80.0f), 22.0f);
-                bitmap->setOpacity(0);
-                parent->addChild(label, bitmap->getZOrder() + 1);
-                notification->show();
-                return;
-            }
-        }
-
-        auto* scene = CCDirector::sharedDirector()->getRunningScene();
-        if (!scene)
-            return;
-
-        float width = std::min(area.size.width, 430.0f);
-        auto* toast = CCLayerColor::create(
-            {20, 27, 37, 245}, width, 48.0f
-        );
-        if (!toast)
-            return;
-
-        toast->setPosition({
-            area.origin.x + (area.size.width - width) / 2,
-            area.origin.y + area.size.height - 54.0f
-        });
-
-        auto* label = russianLabel(text, 12.0f, width - 18.0f);
-        if (!label)
-            return;
-
-        label->setAnchorPoint({0.5f, 0.5f});
-        label->setPosition({width / 2, 24.0f});
-        fitLabel(label, width - 18.0f, 40.0f);
-        toast->addChild(label);
-        scene->addChild(toast, 100000);
-
-        toast->runAction(CCSequence::create(
-            CCDelayTime::create(3.5f),
-            CCRemoveSelf::create(true),
-            nullptr
-        ));
-    }
-
-    constexpr int kModalMenuTouchPriority = 1000;
-    constexpr int kModalScrollTouchPriority = 750;
-    constexpr int kModalTouchPriority = 500;
-    constexpr float kFixedControlsHeight = 104.0f;
-
-    class ModalMenu final : public CCMenu {
-    public:
-        using CCMenu::init;
-
-        static ModalMenu* create() {
-            auto* menu = new ModalMenu;
-            if (menu->init()) {
-                menu->autorelease();
-                return menu;
-            }
-            delete menu;
-            return nullptr;
-        }
-
-        void registerWithTouchDispatcher() override {
-            CCDirector::sharedDirector()->getTouchDispatcher()
-                ->addTargetedDelegate(this, kModalMenuTouchPriority, true);
-        }
-    };
-
-    class ModalScrollLayer final : public ScrollLayer {
-public:
-    using ScrollLayer::ScrollLayer;
-
-    static ModalScrollLayer* create(CCSize const& size) {
-        auto* layer = new ModalScrollLayer(
-            CCRect{0.0f, 0.0f, size.width, size.height},
-            false, // scrollWheelEnabled
-            true   // vertical
-        );
-
-        if (!layer)
-            return nullptr;
-
-        layer->autorelease();
-        return layer;
-    }
-
-    void registerWithTouchDispatcher() override {
-        CCDirector::sharedDirector()->getTouchDispatcher()
-            ->addTargetedDelegate(this, kModalScrollTouchPriority, true);
     }
 };
 
-    class ModalLayer : public CCLayerColor {
-    protected:
-        CCLayerColor* m_box = nullptr;
+class $modify(BotGameStatsManager, GameStatsManager) {
+    bool isItemUnlocked(UnlockType type, int id) {
+        return true;
+    }
+};
 
-    public:
-        bool initModal(float width, float height) {
-            auto window = CCDirector::sharedDirector()->getWinSize();
+// ---------------------------------------------------------------------------
+// Общее состояние настроек (объявлено до использования в хуках)
+// ---------------------------------------------------------------------------
+namespace bot {
+    inline bool disableDeathEffects = true;
+}
 
-            if (!CCLayerColor::initWithColor(
-                    {0, 0, 0, 160}, window.width, window.height)) {
-                return false;
-            }
-
-            setContentSize(window);
-            setPosition({0.0f, 0.0f});
-            setTouchEnabled(true);
-
-            m_box = CCLayerColor::create({24, 29, 39, 255}, width, height);
-            if (!m_box)
-                return false;
-
-            m_box->setContentSize({width, height});
-            m_box->ignoreAnchorPointForPosition(false);
-            m_box->setAnchorPoint({0.5f, 0.5f});
-
-            auto area = safeRect();
-            m_box->setPosition({
-                area.origin.x + area.size.width / 2,
-                area.origin.y + area.size.height / 2
-            });
-            addChild(m_box);
-
-            return true;
+// ---------------------------------------------------------------------------
+// Меню: загрузка настроек мода (безопасно, уже после инициализации Mod)
+// ---------------------------------------------------------------------------
+class $modify(BotMenuLayer, MenuLayer) {
+    bool init() {
+        if (!MenuLayer::init()) return false;
+        if (auto mod = Mod::get()) {
+            bot::disableDeathEffects = mod->getSavedValue<bool>("disableDeathEffects", true);
         }
+        return true;
+    }
+};
 
-        CCSize boxSize() const {
-            return m_box ? m_box->getContentSize() : CCSize{0.0f, 0.0f};
-        }
+namespace bot {
 
-        void registerWithTouchDispatcher() override {
-            CCDirector::sharedDirector()->getTouchDispatcher()
-                ->addTargetedDelegate(this, kModalTouchPriority, true);
-        }
+    constexpr uint32_t kMagic = 0x32544F42; // "BOT2"
+    constexpr uint32_t kMaxActions = 2'000'000;
+    constexpr std::uintmax_t kMaxFileSize = 64ull * 1024ull * 1024ull; // 64 MB
 
-        bool ccTouchBegan(CCTouch*, CCEvent*) override {
-            return true;
-        }
+    enum class Mode { Off, Record, Play };
 
-        void onEnter() override {
-            CCLayerColor::onEnter();
-            ++state().modalCount;
-        }
-
-        void onExit() override {
-            state().modalCount = std::max(0, state().modalCount - 1);
-            CCLayerColor::onExit();
-        }
-
-        void close() {
-            removeFromParentAndCleanup(true);
-        }
-
-        void present() {
-            auto* scene = CCDirector::sharedDirector()->getRunningScene();
-            if (!scene || !m_box)
-                return;
-
-            scene->addChild(this, 100000);
-
-            m_box->setScale(0.92f);
-            m_box->runAction(
-                CCEaseBackOut::create(CCScaleTo::create(0.18f, 1.0f))
-            );
-        }
+    struct Action {
+        uint32_t step = 0;
+        double frac = 0.0;
+        uint8_t button = 1;
+        bool down = false;
+        bool p1 = true;
     };
 
-    class ChoiceModal final : public ModalLayer {
-        std::string m_text;
-        std::vector<ChoiceAction> m_actions;
-
-        void build() {
-            auto size = boxSize();
-            if (!m_box)
-                return;
-
-            auto* title = russianLabel("Бот", 22.0f);
-            if (title) {
-                title->setPosition({size.width / 2, size.height - 24.0f});
-                m_box->addChild(title);
-            }
-
-            auto* body = russianLabel(m_text, 14.0f, size.width - 36.0f);
-            if (body) {
-                body->setAnchorPoint({0.5f, 1.0f});
-                body->setPosition({size.width / 2, size.height - 48.0f});
-                fitLabel(body, size.width - 36.0f, size.height - 148.0f);
-                m_box->addChild(body);
-            }
-
-            auto* menu = ModalMenu::create();
-            if (!menu)
-                return;
-
-            menu->setPosition({0, 0});
-            m_box->addChild(menu);
-
-            float y = 35.0f + 34.0f * static_cast<float>(m_actions.size() - 1);
-            for (std::size_t i = 0; i < m_actions.size(); ++i) {
-                textButton(
-                    menu, m_actions[i].first,
-                    {size.width / 2, y},
-                    {size.width - 38.0f, 28.0f},
-                    [this, i] {
-                        auto callback = m_actions[i].second;
-                        this->close();
-                        if (callback)
-                            callback();
-                    }
-                );
-                y -= 34.0f;
-            }
-        }
-
-    public:
-        static ChoiceModal* create(
-            std::string text, std::vector<ChoiceAction> actions
-        ) {
-            auto area = safeRect();
-            auto* modal = new ChoiceModal;
-            modal->m_text = std::move(text);
-            modal->m_actions = std::move(actions);
-
-            float width = std::min(430.0f, area.size.width);
-            float height = std::min(270.0f, area.size.height);
-
-            if (!modal->initModal(width, height)) {
-                delete modal;
-                return nullptr;
-            }
-
-            modal->build();
-            modal->autorelease();
-            return modal;
-        }
+    struct StepSub {
+        int button = 1;
+        bool push = false;
+        bool p1 = true;
+        double frac = 0.0;
     };
 
-    void ask(std::string text, std::vector<ChoiceAction> actions) {
-        if (actions.empty())
-            return;
-        if (auto* modal = ChoiceModal::create(
-                std::move(text), std::move(actions))) {
-            modal->present();
+    struct RawInput {
+        int button = 1;
+        bool push = false;
+        bool p1 = true;
+        double timestamp = 0.0;
+    };
+
+    inline Mode mode = Mode::Off;
+    inline std::vector<Action> macro;
+    inline uint32_t step = 0;
+    inline size_t playIndex = 0;
+    inline int applying = 0;
+    inline int silent = 0;
+    inline uint32_t applyStep = 0;
+    inline double applyFrac = 0.0;
+    inline bool cpLoaded = false;
+    inline std::unordered_map<CheckpointObject*, uint32_t> checkpoints;
+    inline double recSpeed = 1.0;
+    inline float appliedScale = 1.0f;
+
+    inline std::vector<RawInput> pendingRecordInputs;
+    inline double g_stepStartTime = 0.0;
+
+    inline bool inputThisStep = false;
+    inline bool p1Split = false;
+    inline bool p2Split = false;
+    inline bool midStep = false;
+    inline CCPoint p1Pos = { 0.f, 0.f };
+    inline CCPoint p2Pos = { 0.f, 0.f };
+    inline float rotationDelta = 0.f;
+
+    inline double getCurrentTimestamp() {
+        auto const now = std::chrono::steady_clock::now().time_since_epoch();
+        return std::chrono::duration<double>(now).count();
+    }
+
+    inline bool isPlayLayer(GJBaseGameLayer* l) {
+        auto pl = PlayLayer::get();
+        return pl && static_cast<GJBaseGameLayer*>(pl) == l;
+    }
+
+    inline void restoreAudioPitch() {
+        auto fae = FMODAudioEngine::sharedEngine();
+        if (!fae || !fae->m_backgroundMusicChannel) return;
+        fae->m_backgroundMusicChannel->setPitch(1.0f);
+    }
+
+    inline void updateAudioPitch() {
+        auto fae = FMODAudioEngine::sharedEngine();
+        if (!fae || !fae->m_backgroundMusicChannel) return;
+
+        auto pl = PlayLayer::get();
+        bool shouldSlow = (mode == Mode::Record) && pl && !pl->m_playerDied && (appliedScale > 0.001f);
+        float target = shouldSlow ? appliedScale : 1.0f;
+        target = std::clamp(target, 0.01f, 2.0f);
+
+        float cur = 1.0f;
+        fae->m_backgroundMusicChannel->getPitch(&cur);
+        if (std::abs(cur - target) > 1e-4f) {
+            fae->m_backgroundMusicChannel->setPitch(target);
         }
     }
 
-    void folderRejected(std::string const& error) {
-        ask(
-            error +
-            "\n\nНа Android выбранная папка может быть недоступна из-за "
-            "системных ограничений. Гарантировать доступ на всех устройствах "
-            "нельзя. Папка мода — рекомендуемый запасной вариант.",
-            {
-                {"Выбрать другую", [] { chooseFolder(); }},
-                {"Папка мода", [] { useModFolder(); }}
-            }
-        );
+    inline void resetEngine() {
+        pendingRecordInputs.clear();
+        g_stepStartTime = 0.0;
+        inputThisStep = false;
+        p1Split = false;
+        p2Split = false;
+        midStep = false;
+        rotationDelta = 0.f;
+        // step намеренно не сбрасывается: им управляет PlayLayer
     }
 
-    void acceptFolder(fs::path const& parent) {
-        if (parent.empty())
-            return;
-
-        fs::path directory;
-        std::string error;
-        if (!probeFolder(parent, directory, error)) {
-            folderRejected(error);
-            return;
+    inline void applyClickFlags() {
+        auto pl = PlayLayer::get();
+        if (!pl) return;
+        if (mode == Mode::Record) {
+            pl->m_clickBetweenSteps = true;
+            pl->m_clickOnSteps = false;
         }
-
-        state().directory = std::move(directory);
-        Mod::get()->setSavedValue("macro-parent", pathText(parent));
-        changed();
-        showNotice("Папка проверена: запись разрешена.");
-    }
-
-    void useModFolder() {
-        acceptFolder(Mod::get()->getSaveDir());
-    }
-
-    template <class T>
-    inline constexpr bool alwaysFalse = false;
-
-    template <class Result>
-    void consumePickResult(Result&& result) {
-        using T = std::remove_cvref_t<Result>;
-
-        if constexpr (std::is_same_v<T, fs::path>) {
-            if (!result.empty())
-                acceptFolder(result);
-        }
-        else if constexpr (std::is_same_v<T, std::optional<fs::path>>) {
-            if (result && !result->empty())
-                acceptFolder(*result);
-        }
-        else if constexpr (requires(T& value) {
-            value.isErr();
-            value.unwrap();
-        }) {
-            if (result.isErr()) {
-                folderRejected(
-                    "Выбор папки не завершён. Возможно, система отказала в доступе."
-                );
-            }
-            else {
-                consumePickResult(result.unwrap());
-            }
+        else if (mode == Mode::Play) {
+            pl->m_clickBetweenSteps = false;
+            pl->m_clickOnSteps = false;
         }
         else {
-            static_assert(
-                alwaysFalse<T>,
-                "VERIFY-8: адаптируйте обработчик к PickResult SDK 5.11.2"
-            );
+            auto gm = GameManager::get();
+            pl->m_clickBetweenSteps = gm->getGameVariable("0177");
+            pl->m_clickOnSteps = gm->getGameVariable("0176");
         }
     }
 
-    void chooseFolder() {
-        async::spawn(
-            file::pick(file::PickMode::OpenFolder, {}),
-            [](auto result) {
-                consumePickResult(std::move(result));
+    inline void setTimeScale(float s) {
+        if (std::fabs(s - appliedScale) < 1e-6f) return;
+        g_stepStartTime = 0.0;
+        appliedScale = s;
+        CCDirector::sharedDirector()->getScheduler()->setTimeScale(s);
+        updateAudioPitch();
+    }
+
+    inline void setMode(Mode m) {
+        mode = m;
+        applyClickFlags();
+        resetEngine();
+        if (mode == Mode::Off) {
+            setTimeScale(1.0f);
+            restoreAudioPitch();
+        } else {
+            updateAudioPitch();
+        }
+    }
+
+    inline void recordRawInput(int button, bool push, bool isPlayer1, double timestamp) {
+        RawInput raw;
+        raw.button = button;
+        raw.push = push;
+        raw.p1 = isPlayer1;
+        raw.timestamp = timestamp;
+        pendingRecordInputs.push_back(raw);
+    }
+
+    inline double parseSpeedString(std::string const& str) {
+        std::string s = str;
+        for (char& c : s) if (c == ',') c = '.';
+        double whole = 0.0, frac = 0.0, div = 1.0;
+        bool inFrac = false, hasDigits = false;
+        for (char c : s) {
+            if (c >= '0' && c <= '9') {
+                hasDigits = true;
+                if (!inFrac) whole = whole * 10.0 + (c - '0');
+                else { div *= 10.0; frac += (c - '0') / div; }
             }
+            else if (c == '.' && !inFrac) inFrac = true;
+            else if (c == ' ') continue;
+            else break;
+        }
+        if (!hasDigits) return 1.0;
+        return std::clamp(whole + frac, 0.01, 2.0);
+    }
+
+    inline std::filesystem::path getMacroDir() {
+        auto dir = Mod::get()->getSaveDir() / "macros";
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+        if (ec) return Mod::get()->getSaveDir();
+        return dir;
+    }
+
+    inline std::string generateTimestampName() {
+        auto now = std::chrono::system_clock::now();
+        auto timeT = std::chrono::system_clock::to_time_t(now);
+        std::tm tmStruct{};
+#ifdef GEODE_IS_WINDOWS
+        localtime_s(&tmStruct, &timeT);
+#else
+        localtime_r(&timeT, &tmStruct);
+#endif
+        return fmt::format(
+            "macro_{:04d}{:02d}{:02d}_{:02d}{:02d}{:02d}",
+            tmStruct.tm_year + 1900, tmStruct.tm_mon + 1, tmStruct.tm_mday,
+            tmStruct.tm_hour, tmStruct.tm_min, tmStruct.tm_sec
         );
     }
 
-    void confirmNewRecording() {
-        if (!state().run.play)
-            return;
+    inline std::string sanitizeFileName(std::string const& raw) {
+        std::string out;
+        out.reserve(raw.size());
+        for (char c : raw) {
+            unsigned char uc = static_cast<unsigned char>(c);
+            bool invalid = uc < 0x20
+                || c == '\\' || c == '/' || c == ':' || c == '*'
+                || c == '?' || c == '"' || c == '<' || c == '>' || c == '|';
+            out.push_back(invalid ? '_' : c);
+        }
+        size_t start = out.find_first_not_of(' ');
+        if (start == std::string::npos) return "";
+        size_t end = out.find_last_not_of(' ');
+        out = out.substr(start, end - start + 1);
+        while (!out.empty() && (out.back() == '.' || out.back() == ' ')) out.pop_back();
+        if (out.size() > 80) out.resize(80);
 
-        if (state().hasBuffer) {
-            ask(
-                "Новая запись начнётся с начала уровня и заменит макрос "
-                "в буфере. Сначала сохраните его, если он нужен.",
-                {
-                    {"Начать новую запись", [] { requestStart(Mode::Record); }},
-                    {"Сохранить буфер", [] { saveBuffer(); }}
-                }
-            );
+        std::string upper;
+        upper.reserve(out.size());
+        for (char c : out) upper.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
+        static const char* reserved[] = {
+            "CON","PRN","AUX","NUL",
+            "COM1","COM2","COM3","COM4","COM5","COM6","COM7","COM8","COM9",
+            "LPT1","LPT2","LPT3","LPT4","LPT5","LPT6","LPT7","LPT8","LPT9"
+        };
+        for (auto const* r : reserved) {
+            if (upper == r) { out = "_" + out; break; }
         }
-        else {
-            requestStart(Mode::Record);
-        }
+        return out;
     }
 
-    void deleteFile(fs::path path) {
-        ask(
-            "Удалить файл «" + pathText(path.filename()) + "»?",
-            {
-                {"Удалить", [path = std::move(path)] {
-                    std::error_code ec;
-                    bool removed = fs::remove(path, ec);
-                    changed();
-                    showNotice(
-                        removed && !ec
-                            ? "Файл удалён."
-                            : "Не удалось удалить файл.",
-                        !removed || static_cast<bool>(ec)
-                    );
-                }},
-                {"Отмена", [] {}}
-            }
+    inline bool saveMacro(std::filesystem::path const& path, std::vector<Action> const& actions) {
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        if (!out) return false;
+        uint32_t magic = kMagic;
+        uint32_t count = static_cast<uint32_t>(actions.size());
+        out.write(reinterpret_cast<char const*>(&magic), 4);
+        out.write(reinterpret_cast<char const*>(&count), 4);
+        for (auto const& a : actions) {
+            uint8_t flags = static_cast<uint8_t>((a.down ? 1 : 0) | (a.p1 ? 2 : 0));
+            out.write(reinterpret_cast<char const*>(&a.step), 4);
+            out.write(reinterpret_cast<char const*>(&a.frac), 8);
+            out.write(reinterpret_cast<char const*>(&flags), 1);
+            out.write(reinterpret_cast<char const*>(&a.button), 1);
+        }
+        return static_cast<bool>(out);
+    }
+
+    inline bool loadMacro(std::filesystem::path const& path, std::vector<Action>& actions) {
+        std::error_code ec;
+        auto size = std::filesystem::file_size(path, ec);
+        if (ec || size > kMaxFileSize) return false;
+
+        std::ifstream in(path, std::ios::binary);
+        if (!in) return false;
+        uint32_t magic = 0, count = 0;
+        in.read(reinterpret_cast<char*>(&magic), 4);
+        in.read(reinterpret_cast<char*>(&count), 4);
+        if (!in || magic != kMagic || count > kMaxActions) return false;
+        std::vector<Action> tmp;
+        tmp.reserve(count);
+        for (uint32_t i = 0; i < count; ++i) {
+            Action a;
+            uint8_t flags = 0;
+            in.read(reinterpret_cast<char*>(&a.step), 4);
+            in.read(reinterpret_cast<char*>(&a.frac), 8);
+            in.read(reinterpret_cast<char*>(&flags), 1);
+            in.read(reinterpret_cast<char*>(&a.button), 1);
+            if (!in) return false;
+            a.down = (flags & 1) != 0;
+            a.p1 = (flags & 2) != 0;
+            tmp.push_back(a);
+        }
+        actions = std::move(tmp);
+        return true;
+    }
+
+    inline void applyInput(PlayLayer* pl, StepSub const& s, uint32_t st, double frac) {
+        ++applying;
+        applyStep = st;
+        applyFrac = std::clamp(frac, 0.0, 1.0);
+        pl->handleButton(s.push, static_cast<PlayerButton>(s.button), s.p1);
+        --applying;
+    }
+
+    inline void silentReleaseAll(PlayLayer* pl) {
+        if (!pl) return;
+        ++silent;
+        for (int b = 1; b <= 3; ++b) {
+            pl->handleButton(false, static_cast<PlayerButton>(b), true);
+            pl->handleButton(false, static_cast<PlayerButton>(b), false);
+        }
+        --silent;
+    }
+
+    inline void syncPlayback(PlayLayer* pl) {
+        if (!pl) return;
+        auto it = std::lower_bound(
+            macro.begin(), macro.end(), step,
+            [](Action const& a, uint32_t s) { return a.step < s; }
         );
+        playIndex = static_cast<size_t>(it - macro.begin());
+
+        bool held[4][2] = {};
+        for (size_t i = 0; i < playIndex; ++i) {
+            auto const& a = macro[i];
+            if (a.button < 4) held[a.button][a.p1 ? 0 : 1] = a.down;
+        }
+
+        silentReleaseAll(pl);
+
+        ++silent;
+        for (int b = 1; b <= 3; ++b) {
+            if (held[b][0]) pl->handleButton(true, static_cast<PlayerButton>(b), true);
+            if (held[b][1]) pl->handleButton(true, static_cast<PlayerButton>(b), false);
+        }
+        --silent;
     }
 
-    class BotPopup final : public ModalLayer {
-        ScrollLayer* m_scroll = nullptr;
-        CCLabelTTF* m_status = nullptr;
-        CCLabelTTF* m_speedHint = nullptr;
-        CCLabelTTF* m_tpsHint = nullptr;
-        std::uint64_t m_revision = 0;
-
-        float m_scrollRatio = 0.0f;
-
-        CCMenu* m_fixedMenu = nullptr;
-        CCMenuItemSpriteExtra* m_recordButton = nullptr;
-        CCMenuItemSpriteExtra* m_blockInputButton = nullptr;
-        CCMenuItemSpriteExtra* m_frameModeButton = nullptr;
-
-        static CCLabelTTF* findLabelTTF(CCNode* root) {
-            if (!root)
-                return nullptr;
-            if (auto* label = typeinfo_cast<CCLabelTTF*>(root))
-                return label;
-
-            auto* children = root->getChildren();
-            if (!children)
-                return nullptr;
-
-            for (unsigned i = 0; i < children->count(); ++i) {
-                auto* child = static_cast<CCNode*>(children->objectAtIndex(i));
-                if (auto* found = findLabelTTF(child))
-                    return found;
-            }
-            return nullptr;
-        }
-
-        static void setButtonText(CCMenuItemSpriteExtra* item, std::string const& text) {
-            if (!item)
-                return;
-            auto* normal = item->getNormalImage();
-            if (!normal)
-                return;
-            if (auto* label = findLabelTTF(normal)) {
-                label->setString(text.c_str());
-                auto size = normal->getContentSize();
-                fitLabel(label, size.width - 10, size.height - 6);
-            }
-        }
-
-        void refreshFixedButtons() {
-            auto const& r = state().run;
-
-            std::string recordingText =
-                r.mode == Mode::Record ? "Остановить запись" :
-                (r.pendingStart == Mode::Record ? "Отменить начало записи" :
-                                                 "Начать запись");
-            setButtonText(m_recordButton, recordingText);
-
-            setButtonText(
-                m_blockInputButton,
-                std::string("Живой ввод: ") +
-                    (state().blockInput ? "заблокирован" : "РАЗРЕШЁН")
-            );
-
-            setButtonText(
-                m_frameModeButton,
-                std::string("Покадровый режим: ") +
-                    (r.frameMode ? "включён" : "выключен")
-            );
-        }
-
-        void buildFixedControls() {
-            if (!m_box)
-                return;
-
-            auto size = m_box->getContentSize();
-            float width = size.width - 24.0f;
-            float half = (width - 8.0f) / 2.0f;
-
-            m_fixedMenu = ModalMenu::create();
-            if (!m_fixedMenu)
-                return;
-
-            m_fixedMenu->setPosition({0, 0});
-            m_box->addChild(m_fixedMenu);
-
-            float top = size.height - 60.0f;
-
-            m_recordButton = textButton(
-                m_fixedMenu, "Начать запись",
-                {size.width / 2, top},
-                {width, 26.0f},
-                [this] {
-                    auto& runtime = state().run;
-                    if (runtime.mode == Mode::Record ||
-                        runtime.pendingStart == Mode::Record) {
-                        stopNow(false);
-                    }
-                    else {
-                        confirmNewRecording();
-                    }
-                    refreshFixedButtons();
-                }
-            );
-
-            textButton(
-                m_fixedMenu, "Выключить бота",
-                {12.0f + half / 2, top - 30.0f},
-                {half, 26.0f},
-                [this] { stopNow(true); refreshFixedButtons(); }
-            );
-
-            textButton(
-                m_fixedMenu, "Запустить макрос",
-                {size.width - 12.0f - half / 2, top - 30.0f},
-                {half, 26.0f},
-                [this] { requestStart(Mode::Playback); refreshFixedButtons(); }
-            );
-
-            m_blockInputButton = textButton(
-                m_fixedMenu, "Живой ввод",
-                {12.0f + half / 2, top - 60.0f},
-                {half, 26.0f},
-                [this] {
-                    auto& current = state();
-                    current.blockInput = !current.blockInput;
-                    Mod::get()->setSavedValue(
-                        "block-live-input", current.blockInput
-                    );
-                    if (active() && !current.run.dead)
-                        sendMask(effectiveHeld());
-                    refreshFixedButtons();
-                }
-            );
-
-            m_frameModeButton = textButton(
-                m_fixedMenu, "Покадровый режим",
-                {size.width - 12.0f - half / 2, top - 60.0f},
-                {half, 26.0f},
-                [this] {
-                    setFrameMode(!state().run.frameMode);
-                    refreshFixedButtons();
-                }
-            );
-
-            refreshFixedButtons();
-        }
-        void rebuild() {
-            auto& s = state();
-            auto const& r = s.run;
-            if (!m_box)
-                return;
-            auto size = m_box->getContentSize();
-            auto files = listMacros();
-            float width = size.width - 24.0f;
-            float viewHeight = std::max(
-                1.0f, size.height - 80.0f - kFixedControlsHeight
-            );
-
-            bool firstBuild = m_scroll == nullptr;
-            if (firstBuild) {
-                m_scroll = ModalScrollLayer::create({width, viewHeight});
-                if (!m_scroll)
-                    return;
-                m_scroll->setPosition({12.0f, 16.0f});
-                m_box->addChild(m_scroll);
-            }
-
-            auto* content = m_scroll->m_contentLayer;
-            if (!content)
-                return;
-
-            content->removeAllChildrenWithCleanup(true);
-
-            float contentHeight =
-                520.0f + static_cast<float>(files.size()) * 62.0f;
-            content->setContentSize({width, contentHeight});
-            auto* menu = ModalMenu::create();
-            if (!menu)
-                return;
-
-            menu->setPosition({0, 0});
-            content->addChild(menu);
-
-            float left = 8.0f;
-            float right = width - 8.0f;
-            float inner = right - left;
-            float half = (inner - 8.0f) / 2.0f;
-            float y = contentHeight - 22.0f;
-
-            auto line = [&](std::string const& text, float font = 13.0f) {
-                auto* label = russianLabel(text, font, inner);
-                if (!label)
-                    return label;
-                label->setAnchorPoint({0, 1});
-                label->setPosition({left, y});
-                content->addChild(label);
-                y -= std::max(18.0f, label->getContentSize().height) + 7.0f;
-                return label;
-            };
-
-            auto fullButton = [&](std::string text, std::function<void()> fn) {
-                textButton(
-                    menu, text, {width / 2, y - 14.0f},
-                    {inner, 28.0f}, std::move(fn)
-                );
-                y -= 36.0f;
-            };
-
-            auto pairButtons = [&](
-                std::string a, std::function<void()> fnA,
-                std::string b, std::function<void()> fnB
-            ) {
-                textButton(
-                    menu, a, {left + half / 2, y - 14.0f},
-                    {half, 28.0f}, std::move(fnA)
-                );
-                textButton(
-                    menu, b, {right - half / 2, y - 14.0f},
-                    {half, 28.0f}, std::move(fnB)
-                );
-                y -= 36.0f;
-            };
-
-            auto inputRow = [&](
-                std::string caption,
-                std::string value,
-                std::string filter,
-                std::function<void(std::string const&)> callback
-            ) {
-                auto* label = russianLabel(caption, 14.0f);
-                if (label) {
-                    label->setAnchorPoint({0, 0.5f});
-                    label->setPosition({left, y - 15.0f});
-                    fitLabel(label, inner * 0.55f, 28.0f);
-                    content->addChild(label);
-                }
-
-                float inputWidth = inner * 0.39f;
-                auto* input = TextInput::create(inputWidth, "", "bigFont.fnt");
-                if (input) {
-                    input->setFilter(filter);
-                    input->setString(value);
-                    input->setPosition({
-                        right - inputWidth / 2,
-                        y - 15.0f
-                    });
-                    input->setCallback(std::move(callback));
-                    content->addChild(input);
-                }
-                y -= 39.0f;
-            };
-
-            inputRow(
-                "Скорость записи",
-                fmt::format("{:.2f}", s.recordingSpeed),
-                "0123456789.,",
-                [this](std::string const& text) {
-                    double speed = 0.0;
-                    if (!parseSpeed(text, speed)) {
-                        if (m_speedHint)
-                            m_speedHint->setString("Введите число от 0,01 до 2.");
-                        return;
-                    }
-                    state().recordingSpeed = speed;
-                    Mod::get()->setSavedValue("recording-speed", speed);
-                    if (m_speedHint)
-                        m_speedHint->setString("Применено. Воспроизведение — обычная скорость.");
-                    syncAudio();
-                }
-            );
-            m_speedHint = line(
-                "От 0,01 до 2. Воспроизведение — обычная скорость.", 11.0f
-            );
-
-            inputRow(
-                "Темп, шагов/с",
-                std::to_string(s.tps),
-                "0123456789",
-                [this](std::string const& text) {
-                    std::uint32_t tps = 0;
-                    if (!parseUnsigned(text, kMinTPS, kMaxTPS, tps)) {
-                        if (m_tpsHint)
-                            m_tpsHint->setString(
-                                "Допустимо от 30 до 240. Выше 240 шагов в "
-                                "секунду в физике GD не существует."
-                            );
-                        return;
-                    }
-                    if (active() || state().run.pendingStart) {
-                        if (m_tpsHint)
-                            m_tpsHint->setString("Сначала полностью выключите бота.");
-                        return;
-                    }
-                    state().tps = tps;
-                    Mod::get()->setSavedValue(
-                        "physics-tps", static_cast<int>(tps)
-                    );
-                    if (m_tpsHint)
-                        m_tpsHint->setString(
-                            tps == kNativeTPS
-                                ? "240 = обычная скорость уровня."
-                                : "Замедление: уровень идёт медленнее, макрос "
-                                  "всё равно хранится в нативных шагах 1/240."
-                        );
-                }
-            );
-            m_tpsHint = line(
-                "240 = обычная скорость, меньше — замедление. Макрос хранится "
-                "в нативных шагах 1/240 и от темпа не зависит.",
-                11.0f
-            );
-
-            inputRow(
-                "Размер шага",
-                std::to_string(s.frameSize),
-                "0123456789",
-                [](std::string const& text) {
-                    std::uint32_t value = 0;
-                    if (parseUnsigned(text, 1, 10000, value)) {
-                        state().frameSize = value;
-                        Mod::get()->setSavedValue(
-                            "frame-size", static_cast<int>(value)
-                        );
-                    }
-                }
-            );
-
-            line(
-                "Назад недоступно: не подтверждено полное восстановление "
-                "случайности, триггеров и анимаций. Звук в покадровом режиме "
-                "приостановлен; после него может понадобиться перезапуск.",
-                11.0f
-            );
-
-            inputRow(
-                "Имя макроса",
-                s.fileStem,
-                "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_- ",
-                [](std::string const& text) {
-                    state().fileStem = text;
-                }
-            );
-            line("Имя файла: латиница, цифры, пробел, дефис и подчёркивание.", 11.0f);
-
-            pairButtons(
-                "Сохранить", [] { saveBuffer(); },
-                "Очистить буфер", [] {
-                    ask(
-                        "Удалить макрос из буфера? Файлы в папке останутся.",
-                        {
-                            {"Очистить", [] {
-                                stopNow(true);
-                                state().buffer = Macro{};
-                                state().hasBuffer = false;
-                                changed();
-                            }},
-                            {"Отмена", [] {}}
-                        }
-                    );
-                }
-            );
-
-            line("Папка макросов", 15.0f);
-            line(
-                s.directory.empty()
-                    ? "Папка не выбрана или недоступна."
-                    : shorten(pathText(s.directory), 150),
-                11.0f
-            );
-
-            pairButtons(
-                "Выбрать папку", [] { chooseFolder(); },
-                "Папка мода", [] { useModFolder(); }
-            );
-
-            line(
-                "Выбранная папка проверяется записью тестового файла. "
-                "На Android доступ зависит от системы.",
-                11.0f
-            );
-
-            pairButtons(
-                "Обновить список", [] { changed(); },
-                "Ограничения", [] {
-                    ask(
-                        "Запись и запуск — с начала уровня. Шаг макроса = "
-                        "нативный шаг физики 1/240 c; темп меняет только "
-                        "скорость проигрывания, не единицы записи.\n"
-                        "Живой ввод при воспроизведении заблокирован по "
-                        "умолчанию: случайное нажатие поверх макроса "
-                        "расходится с записью и роняет прогон.\n"
-                        "Чекпоинты practice-режима восстанавливаются; "
-                        "чекпоинты от триггеров уровня — нет, они создаются "
-                        "внутри шага.\n"
-                        "Диагностика в статусе: хуков/тик 1, drift 0, "
-                        "без хука 0, потери 0. «без шага» растёт в интро "
-                        "уровня и после паузы — это норма, номер шага при "
-                        "этом не сжигается.\n"
-                        "Шаг назад отключён. Отправка результатов и прогресса "
-                        "не изменяется.",
-                        {{"Понятно", [] {}}}
-                    );
-                }
-            );
-
-            line("Макросы", 16.0f);
-
-            if (files.empty())
-                line("В папке нет файлов макросов.", 12.0f);
-
-            for (auto const& path : files) {
-                auto* name = russianLabel(
-                    shorten(pathText(path.filename()), 75), 12.0f
-                );
-                if (name) {
-                    name->setAnchorPoint({0, 0.5f});
-                    name->setPosition({left, y - 7.0f});
-                    fitLabel(name, inner, 19.0f);
-                    content->addChild(name);
-                }
-
-                float buttonWidth = (inner - 12.0f) / 3.0f;
-                float buttonY = y - 32.0f;
-
-                textButton(
-                    menu, "Загрузить",
-                    {left + buttonWidth / 2, buttonY},
-                    {buttonWidth, 25.0f},
-                    [path] { loadFile(path); }
-                );
-                textButton(
-                    menu, "Играть",
-                    {left + buttonWidth * 1.5f + 6.0f, buttonY},
-                    {buttonWidth, 25.0f},
-                    [path] {
-                        if (loadFile(path))
-                            requestStart(Mode::Playback);
-                    }
-                );
-                textButton(
-                    menu, "Удалить",
-                    {right - buttonWidth / 2, buttonY},
-                    {buttonWidth, 25.0f},
-                    [path] { deleteFile(path); }
-                );
-                y -= 62.0f;
-            }
-
-            if (files.size() == kListLimit)
-                line("Показаны первые 128 файлов.", 11.0f);
-
-            if (y < 12.0f) {
-                float extra = 12.0f - y;
-                auto* children = content->getChildren();
-                if (children) {
-                    for (unsigned i = 0; i < children->count(); ++i) {
-                        auto* child = static_cast<CCNode*>(
-                            children->objectAtIndex(i)
-                        );
-                        child->setPositionY(child->getPositionY() + extra);
-                    }
-                }
-                content->setContentSize({width, contentHeight + extra});
-                contentHeight += extra;
-            }
-
-            float maxOffset = std::max(0.0f, contentHeight - viewHeight);
-            if (firstBuild) {
-                m_scroll->scrollToTop();
-            }
-            else {
-                content->setPositionY(-m_scrollRatio * maxOffset);
-            }
-            m_revision = s.uiRevision;
-        }
-
-        bool build() {
-            if (!m_box)
-                return false;
-
-            auto size = m_box->getContentSize();
-
-            auto* title = russianLabel("Бот", 24.0f);
-            auto* status = russianLabel("", 11.0f);
-            if (!title || !status)
-                return false;
-
-            title->setPosition({size.width / 2, size.height - 23.0f});
-            m_box->addChild(title);
-
-            m_status = status;
-            m_status->setPosition({size.width / 2, size.height - 48.0f});
-            m_box->addChild(m_status);
-
-            auto* closeMenu = ModalMenu::create();
-            if (!closeMenu)
-                return false;
-
-            closeMenu->setPosition({0, 0});
-            m_box->addChild(closeMenu);
-
-            textButton(
-                closeMenu,
-                "Закрыть",
-                {size.width - 36.0f, size.height - 20.0f},
-                {60.0f, 26.0f},
-                [this] { close(); }
-            );
-            buildFixedControls();
-            rebuild();
-            scheduleUpdate();
-            return true;
-        }
-
-    public:
-        void onEnter() override {
-            ModalLayer::onEnter();
-        }
-
-        void onExit() override {
-            ModalLayer::onExit();
-        }
-
-        void update(float) override {
-            if (!m_box || !m_status)
-                return;
-
-            auto const& s = state();
-            auto const& r = s.run;
-            if (m_revision != s.uiRevision) {
-                if (m_scroll && m_scroll->m_contentLayer) {
-                    auto* content = m_scroll->m_contentLayer;
-                    float contentHeight = content->getContentSize().height;
-                    float viewHeight = m_scroll->getContentSize().height;
-                    float maxOffset = std::max(0.0f, contentHeight - viewHeight);
-                    m_scrollRatio = maxOffset > 0.0f
-                        ? std::clamp(-content->getPositionY() / maxOffset, 0.0f, 1.0f)
-                        : 0.0f;
-                }
-                rebuild();
-                refreshFixedButtons();
-            }
-            std::string mode =
-                r.pendingStart ? "Ожидание выхода из паузы" :
-                r.mode == Mode::Record ? "Запись" :
-                r.mode == Mode::Playback ? "Воспроизведение" :
-                r.frameMode ? "Покадровый режим" : "Выключен";
-
-            auto const& t = r.telemetry;
-            // Здоровые значения: хуков/тик 1, drift 0, без хука 0, потери 0.
-            // «без шага» растёт в интро уровня и после паузы — это нормально,
-            // номер шага при этом не сжигается.
-            // «темп» — сколько шагов физики в реальную секунду сейчас даёт
-            // бот. При записи это Темп × Скорость записи. Если число маленькое
-            // (единицы-десятки), уровень визуально стоит — это не баг запуска,
-            // а настройка скорости.
-            double const rate = static_cast<double>(s.tps) *
-                (r.mode == Mode::Record ? s.recordingSpeed : 1.0);
-
-            auto text = fmt::format(
-                "{} · шаг {} · темп {:.0f} · соб. {} · хуков/тик {} · drift {} · "
-                "без хука {} · без шага {} · потери {}",
-                mode,
-                r.step,
-                rate,
-                s.hasBuffer ? s.buffer.actions.size() : 0,
-                t.maxCommandsPerTick,
-                t.nativeStepDrift,
-                t.stepsNoHook,
-                t.ticksWithoutStep,
-                t.macroEventsDropped
-            );
-            m_status->setString(text.c_str());
-            fitLabel(
-                m_status, m_box->getContentSize().width - 40.0f, 18.0f
-            );
-        }
-
-        static BotPopup* create() {
-            auto area = safeRect();
-            auto* popup = new BotPopup;
-
-            float width = std::min(500.0f, area.size.width);
-            float height = std::min(360.0f, area.size.height);
-
-            if (!popup->initModal(width, height)) {
-                delete popup;
-                return nullptr;
-            }
-
-            if (!popup->build()) {
-                delete popup;
-                return nullptr;
-            }
-
-            popup->autorelease();
-            return popup;
-        }
-    };
-
-    void openPanel() {
-        ensureConfiguration();
-        auto const& r = state().run;
-        if (!r.play || !r.play->m_isPaused) {
-            showNotice("Панель открывается только из меню паузы.", true);
-            return;
-        }
-
-        if (auto* popup = BotPopup::create()) {
-            popup->present();
-        }
-    }
-
-    class DraggableLauncher final : public CCLayer {
-        CCNode* m_box = nullptr;
-        CCPoint m_start;
-        CCPoint m_offset;
-        bool m_dragged = false;
-        int m_touchID = -1;
-
-        CCPoint clampPosition(CCPoint position) const {
-            auto area = safeRect();
-            constexpr float halfWidth = 27.0f;
-            constexpr float halfHeight = 16.0f;
-
-            position.x = std::clamp(
-                position.x,
-                area.origin.x + halfWidth,
-                area.origin.x + area.size.width - halfWidth
-            );
-            position.y = std::clamp(
-                position.y,
-                area.origin.y + halfHeight,
-                area.origin.y + area.size.height - halfHeight
-            );
-            return position;
-        }
-
-        void savePosition() {
-            if (!m_box)
-                return;
-
-            auto area = safeRect();
-            auto position = m_box->getPosition();
-
-            double x = (position.x - area.origin.x) / area.size.width;
-            double y = (position.y - area.origin.y) / area.size.height;
-
-            Mod::get()->setSavedValue("launcher-x", std::clamp(x, 0.0, 1.0));
-            Mod::get()->setSavedValue("launcher-y", std::clamp(y, 0.0, 1.0));
-        }
-
-    public:
-        static DraggableLauncher* create() {
-            auto* layer = new DraggableLauncher;
-            if (!layer->init()) {
-                delete layer;
-                return nullptr;
-            }
-
-            layer->setTouchEnabled(true);
-            layer->setContentSize(
-                CCDirector::sharedDirector()->getWinSize()
-            );
-
-            layer->m_box = CCNode::create();
-            if (!layer->m_box) {
-                delete layer;
-                return nullptr;
-            }
-
-            layer->m_box->setContentSize({54.0f, 32.0f});
-            layer->m_box->setAnchorPoint({0.5f, 0.5f});
-            layer->addChild(layer->m_box);
-
-            auto* background = CCLayerColor::create(
-                {38, 78, 120, 245}, 54.0f, 32.0f
-            );
-            if (background)
-                layer->m_box->addChild(background);
-
-            auto* label = russianLabel("Бот", 16.0f);
-            if (label) {
-                label->setPosition({27.0f, 16.0f});
-                layer->m_box->addChild(label);
-            }
-
-            auto area = safeRect();
-            double x = Mod::get()->getSavedValue<double>("launcher-x", 0.0);
-            double y = Mod::get()->getSavedValue<double>("launcher-y", 0.5);
-            if (!std::isfinite(x)) x = 0.0;
-            if (!std::isfinite(y)) y = 0.5;
-
-            layer->m_box->setPosition(layer->clampPosition({
-                area.origin.x + static_cast<float>(std::clamp(x, 0.0, 1.0)) *
-                                    area.size.width,
-                area.origin.y + static_cast<float>(std::clamp(y, 0.0, 1.0)) *
-                                    area.size.height
-            }));
-
-            layer->autorelease();
-            return layer;
-        }
-
-        void registerWithTouchDispatcher() override {
-            CCDirector::sharedDirector()->getTouchDispatcher()
-                ->addTargetedDelegate(this, -600, true);
-        }
-
-        bool ccTouchBegan(CCTouch* touch, CCEvent*) override {
-            auto const& s = state();
-            if (s.modalCount > 0 || !s.run.play ||
-                !s.run.play->m_isPaused || m_touchID != -1 || !m_box) {
-                return false;
-            }
-
-            auto point = convertToNodeSpace(touch->getLocation());
-            if (!m_box->boundingBox().containsPoint(point))
-                return false;
-
-            m_touchID = touch->getID();
-            m_start = point;
-            m_offset = point - m_box->getPosition();
-            m_dragged = false;
-            return true;
-        }
-
-        void ccTouchMoved(CCTouch* touch, CCEvent*) override {
-            if (touch->getID() != m_touchID || !m_box)
-                return;
-
-            auto point = convertToNodeSpace(touch->getLocation());
-            if (std::hypot(point.x - m_start.x, point.y - m_start.y) > 6.0f)
-                m_dragged = true;
-
-            if (m_dragged)
-                m_box->setPosition(clampPosition(point - m_offset));
-        }
-
-        void ccTouchEnded(CCTouch* touch, CCEvent*) override {
-            if (touch->getID() != m_touchID)
-                return;
-
-            m_touchID = -1;
-            if (m_dragged)
-                savePosition();
-            else
-                openPanel();
-        }
-
-        void ccTouchCancelled(CCTouch*, CCEvent*) override {
-            if (m_dragged)
-                savePosition();
-            m_touchID = -1;
-        }
-    };
-
-    class FrameControls final : public CCLayer {
-        PlayLayer* m_owner = nullptr;
-        CCMenu* m_menu = nullptr;
-        CCLabelTTF* m_hint = nullptr;
-
-    public:
-        static FrameControls* create(PlayLayer* owner) {
-            auto* layer = new FrameControls;
-            if (!layer->init()) {
-                delete layer;
-                return nullptr;
-            }
-
-            layer->m_owner = owner;
-            layer->m_menu = CCMenu::create();
-            if (!layer->m_menu) {
-                delete layer;
-                return nullptr;
-            }
-
-            layer->m_menu->setPosition({0, 0});
-            layer->addChild(layer->m_menu);
-
-            auto area = safeRect();
-            float x = area.origin.x + 46.0f;
-            float y = area.origin.y + area.size.height / 2;
-
-            textButton(
-                layer->m_menu, "Вправо",
-                {x, y + 22.0f}, {88.0f, 30.0f},
-                [] { advanceFrames(); }
-            );
-
-            textButton(
-                layer->m_menu, "Влево",
-                {x, y - 16.0f}, {88.0f, 30.0f},
-                [] {}, false
-            );
-
-            layer->m_hint = russianLabel(
-                "Назад недоступно", 10.0f
-            );
-            if (layer->m_hint) {
-                layer->m_hint->setPosition({x, y - 42.0f});
-                layer->addChild(layer->m_hint);
-            }
-
-            layer->scheduleUpdate();
-            layer->setVisible(false);
-            layer->m_menu->setEnabled(false);
-            layer->autorelease();
-            return layer;
-        }
-
-        void update(float) override {
-            auto const& r = state().run;
-            bool visible = m_owner &&
-                           r.play == m_owner &&
-                           r.frameMode &&
-                           !m_owner->m_isPaused;
-
-            setVisible(visible);
-            if (m_menu)
-                m_menu->setEnabled(visible && !r.dead);
-        }
-    };
-
-    void pumpUI() {
-        auto& s = state();
-
-        if (!s.notices.empty()) {
-            auto messages = std::move(s.notices);
-            s.notices.clear();
-            for (auto const& notice : messages)
-                showNotice(notice.text, notice.warning);
-        }
-
-        if (s.deathQuestion && s.modalCount == 0) {
-            s.deathQuestion = false;
-            auto session = s.deathQuestionSession;
-
-            ask(
-                "Запись остановлена, макрос остался в буфере.\n"
-                "Его можно сохранить или начать новую запись с начала уровня.",
-                {
-                    {"Сохранить буфер", [] { saveBuffer(); }},
-                    {"Новая запись", [session] {
-                        if (state().run.play &&
-                            state().run.session == session) {
-                            requestStart(Mode::Record);
-                        }
-                    }}
-                }
-            );
+    inline void onFrameStart() {
+        PlayLayer* pl = PlayLayer::get();
+        CCNode* par = nullptr;
+        bool idle = !pl
+            || !(par = pl->getParent())
+            || par->getChildByType<PauseLayer>(0)
+            || pl->getChildByType<EndLevelLayer>(0);
+
+        setTimeScale((mode == Mode::Record && !idle) ? static_cast<float>(recSpeed) : 1.0f);
+
+        if (mode == Mode::Off) return;
+
+        if (idle) {
+            pendingRecordInputs.clear();
+            g_stepStartTime = 0.0;
         }
     }
 }
 
-class $modify(GDBotBaseLayer, GJBaseGameLayer) {
-    static void onModify(auto& self) {
-        // getModifiedDelta — последним, чтобы наше значение было итоговым.
-        if (!self.setHookPriorityPost(
-                "GJBaseGameLayer::getModifiedDelta", Priority::Last)) {
-            log::warn("Не удалось установить последний приоритет getModifiedDelta.");
-        }
-        // Хуки шага — первыми, чтобы забрать ввод до нативной обработки.
-        if (!self.setHookPriorityPre(
-                "GJBaseGameLayer::processCommands", Priority::First)) {
-            log::warn("Не удалось установить приоритет processCommands.");
-        }
-        if (!self.setHookPriorityPre(
-                "GJBaseGameLayer::processQueuedButtons", Priority::First)) {
-            log::warn("Не удалось установить приоритет processQueuedButtons.");
-        }
-        if (!self.setHookPriorityPre(
-                "GJBaseGameLayer::handleButton", Priority::First)) {
-            log::warn("Не удалось установить приоритет handleButton.");
-        }
-    }
-
-    double getModifiedDelta(float dt) {
-        auto const& r = gdbot::state().run;
-
-        // Нативный getModifiedDelta не вызываем: он работает с m_extraDelta,
-        // а аккумулятором владеем мы (r.debt) и обнуляем m_extraDelta каждый
-        // тик. Лишний вызов давал бы двойной учёт остатка.
-        if (r.forceOneStep && gdbot::controls(this))
-            return static_cast<double>(r.forcedDelta);
-
-        return GJBaseGameLayer::getModifiedDelta(dt);
-    }
-
+// ---------------------------------------------------------------------------
+// Эффект волны смерти
+// ---------------------------------------------------------------------------
+class $modify(BotCircleWave, CCCircleWave) {
     void update(float dt) {
-        gdbot::driveUpdate(this, dt, [this](float fixedDelta) {
-            GJBaseGameLayer::update(fixedDelta);
-        });
-        gdbot::pumpUI();
-    }
-
-    void processCommands(float dt, bool isHalfTick, bool isLastTick) {
-        auto& r = gdbot::state().run;
-        bool tracked = gdbot::controls(this) && r.inTick;
-
-        if (tracked) {
-            ++r.commandCalls;
-            ++r.telemetry.commandsCalls;
-            gdbot::onStepHook(this, true);
-        }
-
-        GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
-
-        if (tracked) {
-            r.commandsDone = true;
-            r.afterCommands = gdbot::physicsStamp();
-        }
-    }
-
-    void processQueuedButtons(float dt, bool clearInputQueue) {
-        auto& r = gdbot::state().run;
-
-        if (!gdbot::controls(this)) {
-            GJBaseGameLayer::processQueuedButtons(dt, clearInputQueue);
+        if (bot::disableDeathEffects && bot::mode != bot::Mode::Off) {
+            this->setVisible(false);
             return;
         }
-
-        if (r.inTick) {
-            ++r.queuedCalls;
-            ++r.telemetry.queuedCalls;
-            // Если processCommands в этом шаге не вызывался — разбираем здесь.
-            gdbot::onStepHook(this, false);
-        }
-        else if (r.resetDepth || r.loadDepth || r.injecting ||
-                 r.pauseGuard || r.paused ||
-                 (r.play && r.play->m_isPaused) || r.dead) {
-            m_queuedButtons.clear();
-            return;
-        }
-        else {
-            // Вне шага: переносим на следующий шаг, а не применяем сразу.
-            gdbot::deferQueued(this);
-        }
-
-        // Очередь уже разобрана нами; нативная обработка пустой очереди
-        // сохраняет штатный bookkeeping игры.
-        GJBaseGameLayer::processQueuedButtons(dt, clearInputQueue);
-        m_queuedButtons.clear();
+        CCCircleWave::update(dt);
     }
+};
 
-    void handleButton(bool down, int button, bool isPlayer1) {
-        auto& r = gdbot::state().run;
+// ---------------------------------------------------------------------------
+// Контроллер планировщика
+// ---------------------------------------------------------------------------
+class $modify(BotScheduler, CCScheduler) {
+    void update(float dt) {
+        bot::onFrameStart();
+        CCScheduler::update(dt);
+        bot::updateAudioPitch();
+    }
+};
 
-        if (!gdbot::controls(this) || r.injecting ||
-            r.resetDepth || r.loadDepth) {
+// ---------------------------------------------------------------------------
+// Перехват нажатий.
+// FIX: сигнатура handleButton в 2.2081 — (bool, PlayerButton, bool)
+// ---------------------------------------------------------------------------
+class $modify(BotBaseGameLayer, GJBaseGameLayer) {
+    void handleButton(bool down, PlayerButton button, bool isPlayer1) {
+        using namespace bot;
+
+        if (mode == Mode::Off || silent > 0 || !isPlayLayer(this)) {
             GJBaseGameLayer::handleButton(down, button, isPlayer1);
             return;
         }
 
-        if (r.pauseGuard || r.paused ||
-            (r.play && r.play->m_isPaused) || r.dead) {
-            ++r.telemetry.droppedButtons;
+        if (applying > 0) {
+            GJBaseGameLayer::handleButton(down, button, isPlayer1);
             return;
         }
 
-        if (!r.inTick) {
-            // Вне шага: событие принадлежит следующему шагу.
-            gdbot::deferInput(down, button, !isPlayer1);
+        if (mode == Mode::Record) {
+            recordRawInput(static_cast<int>(button), down, isPlayer1, getCurrentTimestamp());
             return;
         }
 
-        // Прямой вызов внутри шага, мимо нативной очереди.
-        ++r.telemetry.directButtons;
-        gdbot::noteDirectInput(down, button, !isPlayer1);
-
-        if (r.mode == gdbot::Mode::Playback && gdbot::state().blockInput) {
-            ++r.telemetry.droppedButtons;
-            return;
-        }
-
-        GJBaseGameLayer::handleButton(down, button, isPlayer1);
+        // Mode::Play: реальный ввод игрока игнорируем
     }
 };
-class $modify(GDBotPlayLayer, PlayLayer) {
+
+// ---------------------------------------------------------------------------
+// Нарезка подтиков игрока
+// ---------------------------------------------------------------------------
+class $modify(BotPlayerObject, PlayerObject) {
+    void playSpawnEffect() {
+        this->setVisible(true);
+        if (bot::disableDeathEffects && bot::mode != bot::Mode::Off) {
+            return;
+        }
+        PlayerObject::playSpawnEffect();
+    }
+
+    void playDeathEffect() {
+        if (bot::disableDeathEffects && bot::mode != bot::Mode::Off) {
+            return;
+        }
+        PlayerObject::playDeathEffect();
+    }
+
+    void update(float stepDelta) {
+        using namespace bot;
+        auto pl = PlayLayer::get();
+        if (!pl || midStep) {
+            PlayerObject::update(stepDelta);
+            return;
+        }
+
+        if (stepDelta <= 1e-9f) {
+            PlayerObject::update(stepDelta);
+            return;
+        }
+
+        if (mode == Mode::Off) {
+            PlayerObject::update(stepDelta);
+            if (this == pl->m_player1) ++step;
+            return;
+        }
+
+        if (this != pl->m_player1) {
+            if (!inputThisStep || this != pl->m_player2) {
+                PlayerObject::update(stepDelta);
+            }
+            return;
+        }
+
+        uint32_t const cur = step;
+        std::vector<StepSub> subs;
+
+        float const scale = (appliedScale > 0.0001f) ? appliedScale : 1.0f;
+        double const stepDuration = static_cast<double>(stepDelta) / static_cast<double>(scale);
+        double const now = getCurrentTimestamp();
+
+        if (g_stepStartTime <= 0.0 || (now - g_stepStartTime) > (stepDuration * 4.0)) {
+            g_stepStartTime = now - stepDuration;
+        }
+
+        double const stepStartTime = g_stepStartTime;
+        double const stepEndTime = stepStartTime + stepDuration;
+
+        if (mode == Mode::Play) {
+            while (playIndex < macro.size() && macro[playIndex].step <= cur) {
+                auto const& a = macro[playIndex++];
+                StepSub s;
+                s.button = a.button;
+                s.push = a.down;
+                s.p1 = a.p1;
+                s.frac = (a.step < cur) ? 0.0 : std::clamp(a.frac, 0.0, 1.0);
+                subs.push_back(s);
+            }
+        }
+        else { // Record
+            std::vector<RawInput> remaining;
+            for (auto const& in : pendingRecordInputs) {
+                if (in.timestamp <= stepEndTime) {
+                    StepSub s;
+                    s.button = in.button;
+                    s.push = in.push;
+                    s.p1 = in.p1;
+
+                    double rel = in.timestamp - stepStartTime;
+                    s.frac = std::clamp(rel / stepDuration, 0.0, 0.9999);
+                    subs.push_back(s);
+
+                    Action a;
+                    a.step = cur;
+                    a.frac = s.frac;
+                    a.button = static_cast<uint8_t>(s.button);
+                    a.down = s.push;
+                    a.p1 = s.p1;
+                    macro.push_back(a);
+                }
+                else {
+                    remaining.push_back(in);
+                }
+            }
+            pendingRecordInputs = std::move(remaining);
+        }
+
+        inputThisStep = !subs.empty();
+
+        if (subs.empty()) {
+            p1Split = false;
+            p2Split = false;
+            PlayerObject::update(stepDelta);
+            g_stepStartTime = stepEndTime;
+            ++step;
+            return;
+        }
+
+        std::stable_sort(subs.begin(), subs.end(), [](auto const& a, auto const& b) {
+            return a.frac < b.frac;
+        });
+
+        for (size_t i = 1; i < subs.size(); ++i) {
+            if (subs[i].frac <= subs[i - 1].frac + 1e-5) {
+                subs[i].frac = std::min(0.9999, subs[i - 1].frac + 1e-5);
+            }
+        }
+
+        PlayerObject* p2 = pl->m_player2;
+        bool isDual = pl->m_gameState.m_isDualMode;
+        bool p1StartedOnGround = this->m_isOnGround;
+        bool p2StartedOnGround = p2 ? p2->m_isOnGround : false;
+
+        p1Pos = PlayerObject::getPosition();
+        p2Pos = p2 ? p2->getPosition() : CCPoint{ 0.f, 0.f };
+
+        p1Split = true;
+        p2Split = isDual && (p2 != nullptr);
+
+        midStep = true;
+        double lastFrac = 0.0;
+
+        for (size_t i = 0; i < subs.size(); ++i) {
+            auto const& s = subs[i];
+            double subFactor = std::max(0.0, s.frac - lastFrac);
+            float substepDelta = static_cast<float>(stepDelta * subFactor);
+            rotationDelta = substepDelta;
+
+            if (substepDelta > 1e-9f) {
+                PlayerObject::update(substepDelta);
+                if (i == 0 && ((this->m_yVelocity < 0) ^ this->m_isUpsideDown)) this->m_isOnGround = p1StartedOnGround;
+                // FIX: для P1 третий параметр checkCollisions должен быть false (isPlayer2)
+                pl->checkCollisions(this, substepDelta, false);
+                PlayerObject::updateRotation(substepDelta);
+
+                if (p2Split && p2) {
+                    p2->update(substepDelta);
+                    if (i == 0 && ((p2->m_yVelocity < 0) ^ p2->m_isUpsideDown)) p2->m_isOnGround = p2StartedOnGround;
+                    pl->checkCollisions(p2, substepDelta, true);
+                    p2->updateRotation(substepDelta);
+                }
+            }
+
+            applyInput(pl, s, cur, s.frac);
+            lastFrac = s.frac;
+        }
+
+        double remainingFactor = std::max(0.0, 1.0 - lastFrac);
+        float remainingDelta = static_cast<float>(stepDelta * remainingFactor);
+        rotationDelta = remainingDelta;
+
+        if (remainingDelta > 1e-9f) {
+            PlayerObject::update(remainingDelta);
+            // FIX: P1 -> false
+            pl->checkCollisions(this, remainingDelta, false);
+            PlayerObject::updateRotation(remainingDelta);
+
+            if (p2Split && p2) {
+                p2->update(remainingDelta);
+                pl->checkCollisions(p2, remainingDelta, true);
+                p2->updateRotation(remainingDelta);
+            }
+        }
+
+        midStep = false;
+        // FIX: сбрасываем флаги split после завершения шага,
+        // иначе updateRotation может применить устаревший rotationDelta
+        p1Split = false;
+        p2Split = false;
+        g_stepStartTime = stepEndTime;
+        ++step;
+    }
+
+    void updateRotation(float t) {
+        auto pl = PlayLayer::get();
+        if (pl && bot::mode != bot::Mode::Off && !bot::midStep) {
+            if (this == pl->m_player1 && bot::p1Split) {
+                PlayerObject::updateRotation(bot::rotationDelta);
+                if (!this->m_isDart) this->m_lastPosition = bot::p1Pos;
+                return;
+            }
+            if (this == pl->m_player2 && bot::p2Split) {
+                PlayerObject::updateRotation(bot::rotationDelta);
+                if (!this->m_isDart) this->m_lastPosition = bot::p2Pos;
+                return;
+            }
+        }
+        PlayerObject::updateRotation(t);
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Контроллер уровня и чекпоинтов
+// ---------------------------------------------------------------------------
+class $modify(BotPlayLayer, PlayLayer) {
     bool init(GJGameLevel* level, bool useReplay, bool dontCreateObjects) {
-        if (!PlayLayer::init(level, useReplay, dontCreateObjects))
-            return false;
+        bot::mode = bot::Mode::Off;
+        bot::step = 0;
+        bot::playIndex = 0;
+        bot::checkpoints.clear();
+        bot::resetEngine();
+        // FIX: принудительно сбрасываем timescale и питч, чтобы не унаследовать
+        // состояние от предыдущей инициализации PlayLayer
+        bot::setTimeScale(1.0f);
+        bot::restoreAudioPitch();
 
-        gdbot::attach(this, level);
+        if (!PlayLayer::init(level, useReplay, dontCreateObjects)) return false;
 
-        if (auto* controls = gdbot::FrameControls::create(this))
-            this->addChild(controls, 10000);
+        if (auto mod = Mod::get()) {
+            bot::disableDeathEffects = mod->getSavedValue<bool>("disableDeathEffects", true);
+        }
 
+        bot::applyClickFlags();
+
+        if (Loader::get()->isModLoaded("syzzi.click_between_frames")) {
+            Notification::create("Disable Click Between Frames mod: it conflicts with the bot", NotificationIcon::Warning, 4.f)->show();
+        }
         return true;
     }
 
-    CheckpointObject* createCheckpoint() {
-        auto* checkpoint = PlayLayer::createCheckpoint();
-
-        if (checkpoint && gdbot::owns(this) && gdbot::active()) {
-            auto& r = gdbot::state().run;
-            if (r.checkpoints.size() > 4096)
-                gdbot::pruneCheckpoints();
-            r.checkpoints[checkpoint] = gdbot::captureCheckpointData();
-        }
-        return checkpoint;
-    }
-
-    CheckpointObject* markCheckpoint() {
-        auto& r = gdbot::state().run;
-        // Откладываем на границу шага в ЛЮБОЙ момент внутри тика, а не только
-        // до processCommands. Иначе чекпоинт, запрошенный во второй половине
-        // шага, снимался бы посреди шага, captureCheckpointData() помечала бы
-        // его небезопасным (inTick == true), восстановление отказывало — и в
-        // practice-режиме это означало конец прогона вместо респавна.
-        //
-        // Возврат nullptr безопасен: practice-ветка идёт через
-        // queueCheckpoint()/m_tryPlaceCheckpoint и результат не разыменовывает.
-        // Отложенный вызов выполняется в driveUpdate под флагом drainingMark,
-        // уже после commitStep(), поэтому снапшот попадает ровно на границу
-        // шага и nextStep согласован.
-        if (gdbot::owns(this) && gdbot::active() &&
-            r.inTick && !r.drainingMark) {
-            r.markPending = true;
-            return nullptr;
-        }
-
-        return PlayLayer::markCheckpoint();
-    }
-
-    void storeCheckpoint(CheckpointObject* checkpoint) {
-        PlayLayer::storeCheckpoint(checkpoint);
-
-        if (gdbot::owns(this) && gdbot::active()) {
-            auto& r = gdbot::state().run;
-            if (checkpoint && !r.checkpoints.contains(checkpoint))
-                r.checkpoints[checkpoint] = gdbot::captureCheckpointData();
-            gdbot::pruneCheckpoints();
-        }
-    }
-
-    void removeCheckpoint(bool first) {
-        PlayLayer::removeCheckpoint(first);
-        if (gdbot::owns(this))
-            gdbot::pruneCheckpoints();
-    }
-
-    void loadFromCheckpoint(CheckpointObject* checkpoint) {
-        auto& r = gdbot::state().run;
-        bool tracked = gdbot::owns(this);
-        auto session = r.session;
-        std::optional<gdbot::CheckpointData> data;
-
-        if (tracked) {
-            auto found = r.checkpoints.find(checkpoint);
-            if (found != r.checkpoints.end())
-                data = found->second;
-            ++r.loadDepth;
-        }
-
-        PlayLayer::loadFromCheckpoint(checkpoint);
-
-        if (!tracked || !gdbot::owns(this) || r.session != session)
-            return;
-
-        --r.loadDepth;
-
-        if (r.resetDepth > 0) {
-            r.loadedDuringReset = true;
-            r.restoreAfterReset = data;
-        }
-        else if (gdbot::active()) {
-            gdbot::restoreCheckpointData(data);
-            if (!r.inTick)
-                gdbot::flushStop();
-        }
+    void onQuit() {
+        bot::setTimeScale(1.0f);
+        bot::restoreAudioPitch();
+        bot::resetEngine();
+        PlayLayer::onQuit();
     }
 
     void resetLevel() {
-        bool tracked = gdbot::owns(this);
-        auto session = gdbot::state().run.session;
-        if (tracked)
-            gdbot::resetBegin();
-
+        bot::cpLoaded = false;
         PlayLayer::resetLevel();
+        bot::resetEngine();
+        bot::updateAudioPitch();
 
-        if (tracked && gdbot::owns(this) &&
-            gdbot::state().run.session == session) {
-            gdbot::resetEnd();
-        }
+        if (this->m_player1) this->m_player1->setVisible(true);
+        if (this->m_player2) this->m_player2->setVisible(true);
+
+        if (bot::cpLoaded) return;
+
+        bot::step = 0;
+        bot::playIndex = 0;
+        bot::checkpoints.clear();
+        if (bot::mode == bot::Mode::Record) bot::macro.clear();
+        if (bot::mode != bot::Mode::Off) bot::silentReleaseAll(this);
     }
 
-    void resetLevelFromStart() {
-        bool tracked = gdbot::owns(this);
-        auto session = gdbot::state().run.session;
-        if (tracked)
-            gdbot::resetBegin();
-
-        PlayLayer::resetLevelFromStart();
-
-        if (tracked && gdbot::owns(this) &&
-            gdbot::state().run.session == session) {
-            gdbot::resetEnd();
-        }
+    CheckpointObject* createCheckpoint() {
+        auto cp = PlayLayer::createCheckpoint();
+        if (cp) bot::checkpoints[cp] = bot::step;
+        return cp;
     }
 
-    void destroyPlayer(PlayerObject* player, GameObject* object) {
-        PlayLayer::destroyPlayer(player, object);
+    void loadFromCheckpoint(CheckpointObject* cp) {
+        PlayLayer::loadFromCheckpoint(cp);
+        bot::cpLoaded = true;
+        bot::resetEngine();
+        bot::updateAudioPitch();
 
-        if (gdbot::owns(this) && this->m_playerDied)
-            gdbot::onDeath();
-    }
+        if (this->m_player1) this->m_player1->setVisible(true);
+        if (this->m_player2) this->m_player2->setVisible(true);
 
-    void pauseGame(bool value) {
-        bool tracked = gdbot::owns(this);
-        auto session = gdbot::state().run.session;
-
-        if (tracked) {
-            auto& r = gdbot::state().run;
-            r.pauseGuard = true;
-            r.paused = true;
-            gdbot::restoreAudio();
+        auto it = bot::checkpoints.find(cp);
+        if (it == bot::checkpoints.end()) {
+            bot::step = 0;
+            bot::playIndex = 0;
+            if (bot::mode != bot::Mode::Off) {
+                bot::setMode(bot::Mode::Off);
+                Notification::create("Bot: unknown checkpoint, OFF", NotificationIcon::Warning)->show();
+            }
+            return;
         }
 
-        PlayLayer::pauseGame(value);
+        bot::step = it->second;
+        bot::g_stepStartTime = 0.0;
+        bot::pendingRecordInputs.clear();
 
-        if (tracked && gdbot::owns(this) &&
-            gdbot::state().run.session == session) {
-            auto& r = gdbot::state().run;
-            r.pauseGuard = false;
-            r.paused = this->m_isPaused;
+        if (bot::mode == bot::Mode::Record) {
+            uint32_t s = bot::step;
+            auto& m = bot::macro;
+            m.erase(
+                std::remove_if(m.begin(), m.end(), [s](bot::Action const& a) { return a.step >= s; }),
+                m.end()
+            );
+            bot::syncPlayback(this);
+        }
+        else if (bot::mode == bot::Mode::Play) {
+            bot::syncPlayback(this);
         }
     }
 
     void levelComplete() {
         PlayLayer::levelComplete();
-
-        if (gdbot::owns(this) && gdbot::active()) {
-            gdbot::requestStop("Уровень завершён. Макрос оставлен в буфере.");
-            gdbot::restoreAudio();
-            if (!gdbot::state().run.inTick)
-                gdbot::flushStop();
+        bot::setTimeScale(1.0f);
+        bot::restoreAudioPitch();
+        if (bot::mode == bot::Mode::Record) {
+            bot::setMode(bot::Mode::Off);
+            Notification::create("Recording stopped: level complete", NotificationIcon::Info)->show();
         }
     }
 
-    void onQuit() {
-        gdbot::detach(this);
-        PlayLayer::onQuit();
+    void destroyPlayer(PlayerObject* player, GameObject* object) {
+        PlayLayer::destroyPlayer(player, object);
     }
 };
 
-class $modify(GDBotPauseLayer, PauseLayer) {
+// ---------------------------------------------------------------------------
+// Интерфейс меню паузы
+// ---------------------------------------------------------------------------
+class $modify(BotPauseLayer, PauseLayer) {
+    struct Fields {
+        CCNode* m_fileListContainer = nullptr;
+        CCLabelBMFont* m_statusLabel = nullptr;
+        ButtonSprite* m_offSprite = nullptr;
+        ButtonSprite* m_recSprite = nullptr;
+        ButtonSprite* m_playSprite = nullptr;
+        ButtonSprite* m_fxSprite = nullptr;
+        TextInput* m_nameInput = nullptr;
+        TextInput* m_speedInput = nullptr;
+        bool m_refreshScheduled = false;
+    };
+
+    void updateStatusUI() {
+        if (m_fields->m_statusLabel) {
+            std::string st = "OFF";
+            if (bot::mode == bot::Mode::Record) st = fmt::format("REC ({} acts)", bot::macro.size());
+            else if (bot::mode == bot::Mode::Play) st = fmt::format("PLAY ({} acts)", bot::macro.size());
+            else if (!bot::macro.empty()) st = fmt::format("OFF ({} acts loaded)", bot::macro.size());
+            m_fields->m_statusLabel->setString(st.c_str());
+        }
+        if (m_fields->m_offSprite) {
+            m_fields->m_offSprite->setColor(bot::mode == bot::Mode::Off ? ccColor3B{ 80, 255, 80 } : ccColor3B{ 255, 255, 255 });
+        }
+        if (m_fields->m_recSprite) {
+            m_fields->m_recSprite->setColor(bot::mode == bot::Mode::Record ? ccColor3B{ 255, 80, 80 } : ccColor3B{ 255, 255, 255 });
+        }
+        if (m_fields->m_playSprite) {
+            m_fields->m_playSprite->setColor(bot::mode == bot::Mode::Play ? ccColor3B{ 80, 200, 255 } : ccColor3B{ 255, 255, 255 });
+        }
+        if (m_fields->m_fxSprite) {
+            m_fields->m_fxSprite->setColor(bot::disableDeathEffects ? ccColor3B{ 255, 180, 80 } : ccColor3B{ 255, 255, 255 });
+        }
+    }
+
+    void refreshMacroListDeferred() {
+        m_fields->m_refreshScheduled = false;
+        this->refreshMacroList();
+    }
+
+    void scheduleRefreshMacroList() {
+        if (m_fields->m_refreshScheduled) return;
+        m_fields->m_refreshScheduled = true;
+        this->runAction(CCSequence::createWithTwoActions(
+            CCDelayTime::create(0.0f),
+            CCCallFunc::create(this, callfunc_selector(BotPauseLayer::refreshMacroListDeferred))
+        ));
+    }
+
+    void refreshMacroList() {
+        if (!m_fields->m_fileListContainer) return;
+        m_fields->m_fileListContainer->removeAllChildren();
+
+        std::vector<std::filesystem::path> files;
+        std::error_code ec;
+        auto dir = bot::getMacroDir();
+        // FIX: ручной обход с error_code — range-based for может бросить на Android
+        std::filesystem::directory_iterator it(dir, ec);
+        std::filesystem::directory_iterator end;
+        for (; !ec && it != end; it.increment(ec)) {
+            std::error_code fec;
+            auto const& entry = *it;
+            if (entry.is_regular_file(fec) && !fec && entry.path().extension() == ".gdbot") {
+                files.push_back(entry.path());
+            }
+        }
+
+        std::sort(files.begin(), files.end(), [](auto const& a, auto const& b) {
+            return a.filename().string() > b.filename().string();
+        });
+
+        float viewW = 160.0f;
+        float viewH = 100.0f;
+        float rowH = 22.0f;
+        float totalH = std::max(viewH, static_cast<float>(files.size()) * rowH);
+
+        auto scroll = ScrollLayer::create(CCSize{ viewW, viewH });
+        scroll->m_contentLayer->setContentSize(CCSize{ viewW, totalH });
+
+        auto rowMenu = CCMenu::create();
+        rowMenu->setPosition(0.0f, 0.0f);
+        rowMenu->setContentSize(CCSize{ viewW, totalH });
+        scroll->m_contentLayer->addChild(rowMenu);
+
+        for (size_t i = 0; i < files.size(); ++i) {
+            auto path = files[i];
+            float y = totalH - static_cast<float>(i + 1) * rowH;
+
+            std::string name = path.stem().string();
+            if (name.length() > 14) name = name.substr(0, 12) + "..";
+            auto lbl = CCLabelBMFont::create(name.c_str(), "chatFont.fnt");
+            lbl->setScale(0.4f);
+            lbl->setAnchorPoint(CCPoint{ 0.0f, 0.5f });
+            lbl->setPosition(4.0f, y + rowH / 2.0f);
+            scroll->m_contentLayer->addChild(lbl);
+
+            auto loadSpr = ButtonSprite::create("L", 12, true, "goldFont.fnt", "GJ_button_01.png", 16.0f, 0.4f);
+            auto loadBtn = CCMenuItemExt::createSpriteExtra(loadSpr, [this, path](CCObject*) {
+                if (bot::loadMacro(path, bot::macro)) {
+                    bot::setMode(bot::Mode::Off);
+                    this->updateStatusUI();
+                    Notification::create("Macro loaded. Press PLAY", NotificationIcon::Success)->show();
+                }
+                else {
+                    Notification::create("Failed to load", NotificationIcon::Error)->show();
+                }
+            });
+            loadBtn->setPosition(120.0f, y + rowH / 2.0f);
+            rowMenu->addChild(loadBtn);
+
+            auto delSpr = ButtonSprite::create("X", 12, true, "goldFont.fnt", "GJ_button_06.png", 16.0f, 0.4f);
+            auto delBtn = CCMenuItemExt::createSpriteExtra(delSpr, [this, path](CCObject*) {
+                std::error_code ec2;
+                std::filesystem::remove(path, ec2);
+                this->scheduleRefreshMacroList();
+                Notification::create("Macro deleted", NotificationIcon::Info)->show();
+            });
+            delBtn->setPosition(145.0f, y + rowH / 2.0f);
+            rowMenu->addChild(delBtn);
+        }
+
+        scroll->scrollToTop();
+        m_fields->m_fileListContainer->addChild(scroll);
+    }
+
     void customSetup() {
         PauseLayer::customSetup();
+        if (!PlayLayer::get()) return;
 
-        if (!gdbot::state().run.play)
-            return;
+        auto winSize = CCDirector::sharedDirector()->getWinSize();
+        float panelW = 170.0f;
+        float panelH = 282.0f;
+        float panelX = winSize.width - panelW - 8.0f;
+        float panelY = (winSize.height - panelH) / 2.0f;
 
-        gdbot::ensureConfiguration();
-        if (auto* launcher = gdbot::DraggableLauncher::create())
-            this->addChild(launcher, 10000);
+        auto panelBg = CCLayerColor::create(ccc4(0, 0, 0, 190), panelW, panelH);
+        panelBg->setPosition(panelX, panelY);
+        this->addChild(panelBg, 100);
+
+        auto titleLbl = CCLabelBMFont::create("CBF TAS BOT", "goldFont.fnt");
+        titleLbl->setScale(0.5f);
+        titleLbl->setPosition(panelW / 2.0f, panelH - 16.0f);
+        panelBg->addChild(titleLbl);
+
+        m_fields->m_statusLabel = CCLabelBMFont::create("OFF", "chatFont.fnt");
+        m_fields->m_statusLabel->setScale(0.5f);
+        m_fields->m_statusLabel->setPosition(panelW / 2.0f, panelH - 34.0f);
+        panelBg->addChild(m_fields->m_statusLabel);
+
+        auto modeMenu = CCMenu::create();
+        modeMenu->setPosition(0.0f, 0.0f);
+
+        m_fields->m_offSprite = ButtonSprite::create("OFF", 24, true, "goldFont.fnt", "GJ_button_01.png", 20.0f, 0.4f);
+        auto offBtn = CCMenuItemExt::createSpriteExtra(m_fields->m_offSprite, [this](CCObject*) {
+            bot::setMode(bot::Mode::Off);
+            this->updateStatusUI();
+        });
+        offBtn->setPosition(panelW * 0.2f, panelH - 58.0f);
+        modeMenu->addChild(offBtn);
+
+        m_fields->m_recSprite = ButtonSprite::create("REC", 24, true, "goldFont.fnt", "GJ_button_01.png", 20.0f, 0.4f);
+        auto recBtn = CCMenuItemExt::createSpriteExtra(m_fields->m_recSprite, [this](CCObject*) {
+            bot::macro.clear();
+            bot::setMode(bot::Mode::Record);
+            this->updateStatusUI();
+            Notification::create("Recording started", NotificationIcon::Info)->show();
+            if (auto pl = PlayLayer::get()) pl->resetLevel();
+        });
+        recBtn->setPosition(panelW * 0.5f, panelH - 58.0f);
+        modeMenu->addChild(recBtn);
+
+        m_fields->m_playSprite = ButtonSprite::create("PLAY", 24, true, "goldFont.fnt", "GJ_button_01.png", 20.0f, 0.4f);
+        auto playBtn = CCMenuItemExt::createSpriteExtra(m_fields->m_playSprite, [this](CCObject*) {
+            if (bot::macro.empty()) {
+                Notification::create("No macro!", NotificationIcon::Warning)->show();
+                return;
+            }
+            bot::setMode(bot::Mode::Play);
+            this->updateStatusUI();
+            Notification::create("Playing...", NotificationIcon::Success)->show();
+            if (auto pl = PlayLayer::get()) pl->resetLevel();
+        });
+        playBtn->setPosition(panelW * 0.8f, panelH - 58.0f);
+        modeMenu->addChild(playBtn);
+
+        panelBg->addChild(modeMenu);
+
+        auto speedLbl = CCLabelBMFont::create("Speed:", "chatFont.fnt");
+        speedLbl->setScale(0.45f);
+        speedLbl->setAnchorPoint(CCPoint{ 0.0f, 0.5f });
+        speedLbl->setPosition(10.0f, panelH - 84.0f);
+        panelBg->addChild(speedLbl);
+
+        m_fields->m_speedInput = TextInput::create(65.0f, "1.00", "chatFont.fnt");
+        m_fields->m_speedInput->setFilter("0123456789.,");
+        m_fields->m_speedInput->setScale(0.7f);
+        m_fields->m_speedInput->setPosition(100.0f, panelH - 84.0f);
+        m_fields->m_speedInput->setCallback([](std::string const& str) {
+            bot::recSpeed = bot::parseSpeedString(str);
+            if (auto mod = Mod::get()) mod->setSavedValue("recSpeed", bot::recSpeed);
+        });
+        m_fields->m_speedInput->setString(fmt::format("{:.2f}", bot::recSpeed));
+        panelBg->addChild(m_fields->m_speedInput);
+
+        auto fxMenu = CCMenu::create();
+        fxMenu->setPosition(0.0f, 0.0f);
+        m_fields->m_fxSprite = ButtonSprite::create("FX", 24, true, "goldFont.fnt", "GJ_button_01.png", 20.0f, 0.4f);
+        auto fxBtn = CCMenuItemExt::createSpriteExtra(m_fields->m_fxSprite, [this](CCObject*) {
+            bot::disableDeathEffects = !bot::disableDeathEffects;
+            Mod::get()->setSavedValue("disableDeathEffects", bot::disableDeathEffects);
+            this->updateStatusUI();
+            Notification::create(
+                bot::disableDeathEffects ? "Death, Wave & Respawn FX: OFF" : "Death, Wave & Respawn FX: ON",
+                NotificationIcon::Info
+            )->show();
+        });
+        fxBtn->setPosition(145.0f, panelH - 84.0f);
+        fxMenu->addChild(fxBtn);
+        panelBg->addChild(fxMenu);
+
+        auto nameLbl = CCLabelBMFont::create("Name:", "chatFont.fnt");
+        nameLbl->setScale(0.45f);
+        nameLbl->setAnchorPoint(CCPoint{ 0.0f, 0.5f });
+        nameLbl->setPosition(10.0f, panelH - 108.0f);
+        panelBg->addChild(nameLbl);
+
+        m_fields->m_nameInput = TextInput::create(110.0f, bot::generateTimestampName().c_str(), "chatFont.fnt");
+        m_fields->m_nameInput->setScale(0.7f);
+        m_fields->m_nameInput->setPosition(105.0f, panelH - 108.0f);
+        panelBg->addChild(m_fields->m_nameInput);
+
+        auto saveMenu = CCMenu::create();
+        saveMenu->setPosition(0.0f, 0.0f);
+        auto saveSpr = ButtonSprite::create("SAVE CURRENT", 80, true, "goldFont.fnt", "GJ_button_01.png", 20.0f, 0.4f);
+        auto saveBtn = CCMenuItemExt::createSpriteExtra(saveSpr, [this](CCObject*) {
+            if (bot::macro.empty()) {
+                Notification::create("Macro is empty", NotificationIcon::Warning)->show();
+                return;
+            }
+
+            std::string raw = m_fields->m_nameInput
+                ? std::string(m_fields->m_nameInput->getString())
+                : std::string();
+            std::string clean = bot::sanitizeFileName(raw);
+            std::string stem = clean.empty() ? bot::generateTimestampName() : clean;
+            std::string filename = stem + ".gdbot";
+
+            auto path = bot::getMacroDir() / filename;
+            bool existed = std::filesystem::exists(path);
+
+            if (bot::saveMacro(path, bot::macro)) {
+                this->scheduleRefreshMacroList();
+                Notification::create(
+                    existed ? "Macro overwritten" : "Saved macro",
+                    NotificationIcon::Success
+                )->show();
+            }
+            else {
+                Notification::create("Save failed", NotificationIcon::Error)->show();
+            }
+        });
+        saveBtn->setPosition(panelW / 2.0f, panelH - 134.0f);
+        saveMenu->addChild(saveBtn);
+        panelBg->addChild(saveMenu);
+
+        m_fields->m_fileListContainer = CCNode::create();
+        m_fields->m_fileListContainer->setPosition(5.0f, 15.0f);
+        m_fields->m_fileListContainer->setContentSize(CCSize{ 160.0f, 100.0f });
+        panelBg->addChild(m_fields->m_fileListContainer);
+
+        this->updateStatusUI();
+        this->refreshMacroList();
     }
 };
