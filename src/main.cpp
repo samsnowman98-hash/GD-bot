@@ -20,25 +20,19 @@
 //  12. Sub-frame timestamps:
 //        * OS event times are queued FIFO by markOsTimestamp; each queued
 //          entry is consumed by exactly one handleButton call via
-//          recordRawInput. The "last timestamp" hack is gone: it was wrong
-//          because handleKeypress only enqueues the button and handleButton
-//          runs one frame later.
-//        * The queue is cleared at the end of BotScheduler::update so stale
-//          entries (e.g. Esc) can't bleed into the next frame.
-//        * frac is computed against the *current physics step*, not the
-//          frame. processCommands captures g_stepTs / g_stepDt; PlayerObject
-//          uses those numbers, so multi-step frames stay correct.
-//  13. setTimeScale verifies the scheduler's actual time scale, so an
-//      external reset cannot leave the speedhack silently unapplied.
-//  14. Record mode forwards the physical handleButton call, so the player
-//      reacts immediately. The recorded action is re-applied at the correct
-//      sub-step during PlayerObject::update.
+//          recordRawInput.
+//        * The queue is cleared at the end of BotScheduler::update.
+//        * frac is computed against the *current physics step* (g_stepTs /
+//          g_stepDt captured in processCommands), not the frame.
+//  13. setTimeScale verifies the scheduler's actual time scale.
+//  14. Record mode forwards the physical handleButton call.
+//  15. processCommands signature is (float dt, bool isHalfTick, bool isLastTick)
+//      in 2.2081. g_stepDt is divided by appliedScale because dt arrives
+//      already scaled by the speedhack, while OS timestamps are real seconds.
 //
-// Android note: gameplay touches carry no sub-frame timestamp in 2.2081
-// (cocos2d::CCTouch has no time field, and nativeTouchesBegin doesn't
-// receive one). Live sub-frame capture is PC-keyboard-only. On Android the
-// bot still records at frame granularity and you can nudge frac by hand via
-// the EDIT menu.
+// Android note: gameplay touches carry no sub-frame timestamp in 2.2081.
+// Live sub-frame capture is PC-keyboard-only. On Android the bot records at
+// frame granularity; nudge frac by hand via the EDIT menu.
 // ---------------------------------------------------------------------------
 
 #include <Geode/Geode.hpp>
@@ -148,8 +142,8 @@ namespace bot {
         int button = 1;
         bool push = false;
         bool p1 = true;
-        double timestamp = 0.0;   // g_botTime at capture (frame granularity)
-        double osTs = 0.0;        // OS event timestamp, sub-frame precision
+        double timestamp = 0.0;
+        double osTs = 0.0;
         bool hasOsTs = false;
     };
 
@@ -169,40 +163,26 @@ namespace bot {
 
     inline std::vector<RawInput> pendingRecordInputs;
 
-    // --- FIFO of OS event timestamps ------------------------------------
-    // handleKeypress is called from the OS event pump *before* the scheduler
-    // tick that will actually drain the button queue and call handleButton.
-    // So "most recent OS timestamp" is always the *previous* frame's by the
-    // time handleButton runs. A FIFO preserves the pairing: one entry pushed
-    // per keyboard event, one entry popped per handleButton call. The queue
-    // is cleared at the end of BotScheduler::update so keys that never map
-    // to a button (Esc, etc.) cannot poison later clicks.
+    // FIFO of OS event timestamps. handleKeypress runs before the scheduler
+    // tick that will call handleButton, so "last timestamp" is always one
+    // frame stale. A FIFO pairs them 1:1 in order.
     inline std::deque<double> g_osTsQueue;
     constexpr size_t kMaxOsTsQueue = 128;
 
-    // --- physics-step time base ------------------------------------------
-    // Captured in GJBaseGameLayer::processCommands, i.e. *inside* the step
-    // that will consume the queued commands. PlayerObject::update runs in
-    // the same step and reads these to compute frac relative to the step
-    // rather than to the frame.
-    //
-    // TEMPORARY DIAGNOSTIC: uncomment the log line in
-    // BotBaseGameLayer::processCommands to confirm m_timestamp and the
-    // handleKeypress timestamp share a time base. If they are orders of
-    // magnitude apart, m_timestamp is game-time and handleKeypress' value
-    // is OS-time; in that case subtract `dt` from g_stepTs and/or add an
-    // offset normaliser once you know the true relationship.
+    // Physics-step time base, captured in GJBaseGameLayer::processCommands.
+    // PlayerObject::update reads these to place clicks inside the current
+    // step rather than inside the whole frame.
     inline double g_stepTs = 0.0;
     inline double g_stepDt = 0.0;
 
-    // --- frac calibration -------------------------------------------------
+    // frac calibration.
     inline double g_fracMin = 1.0;
     inline double g_fracMax = 0.0;
     inline uint32_t g_fracClamped = 0;
     inline uint32_t g_fracSamples = 0;
     inline uint32_t g_fracFallback = 0;
 
-    // --- game clock -------------------------------------------------------
+    // game clock.
     inline double g_botTime = 0.0;
     inline bool g_clockActive = false;
     inline double g_stepStartTime = 0.0;
@@ -220,7 +200,7 @@ namespace bot {
         return pl && static_cast<GJBaseGameLayer*>(pl) == l;
     }
 
-    // --- pause cache -------------------------------------------------------
+    // pause cache.
     inline bool g_pauseCached = false;
     inline int g_pauseCachedChildCount = -1;
 
@@ -326,10 +306,6 @@ namespace bot {
         }
     }
 
-    // Called from BotUILayer::handleKeypress, BEFORE the button is enqueued
-    // into GD's command queue. Order of pushes matches order of enqueues,
-    // which in turn matches order of handleButton calls inside
-    // processCommands, so a plain FIFO pairs them 1:1.
     inline void markOsTimestamp(double ts) {
         if (mode != Mode::Record) return;
         g_osTsQueue.push_back(ts);
@@ -350,6 +326,8 @@ namespace bot {
         pendingRecordInputs.push_back(raw);
     }
 
+    // ... parseSpeedString, parseFracString, getMacroDir, generateTimestampName,
+    //     sanitizeFileName, saveMacro, loadMacro, currentLevelID — without changes.
     inline double parseSpeedString(std::string const& str) {
         std::string s = str;
         for (char& c : s) if (c == ',') c = '.';
@@ -599,10 +577,6 @@ class $modify(BotScheduler, CCScheduler) {
     void update(float dt) {
         bot::onFrameStart(dt);
         CCScheduler::update(dt);
-        // The current frame's button queue has been fully drained by now, so
-        // any leftover OS timestamps belong to keys that never mapped to a
-        // button (Esc, F-keys, etc). Drop them so they cannot poison the
-        // next frame's clicks.
         bot::g_osTsQueue.clear();
         bot::updateAudioPitch();
     }
@@ -612,13 +586,13 @@ class $modify(BotScheduler, CCScheduler) {
 // Input interception + per-step time base
 //
 // GJBaseGameLayer::handleButton(bool down, int button, bool isPlayer1) is the
-// only declaration in 2.2081 (PlayLayer does not override it).
+// only declaration in 2.2081.
 //
-// processCommands(float dt) is the funnel where GD drains its own queueButton
-// queue and calls handleButton for each queued command. Capturing
-// m_timestamp / dt there gives us the *step's* start time and length, which
-// is what frac must be measured against -- a single frame can contain several
-// physics steps, and per-frame timing is off by a step at each boundary.
+// processCommands(float dt, bool isHalfTick, bool isLastTick) is where GD
+// drains its own button queue. m_timestamp is the step's start in game time,
+// and dt arrives already multiplied by the scheduler time scale (speedhack),
+// so it must be divided by appliedScale to match the real-seconds OS
+// timestamps queued in g_osTsQueue.
 // ---------------------------------------------------------------------------
 class $modify(BotBaseGameLayer, GJBaseGameLayer) {
     void handleButton(bool down, int button, bool isPlayer1) {
@@ -630,9 +604,6 @@ class $modify(BotBaseGameLayer, GJBaseGameLayer) {
         }
 
         if (mode == Mode::Record) {
-            // Record the click but still forward the physical press so the
-            // player reacts immediately. Playback re-applies the recorded
-            // action at the sub-step frac inside PlayerObject::update.
             recordRawInput(button, down, isPlayer1);
             GJBaseGameLayer::handleButton(down, button, isPlayer1);
             return;
@@ -641,33 +612,32 @@ class $modify(BotBaseGameLayer, GJBaseGameLayer) {
         // Mode::Play: human input is ignored on purpose.
     }
 
-    void processCommands(float dt) {
+    void processCommands(float dt, bool isHalfTick, bool isLastTick) {
         if (bot::mode != bot::Mode::Off && bot::isPlayLayer(this)) {
+            float const scale = (bot::appliedScale > 0.0001f) ? bot::appliedScale : 1.0f;
             bot::g_stepTs = this->m_timestamp;
-            bot::g_stepDt = static_cast<double>(dt);
+            // dt arrives already scaled by the speedhack; divide it out so
+            // frac is computed in the same real-seconds base as osTs.
+            bot::g_stepDt = static_cast<double>(dt) / scale;
 
-            // TEMPORARY DIAGNOSTIC. Uncomment while verifying that
-            // handleKeypress' timestamp and m_timestamp share a time base.
-            // Healthy PC keyboard recording looks like:
-            //   ts=12.345 dt=0.00417 osq=0        (between clicks)
-            //   ts=12.350 dt=0.00417 osq=1        (click enqueued)
-            // If ts and osq timestamps are orders of magnitude apart the
-            // bases differ and g_stepTs needs a normaliser.
-            // log::info("ts={} dt={} osq={}", this->m_timestamp, dt, bot::g_osTsQueue.size());
+            // TEMPORARY DIAGNOSTIC. Uncomment to verify the time base and the
+            // isHalfTick cadence:
+            //   log::info("ts={} dt={} half={} last={} osq={}",
+            //             this->m_timestamp, dt, isHalfTick, isLastTick,
+            //             bot::g_osTsQueue.size());
+            //
+            // If processCommands is called twice per physics step (once with
+            // isHalfTick=true), g_stepDt will describe only half a step.
+            // In that case either skip recording on the half-tick call or
+            // double g_stepDt for it, depending on which half carries the
+            // queued commands.
         }
-        GJBaseGameLayer::processCommands(dt);
+        GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
     }
 };
 
 // ---------------------------------------------------------------------------
-// OS event timestamps (keyboard only; touches have no timestamp on Android)
-//
-// UILayer::handleKeypress(enumKeyCodes, bool down, double timestamp) is the
-// only path that carries a real sub-frame OS event time. We push it into the
-// FIFO; recordRawInput pops it from the matching handleButton call inside
-// processCommands. Deliberately NOT hooking ccTouchBegan / pushButton /
-// processUINodeTouch: touches carry no timestamp, and hooking them just to
-// reset state (as an earlier draft did) was worse than useless.
+// OS event timestamps (keyboard only; touches carry no timestamp on Android)
 // ---------------------------------------------------------------------------
 class $modify(BotUILayer, UILayer) {
     void handleKeypress(cocos2d::enumKeyCodes key, bool down, double timestamp) {
@@ -740,11 +710,6 @@ class $modify(BotPlayerObject, PlayerObject) {
                 double frac = 0.0;
 
                 if (in.hasOsTs && g_stepDt > 1e-9) {
-                    // Sub-frame path: measure against the current physics
-                    // step, not the enclosing frame. `in.osTs < g_stepTs`
-                    // means the event slipped behind the step boundary
-                    // (queue backlog after a lag spike); take it now with
-                    // frac clamped to 0 so we don't lose the click.
                     take = in.osTs < g_stepTs + g_stepDt;
                     if (take) {
                         double f = (in.osTs - g_stepTs) / g_stepDt;
@@ -757,8 +722,6 @@ class $modify(BotPlayerObject, PlayerObject) {
                     }
                 }
                 else {
-                    // Frame-granularity fallback (Android touches, or no OS
-                    // timestamp for some reason).
                     take = in.timestamp <= stepEndTime;
                     if (take) {
                         double rel = in.timestamp - stepStartTime;
