@@ -23,6 +23,7 @@
 
 #include <Geode/Geode.hpp>
 #include <Geode/DefaultInclude.hpp>
+#include <Geode/Enums.hpp>
 #include <Geode/utils/cocos.hpp>
 #include <Geode/utils/file.hpp>
 
@@ -35,6 +36,7 @@
 #include <Geode/modify/PauseLayer.hpp>
 #include <Geode/modify/PlayLayer.hpp>
 #include <Geode/modify/PlayerObject.hpp>
+#include <Geode/modify/UILayer.hpp>
 
 #include <Geode/binding/ButtonSprite.hpp>
 #include <Geode/binding/CCMenuItemSpriteExtra.hpp>
@@ -45,7 +47,9 @@
 #include <Geode/binding/GJGameLevel.hpp>
 #include <Geode/binding/PauseLayer.hpp>
 #include <Geode/binding/PlayLayer.hpp>
+#include <Geode/binding/GJUINode.hpp>
 #include <Geode/binding/PlayerObject.hpp>
+#include <Geode/binding/UILayer.hpp>
 
 #include <Geode/ui/ListView.hpp>
 #include <Geode/ui/Notification.hpp>
@@ -126,7 +130,11 @@ namespace bot {
         int button = 1;
         bool push = false;
         bool p1 = true;
-        double timestamp = 0.0;
+        double timestamp = 0.0;   // g_botTime at capture (frame granularity)
+        double osTs = 0.0;        // OS event timestamp, sub-frame precision
+        double refTs = 0.0;       // GJBaseGameLayer::m_timestamp at that instant
+        float refDt = 0.f;        // frame length to normalise against
+        bool hasOsTs = false;     // false -> fall back to frame granularity
     };
 
     inline Mode mode = Mode::Off;
@@ -144,6 +152,40 @@ namespace bot {
     inline float appliedScale = 1.0f;
 
     inline std::vector<RawInput> pendingRecordInputs;
+
+    // --- sub-frame input timestamps ------------------------------------
+    // GD hands the OS event time to UILayer::handleKeypress(key, down, ts) and
+    // compares it against GJBaseGameLayer::m_timestamp in its own
+    // shouldUseSubstepForButton(). We capture the same value and use the same
+    // reference, so frac is exact to double precision -- and unlike GD's own
+    // click-between-frames we apply no `dt * 0.5` gate and no
+    // buttonIsRelevant() filter, so every click is recorded and any position
+    // inside the tick is reachable.
+    //
+    // Within one frame the OS event batch is dispatched sequentially
+    // (handleKeypress -> ... -> handleButton for that key, then the next
+    // event), so "most recent OS timestamp" is exactly the event that caused
+    // the handleButton call we are in. No FIFO, no key->button mapping needed.
+    inline double g_lastOsTs = 0.0;
+    inline uint64_t g_lastOsTsFrame = 0;   // only valid for the frame that set it
+    inline uint64_t g_frameCounter = 0;
+
+    // Frame reference captured in the scheduler hook, before anything runs:
+    // GD's own frame origin plus the unscaled frame length.
+    inline double g_frameTs = 0.0;
+    inline float g_frameRawDt = 0.f;
+
+    // Reference snapshot taken at the instant of the click (see
+    // markOsTimestamp for why it cannot be sampled in the scheduler hook).
+    inline double g_lastRefTs = 0.0;
+    inline float g_lastRefDt = 0.f;
+
+    // Diagnostics: if the two time bases ever disagree, frac saturates at the
+    // clamp and these show it immediately in the pause-menu status line.
+    inline double g_fracMin = 1.0;
+    inline double g_fracMax = 0.0;
+    inline uint32_t g_fracClamped = 0;
+    inline uint32_t g_fracSamples = 0;
 
     // --- game clock -------------------------------------------------------
     // Driven by the dt handed to CCScheduler::update (unscaled by the
@@ -170,7 +212,7 @@ namespace bot {
     // Is the pause menu up?
     //
     // getChildByType<PauseLayer> walks every child of PlayLayer doing a typeinfo
-    // cast, and isRunning() is consulted twice per frame, so the negative answer
+    // cast, and isLevelActive() is consulted twice per frame, so the negative answer
     // (the common case during a run) is cached. The cache invalidates itself the
     // moment the child count changes, which is exactly when a PauseLayer would
     // have been added or removed -- so it needs no extra hooks and cannot go
@@ -189,15 +231,15 @@ namespace bot {
         return g_pauseCached;
     }
 
-    // Is the level actually simulating right now?
-    inline bool isRunning() {
+    // Is the level still on screen and interactive (i.e. NOT in the pause menu
+    // and NOT finished)? Deliberately ignores m_playerDied: the death / respawn
+    // gap is still "in the level", and the record speed must survive it.
+    inline bool isLevelActive() {
         if (isPaused()) return false;
         auto pl = PlayLayer::get();
         if (!pl) return false;
         // Only reached while unpaused, so at most once per completed level.
         if (pl->getChildByType<EndLevelLayer>(0)) return false;
-        if (pl->m_playerDied) return false;
-        if (pl->m_hasCompletedLevel) return false;
         return true;
     }
 
@@ -211,7 +253,8 @@ namespace bot {
         auto fae = FMODAudioEngine::sharedEngine();
         if (!fae || !fae->m_backgroundMusicChannel) return;
 
-        bool shouldSlow = (mode == Mode::Record) && isRunning() && appliedScale > 0.001f;
+        // Pitch follows the speedhack, so it too must survive death.
+        bool shouldSlow = (mode == Mode::Record) && isLevelActive() && appliedScale > 0.001f;
         float target = std::clamp(shouldSlow ? appliedScale : 1.0f, 0.01f, 2.0f);
 
         float cur = 1.0f;
@@ -224,12 +267,26 @@ namespace bot {
     inline void resetEngine() {
         pendingRecordInputs.clear();
         g_stepStartTime = 0.0;
+        g_lastOsTs = 0.0;
+        g_lastOsTsFrame = 0;
+        g_lastRefTs = 0.0;
+        g_lastRefDt = 0.f;
+        // NOTE: the frac calibration counters are deliberately NOT reset here.
+        // resetEngine() runs on every death / practice restart, and those are
+        // exactly the moments you still want the accumulated readout for.
         inputThisStep = false;
         p1Split = false;
         p2Split = false;
         midStep = false;
         rotationDelta = 0.f;
         // `step` is deliberately not touched: PlayLayer owns it.
+    }
+
+    inline void resetFracStats() {
+        g_fracMin = 1.0;
+        g_fracMax = 0.0;
+        g_fracClamped = 0;
+        g_fracSamples = 0;
     }
 
     inline void applyClickFlags() {
@@ -260,6 +317,7 @@ namespace bot {
         mode = m;
         applyClickFlags();
         resetEngine();
+        resetFracStats();
         if (mode == Mode::Off) {
             setTimeScale(1.0f);
             restoreAudioPitch();
@@ -275,7 +333,48 @@ namespace bot {
         raw.push = push;
         raw.p1 = isPlayer1;
         raw.timestamp = g_botTime;
+        // Frame-scoped: a timestamp captured two frames ago must not leak
+        // into this click (e.g. a keyboard press followed by a touch that
+        // carries no timestamp of its own).
+        raw.osTs = g_lastOsTs;
+        raw.refTs = g_lastRefTs;
+        raw.refDt = g_lastRefDt;
+        raw.hasOsTs = (g_lastOsTsFrame == g_frameCounter);
         pendingRecordInputs.push_back(raw);
+    }
+
+    // Remember the OS event time for the click we are about to see.
+    //
+    // We snapshot GJBaseGameLayer::m_timestamp *here*, at the instant of the
+    // click, rather than reusing the value captured in onFrameStart(). That
+    // matters: the OS event batch is dispatched from the message pump BEFORE
+    // CCDirector::drawScene() runs, so a value sampled in the scheduler hook
+    // would already belong to the next frame and would shift every frac by one
+    // tick. Sampled at click time this is byte-for-byte the same reference GD
+    // feeds into shouldUseSubstepForButton(), which is what makes the two time
+    // bases agree without any calibration.
+    inline void markOsTimestamp(double ts) {
+        g_lastOsTs = ts;
+        g_lastOsTsFrame = g_frameCounter;
+        g_lastRefTs = 0.0;
+        g_lastRefDt = g_frameRawDt;
+        if (auto pl = PlayLayer::get()) g_lastRefTs = pl->m_timestamp;
+    }
+
+    // Sub-frame position of an OS event inside the current tick, in [0,1].
+    // Same arithmetic GD uses in shouldUseSubstepForButton():
+    //     (command.m_timestamp - m_timestamp) / dt
+    // Returns -1.0 when there is no usable OS timestamp, so the caller can
+    // fall back to frame granularity instead of silently recording 0.
+    inline double osTsToFrac(RawInput const& in) {
+        if (!in.hasOsTs || in.refDt <= 1e-9f || in.refTs <= 0.0) return -1.0;
+        double f = (in.osTs - in.refTs) / static_cast<double>(in.refDt);
+        ++g_fracSamples;
+        if (f < 0.0 || f > 1.0) ++g_fracClamped;
+        f = std::clamp(f, 0.0, 0.9999999);
+        g_fracMin = std::min(g_fracMin, f);
+        g_fracMax = std::max(g_fracMax, f);
+        return f;
     }
 
     inline double parseSpeedString(std::string const& str) {
@@ -471,29 +570,47 @@ namespace bot {
 
     // Called from the CCScheduler hook, before the scheduler scales dt.
     inline void onFrameStart(float rawDt) {
-        bool running = (mode != Mode::Off) && isRunning();
+        // Snapshot GD's own frame origin and the unscaled frame length before
+        // anything runs this frame. Clicks dispatched during this frame are
+        // measured against exactly these two numbers.
+        ++g_frameCounter;
+        g_frameRawDt = rawDt;
+        if (auto plf = PlayLayer::get()) g_frameTs = plf->m_timestamp;
 
-        if (running && !g_clockActive) {
+        // `simulating` gates the input clock; `levelActive` gates the speedhack.
+        // They differ on purpose: while dead the level is still active (so the
+        // record speed must stay applied), but nothing is being simulated (so
+        // the click clock must not advance and stale clicks must be dropped).
+        bool const levelActive = (mode != Mode::Off) && isLevelActive();
+        auto pl = PlayLayer::get();
+        bool const simulating = levelActive && pl && !pl->m_playerDied && !pl->m_hasCompletedLevel;
+
+        if (simulating && !g_clockActive) {
             // (Re)started simulating: drop anything typed while we were frozen
             // and force a resync of the step window.
             pendingRecordInputs.clear();
             g_stepStartTime = 0.0;
         }
-        else if (!running && g_clockActive) {
+        else if (!simulating && g_clockActive) {
             pendingRecordInputs.clear();
         }
-        g_clockActive = running;
+        g_clockActive = simulating;
 
-        if (running) {
+        if (simulating) {
             // rawDt is the director's unscaled delta; the scheduler applies
             // m_fTimeScale to it right after we return.
             g_botTime += std::clamp(static_cast<double>(rawDt), 0.0, 0.25);
         }
 
-        // Only touch the global time scale while we actually own it, so the
-        // bot does not fight other mods (or itself) while switched off.
+        // FIX: the speedhack no longer drops to 1.0 on death. In Record the
+        // scale is held for as long as the level is on screen -- death, respawn
+        // and practice restarts included -- and only released for the pause
+        // menu, the end-of-level screen and leaving the level.
+        //
+        // Still only touch the global time scale while we own it, so the bot
+        // does not fight other mods (or itself) while switched off.
         if (mode == Mode::Record) {
-            setTimeScale(running ? static_cast<float>(recSpeed) : 1.0f);
+            setTimeScale(levelActive ? static_cast<float>(recSpeed) : 1.0f);
         }
         else if (appliedScale != 1.0f) {
             setTimeScale(1.0f);
@@ -548,6 +665,41 @@ class $modify(BotBaseGameLayer, GJBaseGameLayer) {
         }
 
         // Mode::Play: human input is ignored on purpose.
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Sub-frame input timestamps
+//
+// GD already plumbs the OS event time all the way down to the gameplay layer --
+// that is exactly what its own click-between-frames uses. We just read it.
+//
+// Both of these are real (non-inline, address-bound) functions in 2.2081:
+//     UILayer::handleKeypress(enumKeyCodes, bool down, double timestamp)  win 0x4cd830
+//     UILayer::processUINodeTouch(GJUITouchEvent, int, CCPoint, GJUINode*, double timestamp)  win 0x4ce5f0
+//
+// Deliberately NOT hooked:
+//   * GJBaseGameLayer::queueButton -- declared `win inline`, its body lives in
+//     bindings/2.2081/inline/GJBaseGameLayer.cpp, so Geode compiles a private
+//     copy into the mod and a hook would never see the game's own calls.
+//   * UILayer::keyDown/keyUp -- the bindings note that UILayer inherits
+//     CCKeyboardDelegate twice and that this "ended up breaking addresser when
+//     trying to hook it". handleKeypress is the funnel anyway and is safe.
+//   * UILayer::ccTouchBegan -- real, but cocos2d::CCTouch carries no timestamp
+//     in 2.2081 (m_nId, m_startPointCaptured, m_startPoint, m_point,
+//     m_prevPoint and nothing else), so there is nothing sub-frame to read.
+//     Direct gameplay touches therefore fall back to frame granularity.
+// ---------------------------------------------------------------------------
+class $modify(BotUILayer, UILayer) {
+    void handleKeypress(cocos2d::enumKeyCodes key, bool down, double timestamp) {
+        bot::markOsTimestamp(timestamp);
+        UILayer::handleKeypress(key, down, timestamp);
+    }
+
+    bool processUINodeTouch(GJUITouchEvent event, int touchID, cocos2d::CCPoint position,
+                            GJUINode* node, double timestamp) {
+        bot::markOsTimestamp(timestamp);
+        return UILayer::processUINodeTouch(event, touchID, position, node, timestamp);
     }
 };
 
@@ -619,8 +771,17 @@ class $modify(BotPlayerObject, PlayerObject) {
                     s.button = in.button;
                     s.push = in.push;
                     s.p1 = in.p1;
-                    double rel = in.timestamp - stepStartTime;
-                    s.frac = std::clamp(rel / stepDuration, 0.0, 0.9999);
+
+                    // Prefer the OS event timestamp: that is what gives us a
+                    // real sub-frame position instead of "start of tick".
+                    double osFrac = osTsToFrac(in);
+                    if (osFrac >= 0.0) {
+                        s.frac = osFrac;
+                    }
+                    else {
+                        double rel = in.timestamp - stepStartTime;
+                        s.frac = std::clamp(rel / stepDuration, 0.0, 0.9999);
+                    }
                     subs.push_back(s);
 
                     Action a;
@@ -871,6 +1032,7 @@ class $modify(BotPauseLayer, PauseLayer) {
     struct Fields {
         CCNode* m_listContainer = nullptr;
         CCLabelBMFont* m_statusLabel = nullptr;
+        CCLabelBMFont* m_fracLabel = nullptr;
         ButtonSprite* m_offSprite = nullptr;
         ButtonSprite* m_recSprite = nullptr;
         ButtonSprite* m_playSprite = nullptr;
@@ -890,6 +1052,22 @@ class $modify(BotPauseLayer, PauseLayer) {
             else if (bot::mode == bot::Mode::Play) st = fmt::format("PLAY {} acts", bot::macro.size());
             else if (!bot::macro.empty()) st = fmt::format("OFF  {} acts loaded", bot::macro.size());
             f->m_statusLabel->setString(st.c_str());
+        }
+        // Calibration readout. `frac` is the sub-frame position we derived from
+        // the OS event timestamp; if the two time bases ever disagreed it would
+        // pin to the clamp, and `clamp n/m` makes that visible at a glance.
+        // A healthy recording shows a spread like 0.03..0.97 with clamp 0/m.
+        if (f->m_fracLabel) {
+            std::string fs;
+            if (bot::g_fracSamples == 0) {
+                fs = "frac: no clicks yet";
+            }
+            else {
+                fs = fmt::format("frac {:.4f}..{:.4f}  clamp {}/{}",
+                                 bot::g_fracMin, bot::g_fracMax,
+                                 bot::g_fracClamped, bot::g_fracSamples);
+            }
+            f->m_fracLabel->setString(fs.c_str());
         }
         if (f->m_offSprite)
             f->m_offSprite->setColor(bot::mode == bot::Mode::Off ? ccColor3B{ 80, 255, 80 } : ccColor3B{ 255, 255, 255 });
@@ -1050,6 +1228,11 @@ class $modify(BotPauseLayer, PauseLayer) {
         m_fields->m_statusLabel->setScale(0.5f);
         m_fields->m_statusLabel->setPosition(CCPoint{ panelW / 2.f, panelH - 34.f });
         panel->addChild(m_fields->m_statusLabel);
+
+        m_fields->m_fracLabel = CCLabelBMFont::create("frac: no clicks yet", "chatFont.fnt");
+        m_fields->m_fracLabel->setScale(0.38f);
+        m_fields->m_fracLabel->setPosition(CCPoint{ panelW / 2.f, panelH - 48.f });
+        panel->addChild(m_fields->m_fracLabel);
 
         auto modeMenu = CCMenu::create();
         modeMenu->setContentSize(CCSize{ panelW, 24.f });
