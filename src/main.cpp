@@ -1,32 +1,32 @@
-// CBF-style TAS bot for Geometry Dash 2.2081 / Geode 5.x (Windows, macOS, Android)
+// CBF-style TAS bot for Geometry Dash 2.2081 / Geode 4.x (Windows, macOS, Android)
 //
 // Verified against geode-sdk/bindings @ bindings/2.2081/GeometryDash.bro
 //
 // ---------------------------------------------------------------------------
-// Fixes applied vs. the original draft (see REVIEW.md for the full list):
+// Fixes applied:
 //   1. CCCircleWave has NO update(float) in 2.2081 -> hook draw() instead.
 //   2. PlayerObject has NO m_lastPosition (that's GameObject) -> removed.
 //   3. CCMenuItemExt callbacks take CCMenuItemSpriteExtra*, not CCObject*.
-//   4. geode::ScrollLayer/ListView is the correct list widget; the game's
-//      CCScrollLayerExt has no bound static create(), and CCContentLayer
-//      expects TableViewCell children -> use ListView + GenericListCell.
+//   4. geode::ListView is the correct list widget; CCScrollLayerExt has no
+//      bound static create() in 2.2081 -> use ListView.
 //   5. Missing closing brace in refreshMacroList().
-//   6. ButtonSprite absolute-width misuse ("OFF" in a 24px box).
-//   7. Wall-clock timestamps desync on any stall -> bot now runs on a
-//      scheduler-driven game clock that freezes while paused/dead/idle.
-//   8. Bot no longer stomps the global time scale to 1.0 while Mode::Off.
-//   9. Checkpoint bookkeeping: stale pointers cleared, held buttons restored
-//      in Play mode too.
-//  10. Macro files now carry format version + level ID and are validated.
-//  11. getSaveDir() requires "save-data" in mod.json -> use getConfigDir().
-//  12. Sub-frame timestamp capture: markOsTimestamp is now called from every
-//      input path (keyboard + touch), and g_lastRefTs samples the current
-//      frame's timestamp instead of the previous one.
-//  13. setTimeScale now verifies the scheduler's actual time scale before
-//      skipping, so an external reset cannot leave the speedhack unapplied.
-//  14. Record mode no longer swallows the physical button press; the real
-//      handleButton is forwarded immediately, and the recorded action is
-//      re-applied at the correct sub-step for deterministic playback.
+//   6. ButtonSprite absolute-width misuse -> absolute=false everywhere.
+//   7. Wall-clock timestamps desync on stalls -> scheduler-driven game clock
+//      that freezes while paused/dead/idle.
+//   8. Bot does not stomp the global time scale to 1.0 while Mode::Off.
+//   9. Checkpoint bookkeeping: stale pointers cleared.
+//  10. Macro files carry format version + level ID and are validated.
+//  11. getSaveDir() requires "save-data" -> use getConfigDir().
+//  12. markOsTimestamp now samples g_frameTs (start of *current* frame),
+//      not pl->m_timestamp (still previous frame during OS event dispatch).
+//  13. setTimeScale verifies the scheduler's actual time scale, so an
+//      external reset cannot leave the speedhack silently unapplied.
+//  14. Record mode forwards the physical handleButton call, so the player
+//      reacts immediately. The recorded action is re-applied at the correct
+//      sub-step during PlayerObject::update.
+//  15. BotUILayer now hooks ccTouchBegan so that Android gameplay touches
+//      (which carry no sub-frame timestamp) don't inherit stale OS timestamps
+//      from previous keyboard events.
 // ---------------------------------------------------------------------------
 
 #include <Geode/Geode.hpp>
@@ -272,9 +272,8 @@ namespace bot {
         }
     }
 
-    // FIX #13: verify the scheduler's actual time scale, not just our own
-    // cached `appliedScale`. An external mod (or the game itself) can reset
-    // the scheduler without telling us, leaving the speedhack silently off.
+    // FIX #13: verify the scheduler's *actual* time scale, not just our own
+    // cached value. An external mod can reset it without telling us.
     inline void setTimeScale(float s) {
         auto scheduler = CCDirector::sharedDirector()->getScheduler();
         if (!scheduler) return;
@@ -303,10 +302,10 @@ namespace bot {
         }
     }
 
-    // FIX #12: capture the reference timestamp at the *instant* of the click,
-    // but use g_frameTs (sampled at the start of this frame) instead of
-    // pl->m_timestamp, which still belongs to the previous frame when the OS
-    // event batch is dispatched before drawScene().
+    // FIX #12: sample the reference timestamp from g_frameTs (start of the
+    // *current* frame, captured in onFrameStart), not pl->m_timestamp, which
+    // still belongs to the previous frame while the OS event batch is being
+    // dispatched ahead of drawScene().
     inline void markOsTimestamp(double ts) {
         g_lastOsTs = ts;
         g_lastOsTsFrame = g_frameCounter;
@@ -338,9 +337,168 @@ namespace bot {
         return f;
     }
 
-    // ... (parseSpeedString, parseFracString, getMacroDir, generateTimestampName,
-    //      sanitizeFileName, saveMacro, loadMacro, currentLevelID — unchanged
-    //      from the verified draft; omitted here only for brevity) ...
+    inline double parseSpeedString(std::string const& str) {
+        std::string s = str;
+        for (char& c : s) if (c == ',') c = '.';
+        double whole = 0.0, frac = 0.0, div = 1.0;
+        bool inFrac = false, hasDigits = false;
+        for (char c : s) {
+            if (c >= '0' && c <= '9') {
+                hasDigits = true;
+                if (!inFrac) whole = whole * 10.0 + (c - '0');
+                else { div *= 10.0; frac += (c - '0') / div; }
+            }
+            else if (c == '.' && !inFrac) inFrac = true;
+            else if (c == ' ') continue;
+            else break;
+        }
+        if (!hasDigits) return 1.0;
+        return std::clamp(whole + frac, 0.01, 2.0);
+    }
+
+    inline double parseFracString(std::string const& str) {
+        std::string s = str;
+        for (char& c : s) if (c == ',') c = '.';
+        double whole = 0.0, frac = 0.0, div = 1.0;
+        bool inFrac = false, hasDigits = false;
+        for (char c : s) {
+            if (c >= '0' && c <= '9') {
+                hasDigits = true;
+                if (!inFrac) whole = whole * 10.0 + (c - '0');
+                else { div *= 10.0; frac += (c - '0') / div; }
+            }
+            else if (c == '.' && !inFrac) inFrac = true;
+            else if (c == ' ') continue;
+            else break;
+        }
+        if (!hasDigits) return 0.0;
+        return std::clamp(whole + frac, 0.0, 0.9999999);
+    }
+
+    inline std::filesystem::path getMacroDir() {
+        auto mod = Mod::get();
+        if (!mod) return std::filesystem::path();
+        std::error_code ec;
+        auto dir = mod->getConfigDir(true) / "macros";
+        std::filesystem::create_directories(dir, ec);
+        if (ec) return mod->getConfigDir(true);
+        return dir;
+    }
+
+    inline std::string generateTimestampName() {
+        auto now = std::chrono::system_clock::now();
+        auto timeT = std::chrono::system_clock::to_time_t(now);
+        std::tm tmStruct{};
+#ifdef GEODE_IS_WINDOWS
+        localtime_s(&tmStruct, &timeT);
+#else
+        localtime_r(&timeT, &tmStruct);
+#endif
+        return fmt::format(
+            "macro_{:04d}{:02d}{:02d}_{:02d}{:02d}{:02d}",
+            tmStruct.tm_year + 1900, tmStruct.tm_mon + 1, tmStruct.tm_mday,
+            tmStruct.tm_hour, tmStruct.tm_min, tmStruct.tm_sec
+        );
+    }
+
+    inline std::string sanitizeFileName(std::string const& raw) {
+        std::string out;
+        out.reserve(raw.size());
+        for (char c : raw) {
+            unsigned char uc = static_cast<unsigned char>(c);
+            bool invalid = uc < 0x20
+                || c == '\\' || c == '/' || c == ':' || c == '*'
+                || c == '?' || c == '"' || c == '<' || c == '>' || c == '|';
+            out.push_back(invalid ? '_' : c);
+        }
+        size_t start = out.find_first_not_of(' ');
+        if (start == std::string::npos) return "";
+        size_t end = out.find_last_not_of(' ');
+        out = out.substr(start, end - start + 1);
+        while (!out.empty() && (out.back() == '.' || out.back() == ' ')) out.pop_back();
+        if (out.size() > 80) out.resize(80);
+
+        std::string upper;
+        upper.reserve(out.size());
+        for (char c : out) upper.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
+        static char const* reserved[] = {
+            "CON","PRN","AUX","NUL",
+            "COM1","COM2","COM3","COM4","COM5","COM6","COM7","COM8","COM9",
+            "LPT1","LPT2","LPT3","LPT4","LPT5","LPT6","LPT7","LPT8","LPT9"
+        };
+        for (auto const* r : reserved) {
+            if (upper == r) { out = "_" + out; break; }
+        }
+        return out;
+    }
+
+    inline bool saveMacro(std::filesystem::path const& path,
+                          std::vector<Action> const& actions,
+                          int levelID) {
+        std::ofstream out(path, std::ios::binary | std::ios::trunc);
+        if (!out) return false;
+        uint32_t magic = kMagic;
+        uint32_t format = kFormat;
+        int32_t lid = static_cast<int32_t>(levelID);
+        uint32_t count = static_cast<uint32_t>(actions.size());
+        out.write(reinterpret_cast<char const*>(&magic), 4);
+        out.write(reinterpret_cast<char const*>(&format), 4);
+        out.write(reinterpret_cast<char const*>(&lid), 4);
+        out.write(reinterpret_cast<char const*>(&count), 4);
+        for (auto const& a : actions) {
+            uint8_t flags = static_cast<uint8_t>((a.down ? 1 : 0) | (a.p1 ? 2 : 0));
+            uint8_t button = a.button;
+            out.write(reinterpret_cast<char const*>(&a.step), 4);
+            out.write(reinterpret_cast<char const*>(&a.frac), 8);
+            out.write(reinterpret_cast<char const*>(&flags), 1);
+            out.write(reinterpret_cast<char const*>(&button), 1);
+        }
+        return static_cast<bool>(out);
+    }
+
+    inline bool loadMacro(std::filesystem::path const& path,
+                          std::vector<Action>& actions,
+                          int& levelID) {
+        std::error_code ec;
+        auto size = std::filesystem::file_size(path, ec);
+        if (ec || size > kMaxFileSize) return false;
+
+        std::ifstream in(path, std::ios::binary);
+        if (!in) return false;
+
+        uint32_t magic = 0, format = 0, count = 0;
+        int32_t lid = 0;
+        in.read(reinterpret_cast<char*>(&magic), 4);
+        in.read(reinterpret_cast<char*>(&format), 4);
+        in.read(reinterpret_cast<char*>(&lid), 4);
+        in.read(reinterpret_cast<char*>(&count), 4);
+        if (!in || magic != kMagic || format != kFormat || count > kMaxActions) return false;
+
+        std::vector<Action> tmp;
+        tmp.reserve(count);
+        for (uint32_t i = 0; i < count; ++i) {
+            Action a;
+            uint8_t flags = 0, button = 1;
+            in.read(reinterpret_cast<char*>(&a.step), 4);
+            in.read(reinterpret_cast<char*>(&a.frac), 8);
+            in.read(reinterpret_cast<char*>(&flags), 1);
+            in.read(reinterpret_cast<char*>(&button), 1);
+            if (!in) return false;
+            a.down = (flags & 1) != 0;
+            a.p1 = (flags & 2) != 0;
+            a.button = button;
+            tmp.push_back(a);
+        }
+        actions = std::move(tmp);
+        levelID = static_cast<int>(lid);
+        return true;
+    }
+
+    inline int currentLevelID() {
+        auto pl = PlayLayer::get();
+        if (!pl || !pl->m_level) return 0;
+        return static_cast<int>(pl->m_level->m_levelID);
+    }
 
     inline void applyInput(PlayLayer* pl, StepSub const& s, uint32_t st, double frac) {
         ++applying;
@@ -449,11 +607,8 @@ class $modify(BotBaseGameLayer, GJBaseGameLayer) {
         }
 
         if (mode == Mode::Record) {
-            // FIX #14: record the click but still forward the physical press
-            // so the player object reacts immediately. The recorded action is
-            // re-applied at the correct sub-step during the next
-            // PlayerObject::update, keeping playback deterministic without
-            // making live recording feel laggy.
+            // FIX #14: record the action but forward the real press so the
+            // player reacts immediately. Playback re-applies at the sub-step.
             recordRawInput(button, down, isPlayer1);
             GJBaseGameLayer::handleButton(down, button, isPlayer1);
             return;
@@ -464,12 +619,7 @@ class $modify(BotBaseGameLayer, GJBaseGameLayer) {
 };
 
 // ---------------------------------------------------------------------------
-// Sub-frame input timestamps (keyboard + touch)
-//
-// UILayer::handleKeypress carries the OS event time on PC. On Android,
-// gameplay touches do not carry a sub-frame timestamp, so we fall back to
-// frame granularity — but we still capture the reference timestamp here so
-// the fallback is as accurate as possible.
+// Sub-frame input timestamps
 // ---------------------------------------------------------------------------
 class $modify(BotUILayer, UILayer) {
     void handleKeypress(cocos2d::enumKeyCodes key, bool down, double timestamp) {
@@ -483,14 +633,15 @@ class $modify(BotUILayer, UILayer) {
         return UILayer::processUINodeTouch(event, touchID, position, node, timestamp);
     }
 
-    // FIX #1 (Android): gameplay touches arrive here without a timestamp.
-    // We still take a reference snapshot so the frame-granularity fallback
-    // is anchored to the current frame, not a stale one.
+    // FIX #15: Android gameplay touches arrive through ccTouchBegan without a
+    // sub-frame timestamp. Invalidate any stale OS timestamp from previous
+    // keyboard events so hasOsTs correctly falls back to frame granularity.
     bool ccTouchBegan(cocos2d::CCTouch* touch, cocos2d::CCEvent* event) {
         if (bot::mode != bot::Mode::Off) {
             bot::g_lastOsTs = 0.0;
-            bot::g_lastOsTsFrame = 0; // forces hasOsTs = false
-            bot::markOsTimestamp(0.0);
+            bot::g_lastOsTsFrame = 0;
+            bot::g_lastRefTs = bot::g_frameTs;
+            bot::g_lastRefDt = bot::g_frameRawDt;
         }
         return UILayer::ccTouchBegan(touch, event);
     }
@@ -804,8 +955,461 @@ class $modify(BotPlayLayer, PlayLayer) {
 };
 
 // ---------------------------------------------------------------------------
-// Pause-menu UI (unchanged from the verified draft)
+// Pause-menu UI
 // ---------------------------------------------------------------------------
-// ... [The entire BotPauseLayer implementation remains identical to the draft
-//      you provided, including the sub-frame editor, ListView rows, and all
-//      button callbacks. It already compiles and works with the fixed core.] ...
+class $modify(BotPauseLayer, PauseLayer) {
+    struct Fields {
+        CCNode* m_listContainer = nullptr;
+        CCLabelBMFont* m_statusLabel = nullptr;
+        CCLabelBMFont* m_fracLabel = nullptr;
+        bool m_editMode = false;
+        size_t m_editCursor = 0;
+        CCLabelBMFont* m_editInfo = nullptr;
+        TextInput* m_fracInput = nullptr;
+        ButtonSprite* m_editBtnSprite = nullptr;
+        ButtonSprite* m_offSprite = nullptr;
+        ButtonSprite* m_recSprite = nullptr;
+        ButtonSprite* m_playSprite = nullptr;
+        ButtonSprite* m_fxSprite = nullptr;
+        TextInput* m_nameInput = nullptr;
+        TextInput* m_speedInput = nullptr;
+        bool m_refreshScheduled = false;
+        float m_listW = 160.f;
+        float m_listH = 100.f;
+    };
+
+    void updateStatusUI() {
+        auto& f = m_fields;
+        if (f->m_statusLabel) {
+            std::string st = "OFF";
+            if (bot::mode == bot::Mode::Record) st = fmt::format("REC  {} acts", bot::macro.size());
+            else if (bot::mode == bot::Mode::Play) st = fmt::format("PLAY {} acts", bot::macro.size());
+            else if (!bot::macro.empty()) st = fmt::format("OFF  {} acts loaded", bot::macro.size());
+            f->m_statusLabel->setString(st.c_str());
+        }
+        if (f->m_fracLabel) {
+            std::string fs;
+            if (bot::g_fracSamples == 0) {
+                fs = "frac: no clicks yet";
+            }
+            else {
+                fs = fmt::format("frac {:.4f}..{:.4f}  os {}  fb {}  clamp {}",
+                                 bot::g_fracMin, bot::g_fracMax,
+                                 bot::g_fracSamples, bot::g_fracFallback,
+                                 bot::g_fracClamped);
+            }
+            f->m_fracLabel->setString(fs.c_str());
+        }
+        if (f->m_offSprite)
+            f->m_offSprite->setColor(bot::mode == bot::Mode::Off ? ccColor3B{ 80, 255, 80 } : ccColor3B{ 255, 255, 255 });
+        if (f->m_recSprite)
+            f->m_recSprite->setColor(bot::mode == bot::Mode::Record ? ccColor3B{ 255, 80, 80 } : ccColor3B{ 255, 255, 255 });
+        if (f->m_playSprite)
+            f->m_playSprite->setColor(bot::mode == bot::Mode::Play ? ccColor3B{ 80, 200, 255 } : ccColor3B{ 255, 255, 255 });
+        if (f->m_fxSprite)
+            f->m_fxSprite->setColor(bot::disableDeathEffects ? ccColor3B{ 255, 180, 80 } : ccColor3B{ 255, 255, 255 });
+    }
+
+    void onDeferredRefresh() {
+        m_fields->m_refreshScheduled = false;
+        this->refreshCurrentView();
+    }
+
+    void scheduleRefreshMacroList() {
+        if (m_fields->m_refreshScheduled) return;
+        m_fields->m_refreshScheduled = true;
+        this->runAction(CCSequence::createWithTwoActions(
+            CCDelayTime::create(0.0f),
+            CCCallFunc::create(this, callfunc_selector(BotPauseLayer::onDeferredRefresh))
+        ));
+    }
+
+    static constexpr float kRowHeight = 26.f;
+
+    CCNode* makeRow(std::filesystem::path path) {
+        auto row = CCNode::create();
+        row->setContentSize(CCSize{ m_fields->m_listW, kRowHeight });
+
+        std::string name = path.stem().string();
+        if (name.size() > 15) name = name.substr(0, 13) + "..";
+
+        auto label = CCLabelBMFont::create(name.c_str(), "chatFont.fnt");
+        label->setScale(0.4f);
+        label->setAnchorPoint(CCPoint{ 0.f, 0.5f });
+        label->setPosition(CCPoint{ 6.f, kRowHeight / 2.f });
+        row->addChild(label);
+
+        auto menu = CCMenu::create();
+        menu->setContentSize(CCSize{ m_fields->m_listW, kRowHeight });
+        menu->setPosition(CCPoint{ 0.f, 0.f });
+        row->addChild(menu);
+
+        auto loadSpr = ButtonSprite::create("L", 0, false, "goldFont.fnt", "GJ_button_01.png", 0.f, 0.45f);
+        auto loadBtn = CCMenuItemExt::createSpriteExtra(loadSpr, [this, path](CCMenuItemSpriteExtra*) {
+            int lid = 0;
+            if (!bot::loadMacro(path, bot::macro, lid)) {
+                Notification::create("Failed to load macro (bad file?)", NotificationIcon::Error)->show();
+                return;
+            }
+            bot::macroLevelID = lid;
+            bot::setMode(bot::Mode::Off);
+            this->updateStatusUI();
+
+            int const cur = bot::currentLevelID();
+            if (lid != 0 && cur != 0 && lid != cur) {
+                Notification::create(
+                    fmt::format("Macro is for level {}, this is {}", lid, cur),
+                    NotificationIcon::Warning, 4.f
+                )->show();
+            }
+            else {
+                Notification::create("Macro loaded - press PLAY", NotificationIcon::Success)->show();
+            }
+        });
+        loadBtn->setPosition(CCPoint{ m_fields->m_listW - 30.f, kRowHeight / 2.f });
+        menu->addChild(loadBtn);
+
+        auto delSpr = ButtonSprite::create("X", 0, false, "goldFont.fnt", "GJ_button_06.png", 0.f, 0.45f);
+        auto delBtn = CCMenuItemExt::createSpriteExtra(delSpr, [this, path](CCMenuItemSpriteExtra*) {
+            std::error_code ec;
+            if (std::filesystem::remove(path, ec)) {
+                Notification::create("Macro deleted", NotificationIcon::Info)->show();
+            }
+            else {
+                Notification::create("Delete failed", NotificationIcon::Error)->show();
+            }
+            this->scheduleRefreshMacroList();
+        });
+        delBtn->setPosition(CCPoint{ m_fields->m_listW - 10.f, kRowHeight / 2.f });
+        menu->addChild(delBtn);
+
+        return row;
+    }
+
+    void updateEditorInfo() {
+        auto& f = m_fields;
+        if (!f->m_editInfo) return;
+        std::string txt;
+        if (bot::macro.empty()) {
+            txt = "macro is empty";
+        }
+        else {
+            if (f->m_editCursor >= bot::macro.size()) f->m_editCursor = bot::macro.size() - 1;
+            auto const& a = bot::macro[f->m_editCursor];
+            txt = fmt::format("act {}/{}  step {}  btn{} {} {}",
+                              f->m_editCursor + 1, bot::macro.size(), a.step,
+                              static_cast<int>(a.button), a.p1 ? "P1" : "P2",
+                              a.down ? "HOLD" : "RELEASE");
+            if (f->m_fracInput) {
+                f->m_fracInput->setString(fmt::format("{:.7f}", a.frac));
+            }
+        }
+        f->m_editInfo->setString(txt.c_str());
+    }
+
+    void refreshEditor() {
+        auto& f = m_fields;
+        if (!f->m_listContainer) return;
+        f->m_listContainer->removeAllChildren();
+        float const W = f->m_listW;
+
+        f->m_editInfo = CCLabelBMFont::create("", "chatFont.fnt");
+        f->m_editInfo->setScale(0.38f);
+        f->m_editInfo->setAnchorPoint(CCPoint{ 0.f, 0.5f });
+        f->m_editInfo->setPosition(CCPoint{ 4.f, 98.f });
+        f->m_listContainer->addChild(f->m_editInfo);
+
+        auto navMenu = CCMenu::create();
+        navMenu->setContentSize(CCSize{ W, 24.f });
+        navMenu->setPosition(CCPoint{ 0.f, 58.f });
+        f->m_listContainer->addChild(navMenu);
+
+        auto prevSpr = ButtonSprite::create("PREV", 0, false, "goldFont.fnt", "GJ_button_01.png", 0.f, 0.45f);
+        auto prevBtn = CCMenuItemExt::createSpriteExtra(prevSpr, [this](CCMenuItemSpriteExtra*) {
+            if (m_fields->m_editCursor > 0) --m_fields->m_editCursor;
+            this->updateEditorInfo();
+        });
+        prevBtn->setPosition(CCPoint{ 34.f, 12.f });
+        navMenu->addChild(prevBtn);
+
+        auto nextSpr = ButtonSprite::create("NEXT", 0, false, "goldFont.fnt", "GJ_button_01.png", 0.f, 0.45f);
+        auto nextBtn = CCMenuItemExt::createSpriteExtra(nextSpr, [this](CCMenuItemSpriteExtra*) {
+            if (!bot::macro.empty() && m_fields->m_editCursor + 1 < bot::macro.size()) ++m_fields->m_editCursor;
+            this->updateEditorInfo();
+        });
+        nextBtn->setPosition(CCPoint{ 96.f, 12.f });
+        navMenu->addChild(nextBtn);
+
+        f->m_fracInput = TextInput::create(84.f, "0.0000000", "chatFont.fnt");
+        f->m_fracInput->setCommonFilter(CommonFilter::Float);
+        f->m_fracInput->setMaxCharCount(10);
+        f->m_fracInput->setScale(0.7f);
+        f->m_fracInput->setPosition(CCPoint{ 46.f, 32.f });
+        f->m_listContainer->addChild(f->m_fracInput);
+
+        auto setMenu = CCMenu::create();
+        setMenu->setContentSize(CCSize{ 60.f, 24.f });
+        setMenu->setPosition(CCPoint{ W - 60.f, 20.f });
+        f->m_listContainer->addChild(setMenu);
+
+        auto setSpr = ButtonSprite::create("SET", 0, false, "goldFont.fnt", "GJ_button_01.png", 0.f, 0.45f);
+        auto setBtn = CCMenuItemExt::createSpriteExtra(setSpr, [this](CCMenuItemSpriteExtra*) {
+            if (bot::macro.empty()) return;
+            std::string const raw = m_fields->m_fracInput
+                ? std::string(m_fields->m_fracInput->getString().c_str()) : std::string();
+            double const v = bot::parseFracString(raw);
+            bot::macro[m_fields->m_editCursor].frac = v;
+            this->updateEditorInfo();
+            Notification::create(
+                fmt::format("act {} frac = {:.7f}", m_fields->m_editCursor + 1, v),
+                NotificationIcon::Success
+            )->show();
+        });
+        setBtn->setPosition(CCPoint{ 30.f, 12.f });
+        setMenu->addChild(setBtn);
+
+        auto hint = CCLabelBMFont::create("sub-frame position of the click inside its tick", "chatFont.fnt");
+        hint->setScale(0.32f);
+        hint->setAnchorPoint(CCPoint{ 0.f, 0.5f });
+        hint->setPosition(CCPoint{ 4.f, 8.f });
+        f->m_listContainer->addChild(hint);
+
+        this->updateEditorInfo();
+    }
+
+    void setEditMode(bool on) {
+        auto& f = m_fields;
+        f->m_editMode = on;
+        if (on && !bot::macro.empty()) f->m_editCursor = bot::macro.size() - 1;
+        if (f->m_editBtnSprite) {
+            f->m_editBtnSprite->setString(on ? "LIST" : "EDIT");
+            f->m_editBtnSprite->setColor(on ? ccColor3B{ 255, 180, 80 } : ccColor3B{ 255, 255, 255 });
+        }
+        f->m_listContainer->removeAllChildren();
+        if (on) this->refreshEditor();
+        else this->refreshMacroList();
+    }
+
+    void refreshCurrentView() {
+        if (m_fields->m_editMode) this->refreshEditor();
+        else this->refreshMacroList();
+    }
+
+    void refreshMacroList() {
+        auto& f = m_fields;
+        if (!f->m_listContainer) return;
+        f->m_listContainer->removeAllChildren();
+
+        std::vector<std::filesystem::path> files;
+        std::error_code ec;
+        auto dir = bot::getMacroDir();
+        if (!dir.empty()) {
+            std::filesystem::directory_iterator it(dir, ec);
+            std::filesystem::directory_iterator end;
+            for (; !ec && it != end; it.increment(ec)) {
+                std::error_code fec;
+                auto const& entry = *it;
+                if (entry.is_regular_file(fec) && !fec && entry.path().extension() == ".gdbot") {
+                    files.push_back(entry.path());
+                }
+            }
+        }
+
+        std::sort(files.begin(), files.end(), [](std::filesystem::path const& a, std::filesystem::path const& b) {
+            return a.filename().string() > b.filename().string();
+        });
+
+        auto items = CCArray::create();
+        for (size_t i = 0; i < files.size(); ++i) {
+            items->addObject(this->makeRow(files[i]));
+        }
+
+        auto list = ListView::create(items, kRowHeight, f->m_listW, f->m_listH);
+        if (!list) return;
+        list->setPosition(CCPoint{ 0.f, 0.f });
+        f->m_listContainer->addChild(list);
+    }
+
+    void customSetup() {
+        PauseLayer::customSetup();
+        auto pl = PlayLayer::get();
+        if (!pl) return;
+
+        auto const winSize = CCDirector::sharedDirector()->getWinSize();
+        float const panelW = 176.f;
+        float const panelH = 292.f;
+        float const panelX = winSize.width - panelW - 8.f;
+        float const panelY = (winSize.height - panelH) / 2.f;
+
+        auto panel = CCLayerColor::create(ccc4(0, 0, 0, 190), panelW, panelH);
+        panel->setPosition(CCPoint{ panelX, panelY });
+        this->addChild(panel, 100);
+
+        auto title = CCLabelBMFont::create("CBF TAS BOT", "goldFont.fnt");
+        title->setScale(0.5f);
+        title->setPosition(CCPoint{ panelW / 2.f, panelH - 16.f });
+        panel->addChild(title);
+
+        m_fields->m_statusLabel = CCLabelBMFont::create("OFF", "chatFont.fnt");
+        m_fields->m_statusLabel->setScale(0.5f);
+        m_fields->m_statusLabel->setPosition(CCPoint{ panelW / 2.f, panelH - 34.f });
+        panel->addChild(m_fields->m_statusLabel);
+
+        m_fields->m_fracLabel = CCLabelBMFont::create("frac: no clicks yet", "chatFont.fnt");
+        m_fields->m_fracLabel->setScale(0.38f);
+        m_fields->m_fracLabel->setPosition(CCPoint{ panelW / 2.f, panelH - 48.f });
+        panel->addChild(m_fields->m_fracLabel);
+
+        auto modeMenu = CCMenu::create();
+        modeMenu->setContentSize(CCSize{ panelW, 24.f });
+        modeMenu->setPosition(CCPoint{ 0.f, panelH - 80.f });
+        panel->addChild(modeMenu);
+
+        m_fields->m_offSprite = ButtonSprite::create("OFF", 0, false, "goldFont.fnt", "GJ_button_01.png", 0.f, 0.45f);
+        auto offBtn = CCMenuItemExt::createSpriteExtra(m_fields->m_offSprite, [this](CCMenuItemSpriteExtra*) {
+            bot::setMode(bot::Mode::Off);
+            this->updateStatusUI();
+        });
+        offBtn->setPosition(CCPoint{ panelW * 0.2f, 12.f });
+        modeMenu->addChild(offBtn);
+
+        m_fields->m_recSprite = ButtonSprite::create("REC", 0, false, "goldFont.fnt", "GJ_button_01.png", 0.f, 0.45f);
+        auto recBtn = CCMenuItemExt::createSpriteExtra(m_fields->m_recSprite, [this](CCMenuItemSpriteExtra*) {
+            bot::macro.clear();
+            bot::macroLevelID = bot::currentLevelID();
+            bot::setMode(bot::Mode::Record);
+            this->updateStatusUI();
+            Notification::create("Recording started", NotificationIcon::Info)->show();
+            if (auto p = PlayLayer::get()) p->resetLevel();
+        });
+        recBtn->setPosition(CCPoint{ panelW * 0.5f, 12.f });
+        modeMenu->addChild(recBtn);
+
+        m_fields->m_playSprite = ButtonSprite::create("PLAY", 0, false, "goldFont.fnt", "GJ_button_01.png", 0.f, 0.45f);
+        auto playBtn = CCMenuItemExt::createSpriteExtra(m_fields->m_playSprite, [this](CCMenuItemSpriteExtra*) {
+            if (bot::macro.empty()) {
+                Notification::create("No macro loaded", NotificationIcon::Warning)->show();
+                return;
+            }
+            int const cur = bot::currentLevelID();
+            if (bot::macroLevelID != 0 && cur != 0 && bot::macroLevelID != cur) {
+                Notification::create(
+                    fmt::format("Macro is for level {}, refusing to play on {}", bot::macroLevelID, cur),
+                    NotificationIcon::Error, 4.f
+                )->show();
+                return;
+            }
+            bot::setMode(bot::Mode::Play);
+            this->updateStatusUI();
+            Notification::create("Playing...", NotificationIcon::Success)->show();
+            if (auto p = PlayLayer::get()) p->resetLevel();
+        });
+        playBtn->setPosition(CCPoint{ panelW * 0.8f, 12.f });
+        modeMenu->addChild(playBtn);
+
+        auto speedLbl = CCLabelBMFont::create("Speed:", "chatFont.fnt");
+        speedLbl->setScale(0.45f);
+        speedLbl->setAnchorPoint(CCPoint{ 0.f, 0.5f });
+        speedLbl->setPosition(CCPoint{ 10.f, panelH - 106.f });
+        panel->addChild(speedLbl);
+
+        m_fields->m_speedInput = TextInput::create(60.f, "1.00", "chatFont.fnt");
+        m_fields->m_speedInput->setCommonFilter(CommonFilter::Float);
+        m_fields->m_speedInput->setMaxCharCount(6);
+        m_fields->m_speedInput->setScale(0.7f);
+        m_fields->m_speedInput->setPosition(CCPoint{ 86.f, panelH - 106.f });
+        m_fields->m_speedInput->setString(fmt::format("{:.2f}", bot::recSpeed));
+        m_fields->m_speedInput->setCallback([](std::string const& str) {
+            bot::recSpeed = bot::parseSpeedString(str);
+            if (auto mod = Mod::get()) mod->setSavedValue<double>("recSpeed", bot::recSpeed);
+        });
+        panel->addChild(m_fields->m_speedInput);
+
+        auto fxMenu = CCMenu::create();
+        fxMenu->setContentSize(CCSize{ 40.f, 24.f });
+        fxMenu->setPosition(CCPoint{ panelW - 44.f, panelH - 118.f });
+        panel->addChild(fxMenu);
+
+        m_fields->m_fxSprite = ButtonSprite::create("FX", 0, false, "goldFont.fnt", "GJ_button_01.png", 0.f, 0.45f);
+        auto fxBtn = CCMenuItemExt::createSpriteExtra(m_fields->m_fxSprite, [this](CCMenuItemSpriteExtra*) {
+            bot::disableDeathEffects = !bot::disableDeathEffects;
+            if (auto mod = Mod::get()) mod->setSavedValue<bool>("disableDeathEffects", bot::disableDeathEffects);
+            this->updateStatusUI();
+            Notification::create(
+                bot::disableDeathEffects ? "Death / wave / respawn FX: OFF" : "Death / wave / respawn FX: ON",
+                NotificationIcon::Info
+            )->show();
+        });
+        fxBtn->setPosition(CCPoint{ 20.f, 12.f });
+        fxMenu->addChild(fxBtn);
+
+        auto nameLbl = CCLabelBMFont::create("Name:", "chatFont.fnt");
+        nameLbl->setScale(0.45f);
+        nameLbl->setAnchorPoint(CCPoint{ 0.f, 0.5f });
+        nameLbl->setPosition(CCPoint{ 10.f, panelH - 132.f });
+        panel->addChild(nameLbl);
+
+        m_fields->m_nameInput = TextInput::create(104.f, bot::generateTimestampName().c_str(), "chatFont.fnt");
+        m_fields->m_nameInput->setMaxCharCount(48);
+        m_fields->m_nameInput->setScale(0.7f);
+        m_fields->m_nameInput->setPosition(CCPoint{ 100.f, panelH - 132.f });
+        panel->addChild(m_fields->m_nameInput);
+
+        auto saveMenu = CCMenu::create();
+        saveMenu->setContentSize(CCSize{ panelW - 16.f, 24.f });
+        saveMenu->setPosition(CCPoint{ 8.f, panelH - 170.f });
+        panel->addChild(saveMenu);
+
+        auto saveSpr = ButtonSprite::create("SAVE CURRENT", 0, false, "goldFont.fnt", "GJ_button_01.png", 0.f, 0.45f);
+        auto saveBtn = CCMenuItemExt::createSpriteExtra(saveSpr, [this](CCMenuItemSpriteExtra*) {
+            if (bot::macro.empty()) {
+                Notification::create("Macro is empty", NotificationIcon::Warning)->show();
+                return;
+            }
+            std::string const raw = m_fields->m_nameInput
+                ? std::string(m_fields->m_nameInput->getString().c_str())
+                : std::string();
+            std::string const clean = bot::sanitizeFileName(raw);
+            std::string const stem = clean.empty() ? bot::generateTimestampName() : clean;
+
+            auto dir = bot::getMacroDir();
+            if (dir.empty()) {
+                Notification::create("Save failed: no config dir", NotificationIcon::Error)->show();
+                return;
+            }
+            auto path = dir / (stem + ".gdbot");
+            std::error_code ec;
+            bool const existed = std::filesystem::exists(path, ec);
+
+            int const lid = bot::macroLevelID != 0 ? bot::macroLevelID : bot::currentLevelID();
+            if (bot::saveMacro(path, bot::macro, lid)) {
+                bot::macroLevelID = lid;
+                this->scheduleRefreshMacroList();
+                Notification::create(existed ? "Macro overwritten" : "Macro saved", NotificationIcon::Success)->show();
+            }
+            else {
+                Notification::create("Save failed", NotificationIcon::Error)->show();
+            }
+        });
+        saveBtn->setPosition(CCPoint{ (panelW - 16.f) * 0.33f, 12.f });
+        saveMenu->addChild(saveBtn);
+
+        m_fields->m_editBtnSprite = ButtonSprite::create("EDIT", 0, false, "goldFont.fnt", "GJ_button_01.png", 0.f, 0.45f);
+        auto editBtn = CCMenuItemExt::createSpriteExtra(m_fields->m_editBtnSprite, [this](CCMenuItemSpriteExtra*) {
+            this->setEditMode(!m_fields->m_editMode);
+        });
+        editBtn->setPosition(CCPoint{ (panelW - 16.f) * 0.82f, 12.f });
+        saveMenu->addChild(editBtn);
+
+        m_fields->m_listW = panelW - 12.f;
+        m_fields->m_listH = 110.f;
+        m_fields->m_listContainer = CCNode::create();
+        m_fields->m_listContainer->setContentSize(CCSize{ m_fields->m_listW, m_fields->m_listH });
+        m_fields->m_listContainer->setAnchorPoint(CCPoint{ 0.f, 0.f });
+        m_fields->m_listContainer->setPosition(CCPoint{ 6.f, 10.f });
+        panel->addChild(m_fields->m_listContainer);
+
+        this->updateStatusUI();
+        this->refreshCurrentView();
+    }
+};
