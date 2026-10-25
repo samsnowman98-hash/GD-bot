@@ -186,6 +186,10 @@ namespace bot {
     inline double g_fracMax = 0.0;
     inline uint32_t g_fracClamped = 0;
     inline uint32_t g_fracSamples = 0;
+    // Clicks recorded without any OS timestamp (Android touches): these fall
+    // back to tick granularity. If this counter grows while g_fracSamples
+    // stays 0, the platform simply does not deliver sub-frame input times.
+    inline uint32_t g_fracFallback = 0;
 
     // --- game clock -------------------------------------------------------
     // Driven by the dt handed to CCScheduler::update (unscaled by the
@@ -287,6 +291,7 @@ namespace bot {
         g_fracMax = 0.0;
         g_fracClamped = 0;
         g_fracSamples = 0;
+        g_fracFallback = 0;
     }
 
     inline void applyClickFlags() {
@@ -398,6 +403,26 @@ namespace bot {
 
     // getConfigDir() needs no "save-data" declaration in mod.json, unlike
     // getSaveDir(), which throws without it.
+    // Like parseSpeedString but for a sub-frame position in [0, 0.9999999].
+    inline double parseFracString(std::string const& str) {
+        std::string s = str;
+        for (char& c : s) if (c == ',') c = '.';
+        double whole = 0.0, frac = 0.0, div = 1.0;
+        bool inFrac = false, hasDigits = false;
+        for (char c : s) {
+            if (c >= '0' && c <= '9') {
+                hasDigits = true;
+                if (!inFrac) whole = whole * 10.0 + (c - '0');
+                else { div *= 10.0; frac += (c - '0') / div; }
+            }
+            else if (c == '.' && !inFrac) inFrac = true;
+            else if (c == ' ') continue;
+            else break;
+        }
+        if (!hasDigits) return 0.0;
+        return std::clamp(whole + frac, 0.0, 0.9999999);
+    }
+
     inline std::filesystem::path getMacroDir() {
         auto mod = Mod::get();
         if (!mod) return std::filesystem::path();
@@ -781,6 +806,7 @@ class $modify(BotPlayerObject, PlayerObject) {
                     else {
                         double rel = in.timestamp - stepStartTime;
                         s.frac = std::clamp(rel / stepDuration, 0.0, 0.9999);
+                        ++g_fracFallback;
                     }
                     subs.push_back(s);
 
@@ -1033,6 +1059,11 @@ class $modify(BotPauseLayer, PauseLayer) {
         CCNode* m_listContainer = nullptr;
         CCLabelBMFont* m_statusLabel = nullptr;
         CCLabelBMFont* m_fracLabel = nullptr;
+        bool m_editMode = false;
+        size_t m_editCursor = 0;
+        CCLabelBMFont* m_editInfo = nullptr;
+        TextInput* m_fracInput = nullptr;
+        ButtonSprite* m_editBtnSprite = nullptr;
         ButtonSprite* m_offSprite = nullptr;
         ButtonSprite* m_recSprite = nullptr;
         ButtonSprite* m_playSprite = nullptr;
@@ -1063,9 +1094,10 @@ class $modify(BotPauseLayer, PauseLayer) {
                 fs = "frac: no clicks yet";
             }
             else {
-                fs = fmt::format("frac {:.4f}..{:.4f}  clamp {}/{}",
+                fs = fmt::format("frac {:.4f}..{:.4f}  os {}  fb {}  clamp {}",
                                  bot::g_fracMin, bot::g_fracMax,
-                                 bot::g_fracClamped, bot::g_fracSamples);
+                                 bot::g_fracSamples, bot::g_fracFallback,
+                                 bot::g_fracClamped);
             }
             f->m_fracLabel->setString(fs.c_str());
         }
@@ -1084,7 +1116,7 @@ class $modify(BotPauseLayer, PauseLayer) {
     // list cannot be torn down synchronously. Bounce it through an action.
     void onDeferredRefresh() {
         m_fields->m_refreshScheduled = false;
-        this->refreshMacroList();
+        this->refreshCurrentView();
     }
 
     void scheduleRefreshMacroList() {
@@ -1159,6 +1191,126 @@ class $modify(BotPauseLayer, PauseLayer) {
         menu->addChild(delBtn);
 
         return row;
+    }
+
+    // ---- sub-frame editor -------------------------------------------------
+    //
+    // WHY THIS EXISTS: on Android a gameplay touch carries no sub-frame
+    // timestamp at all -- cocos2d::CCTouch only stores m_nId,
+    // m_startPointCaptured, m_startPoint, m_point, m_prevPoint, and the JNI
+    // entry nativeTouchesBegin(id, x, y) receives no event time. Worse, a
+    // touch always arrives BEFORE the start of the tick that consumes it, so
+    // its position inside that tick is <= 0 by construction. Live sub-frame
+    // recording is therefore a PC-keyboard-only feature (that path uses
+    // UILayer::handleKeypress' OS timestamp). On every platform the way to
+    // place a click at an exact fraction such as 0.0384163 is this editor.
+    void updateEditorInfo() {
+        auto& f = m_fields;
+        if (!f->m_editInfo) return;
+        std::string txt;
+        if (bot::macro.empty()) {
+            txt = "macro is empty";
+        }
+        else {
+            if (f->m_editCursor >= bot::macro.size()) f->m_editCursor = bot::macro.size() - 1;
+            auto const& a = bot::macro[f->m_editCursor];
+            txt = fmt::format("act {}/{}  step {}  btn{} {} {}",
+                              f->m_editCursor + 1, bot::macro.size(), a.step,
+                              static_cast<int>(a.button), a.p1 ? "P1" : "P2",
+                              a.down ? "HOLD" : "RELEASE");
+            if (f->m_fracInput) {
+                f->m_fracInput->setString(fmt::format("{:.7f}", a.frac));
+            }
+        }
+        f->m_editInfo->setString(txt.c_str());
+    }
+
+    void refreshEditor() {
+        auto& f = m_fields;
+        if (!f->m_listContainer) return;
+        f->m_listContainer->removeAllChildren();
+        float const W = f->m_listW;
+
+        f->m_editInfo = CCLabelBMFont::create("", "chatFont.fnt");
+        f->m_editInfo->setScale(0.38f);
+        f->m_editInfo->setAnchorPoint(CCPoint{ 0.f, 0.5f });
+        f->m_editInfo->setPosition(CCPoint{ 4.f, 98.f });
+        f->m_listContainer->addChild(f->m_editInfo);
+
+        auto navMenu = CCMenu::create();
+        navMenu->setContentSize(CCSize{ W, 24.f });
+        navMenu->setPosition(CCPoint{ 0.f, 58.f });
+        f->m_listContainer->addChild(navMenu);
+
+        auto prevSpr = ButtonSprite::create("PREV", 0, false, "goldFont.fnt", "GJ_button_01.png", 0.f, 0.45f);
+        auto prevBtn = CCMenuItemExt::createSpriteExtra(prevSpr, [this](CCMenuItemSpriteExtra*) {
+            if (m_fields->m_editCursor > 0) --m_fields->m_editCursor;
+            this->updateEditorInfo();
+        });
+        prevBtn->setPosition(CCPoint{ 34.f, 12.f });
+        navMenu->addChild(prevBtn);
+
+        auto nextSpr = ButtonSprite::create("NEXT", 0, false, "goldFont.fnt", "GJ_button_01.png", 0.f, 0.45f);
+        auto nextBtn = CCMenuItemExt::createSpriteExtra(nextSpr, [this](CCMenuItemSpriteExtra*) {
+            if (!bot::macro.empty() && m_fields->m_editCursor + 1 < bot::macro.size()) ++m_fields->m_editCursor;
+            this->updateEditorInfo();
+        });
+        nextBtn->setPosition(CCPoint{ 96.f, 12.f });
+        navMenu->addChild(nextBtn);
+
+        f->m_fracInput = TextInput::create(84.f, "0.0000000", "chatFont.fnt");
+        f->m_fracInput->setCommonFilter(CommonFilter::Float);
+        f->m_fracInput->setMaxCharCount(10);
+        f->m_fracInput->setScale(0.7f);
+        f->m_fracInput->setPosition(CCPoint{ 46.f, 32.f });
+        f->m_listContainer->addChild(f->m_fracInput);
+
+        auto setMenu = CCMenu::create();
+        setMenu->setContentSize(CCSize{ 60.f, 24.f });
+        setMenu->setPosition(CCPoint{ W - 60.f, 20.f });
+        f->m_listContainer->addChild(setMenu);
+
+        auto setSpr = ButtonSprite::create("SET", 0, false, "goldFont.fnt", "GJ_button_01.png", 0.f, 0.45f);
+        auto setBtn = CCMenuItemExt::createSpriteExtra(setSpr, [this](CCMenuItemSpriteExtra*) {
+            if (bot::macro.empty()) return;
+            std::string const raw = m_fields->m_fracInput
+                ? std::string(m_fields->m_fracInput->getString().c_str()) : std::string();
+            double const v = bot::parseFracString(raw);
+            bot::macro[m_fields->m_editCursor].frac = v;
+            this->updateEditorInfo();
+            Notification::create(
+                fmt::format("act {} frac = {:.7f}", m_fields->m_editCursor + 1, v),
+                NotificationIcon::Success
+            )->show();
+        });
+        setBtn->setPosition(CCPoint{ 30.f, 12.f });
+        setMenu->addChild(setBtn);
+
+        auto hint = CCLabelBMFont::create("sub-frame position of the click inside its tick", "chatFont.fnt");
+        hint->setScale(0.32f);
+        hint->setAnchorPoint(CCPoint{ 0.f, 0.5f });
+        hint->setPosition(CCPoint{ 4.f, 8.f });
+        f->m_listContainer->addChild(hint);
+
+        this->updateEditorInfo();
+    }
+
+    void setEditMode(bool on) {
+        auto& f = m_fields;
+        f->m_editMode = on;
+        if (on && !bot::macro.empty()) f->m_editCursor = bot::macro.size() - 1;
+        if (f->m_editBtnSprite) {
+            f->m_editBtnSprite->setString(on ? "LIST" : "EDIT");
+            f->m_editBtnSprite->setColor(on ? ccColor3B{ 255, 180, 80 } : ccColor3B{ 255, 255, 255 });
+        }
+        f->m_listContainer->removeAllChildren();
+        if (on) this->refreshEditor();
+        else this->refreshMacroList();
+    }
+
+    void refreshCurrentView() {
+        if (m_fields->m_editMode) this->refreshEditor();
+        else this->refreshMacroList();
     }
 
     // ---- list -------------------------------------------------------------
@@ -1236,7 +1388,7 @@ class $modify(BotPauseLayer, PauseLayer) {
 
         auto modeMenu = CCMenu::create();
         modeMenu->setContentSize(CCSize{ panelW, 24.f });
-        modeMenu->setPosition(CCPoint{ 0.f, panelH - 70.f });
+        modeMenu->setPosition(CCPoint{ 0.f, panelH - 80.f });
         panel->addChild(modeMenu);
 
         m_fields->m_offSprite = ButtonSprite::create("OFF", 0, false, "goldFont.fnt", "GJ_button_01.png", 0.f, 0.45f);
@@ -1285,14 +1437,14 @@ class $modify(BotPauseLayer, PauseLayer) {
         auto speedLbl = CCLabelBMFont::create("Speed:", "chatFont.fnt");
         speedLbl->setScale(0.45f);
         speedLbl->setAnchorPoint(CCPoint{ 0.f, 0.5f });
-        speedLbl->setPosition(CCPoint{ 10.f, panelH - 96.f });
+        speedLbl->setPosition(CCPoint{ 10.f, panelH - 106.f });
         panel->addChild(speedLbl);
 
         m_fields->m_speedInput = TextInput::create(60.f, "1.00", "chatFont.fnt");
         m_fields->m_speedInput->setCommonFilter(CommonFilter::Float);
         m_fields->m_speedInput->setMaxCharCount(6);
         m_fields->m_speedInput->setScale(0.7f);
-        m_fields->m_speedInput->setPosition(CCPoint{ 86.f, panelH - 96.f });
+        m_fields->m_speedInput->setPosition(CCPoint{ 86.f, panelH - 106.f });
         m_fields->m_speedInput->setString(fmt::format("{:.2f}", bot::recSpeed));
         m_fields->m_speedInput->setCallback([](std::string const& str) {
             bot::recSpeed = bot::parseSpeedString(str);
@@ -1302,7 +1454,7 @@ class $modify(BotPauseLayer, PauseLayer) {
 
         auto fxMenu = CCMenu::create();
         fxMenu->setContentSize(CCSize{ 40.f, 24.f });
-        fxMenu->setPosition(CCPoint{ panelW - 44.f, panelH - 108.f });
+        fxMenu->setPosition(CCPoint{ panelW - 44.f, panelH - 118.f });
         panel->addChild(fxMenu);
 
         m_fields->m_fxSprite = ButtonSprite::create("FX", 0, false, "goldFont.fnt", "GJ_button_01.png", 0.f, 0.45f);
@@ -1322,18 +1474,18 @@ class $modify(BotPauseLayer, PauseLayer) {
         auto nameLbl = CCLabelBMFont::create("Name:", "chatFont.fnt");
         nameLbl->setScale(0.45f);
         nameLbl->setAnchorPoint(CCPoint{ 0.f, 0.5f });
-        nameLbl->setPosition(CCPoint{ 10.f, panelH - 122.f });
+        nameLbl->setPosition(CCPoint{ 10.f, panelH - 132.f });
         panel->addChild(nameLbl);
 
         m_fields->m_nameInput = TextInput::create(104.f, bot::generateTimestampName().c_str(), "chatFont.fnt");
         m_fields->m_nameInput->setMaxCharCount(48);
         m_fields->m_nameInput->setScale(0.7f);
-        m_fields->m_nameInput->setPosition(CCPoint{ 100.f, panelH - 122.f });
+        m_fields->m_nameInput->setPosition(CCPoint{ 100.f, panelH - 132.f });
         panel->addChild(m_fields->m_nameInput);
 
         auto saveMenu = CCMenu::create();
         saveMenu->setContentSize(CCSize{ panelW - 16.f, 24.f });
-        saveMenu->setPosition(CCPoint{ 8.f, panelH - 160.f });
+        saveMenu->setPosition(CCPoint{ 8.f, panelH - 170.f });
         panel->addChild(saveMenu);
 
         auto saveSpr = ButtonSprite::create("SAVE CURRENT", 0, false, "goldFont.fnt", "GJ_button_01.png", 0.f, 0.45f);
@@ -1367,8 +1519,15 @@ class $modify(BotPauseLayer, PauseLayer) {
                 Notification::create("Save failed", NotificationIcon::Error)->show();
             }
         });
-        saveBtn->setPosition(CCPoint{ (panelW - 16.f) / 2.f, 12.f });
+        saveBtn->setPosition(CCPoint{ (panelW - 16.f) * 0.33f, 12.f });
         saveMenu->addChild(saveBtn);
+
+        m_fields->m_editBtnSprite = ButtonSprite::create("EDIT", 0, false, "goldFont.fnt", "GJ_button_01.png", 0.f, 0.45f);
+        auto editBtn = CCMenuItemExt::createSpriteExtra(m_fields->m_editBtnSprite, [this](CCMenuItemSpriteExtra*) {
+            this->setEditMode(!m_fields->m_editMode);
+        });
+        editBtn->setPosition(CCPoint{ (panelW - 16.f) * 0.82f, 12.f });
+        saveMenu->addChild(editBtn);
 
         m_fields->m_listW = panelW - 12.f;
         m_fields->m_listH = 110.f;
@@ -1379,6 +1538,6 @@ class $modify(BotPauseLayer, PauseLayer) {
         panel->addChild(m_fields->m_listContainer);
 
         this->updateStatusUI();
-        this->refreshMacroList();
+        this->refreshCurrentView();
     }
 };
