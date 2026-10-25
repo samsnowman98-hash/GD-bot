@@ -841,7 +841,7 @@ class $modify(BotPlayLayer, PlayLayer) {
             uint32_t const s = bot::step;
             auto& m = bot::macro;
             m.erase(
-                std::remove_if(m.begin(), m.end(), [s](Action const& a) { return a.step >= s; }),
+                std::remove_if(m.begin(), m.end(), [s](bot::Action const& a) { return a.step >= s; }),
                 m.end()
             );
             // The macro prefix is still the source of truth for what the
@@ -883,7 +883,7 @@ class $modify(BotPauseLayer, PauseLayer) {
     };
 
     void updateStatusUI() {
-        auto f = m_fields;
+        auto& f = m_fields;
         if (f->m_statusLabel) {
             std::string st = "OFF";
             if (bot::mode == bot::Mode::Record) st = fmt::format("REC  {} acts", bot::macro.size());
@@ -985,7 +985,7 @@ class $modify(BotPauseLayer, PauseLayer) {
 
     // ---- list -------------------------------------------------------------
     void refreshMacroList() {
-        auto f = m_fields;
+        auto& f = m_fields;
         if (!f->m_listContainer) return;
         f->m_listContainer->removeAllChildren();
 
