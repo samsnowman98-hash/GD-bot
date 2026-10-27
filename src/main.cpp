@@ -187,6 +187,10 @@ namespace bot {
         bool isFrozen = false;
         std::chrono::steady_clock::time_point freezeEndTime{};
 
+        // [P1] Окно-предохранитель после авто-рестарта из меню паузы:
+        // пока оно открыто, каждый кадр сверяем «меню паузы vs m_isPaused».
+        std::chrono::steady_clock::time_point pauseGuardUntil{};
+
         bool inResetLevel = false;
         int cpLoadDepth = 0;
         bool cpLoadedInReset = false;
@@ -1288,15 +1292,68 @@ namespace bot {
         state().inExplicitRestart = true;
     }
 
+    /// Ищет PauseLayer, висящий ребенком на уровне. [P1]
+    inline PauseLayer* findPauseLayer(PlayLayer* pl) {
+        if (!pl) return nullptr;
+        if (auto* children = pl->getChildren()) {
+            for (auto* node : CCArrayExt<CCNode*>(children)) {
+                if (auto* p = geode::cast::typeinfo_cast<PauseLayer*>(node)) {
+                    return p;
+                }
+            }
+        }
+        return nullptr;
+    }
+
+    /// Приводит пару «меню паузы / m_isPaused» к согласованному состоянию. [P1]
+    ///
+    /// Баг, который это чинит: после resumeAndRestart(...) игра УЖЕ running
+    /// (m_isPaused == false), а PauseLayer остаётся висеть на уровне ребёнком —
+    /// движок «отпустил» меню и сам его больше не уберёт. Итог: кубик едет,
+    /// а поверх него висит меню паузы. Лечится снятием узла вручную.
+    /// Обратная ситуация (m_isPaused == true при висящем меню) для игрока —
+    /// нормальная пауза; трогаем её только с forceResume (сразу после
+    /// resumeAndRestart и в коротком guard-окне, см. вызовы).
+    /// Возвращает true, если состояние пришлось чинить.
+    inline bool syncPauseState(PlayLayer* pl, bool forceResume = false) {
+        if (!pl) return false;
+
+        auto* pause = findPauseLayer(pl);
+        if (!pause) return false;
+
+        if (pl->m_isPaused) {
+            if (!forceResume) return false;
+            log::info("GDBot: force-resuming stray pause right after restart");
+            pl->resume();        // штатно: снять паузу и убрать меню
+            if (auto* left = findPauseLayer(pl)) {
+                left->removeFromParentAndCleanup(true);
+            }
+        } else {
+            log::info("GDBot: removing stray PauseLayer over running game");
+            pause->removeFromParentAndCleanup(true);
+        }
+        return true;
+    }
+
     /// Выход из паузы + рестарт с начала.
     /// Это замена несуществующему в 2.2081 togglePauseGame(false). [B3]
-    /// ВАЖНО: вызывать ПОСЛЕДНИМ в колбэке кнопки — внутри resume()
-    /// PauseLayer уничтожается.
+    /// ВАЖНО: вызывать ПОСЛЕДНИМ в колбэке кнопки (или с следующего тика) —
+    /// внутри resume() PauseLayer уничтожается.
     inline void restartFromMenu(PlayLayer* pl) {
         if (!pl) return;
         beginExplicitRestart();
         pl->resumeAndRestart(true);
         state().inExplicitRestart = false;
+
+        // [P1] Сразу приводим состояние к согласованному (если движок оставил
+        // меню висеть поверх уже запущенной игры — убираем его).
+        syncPauseState(pl, true);
+
+        // И ещё ~1 секунду проверяем каждый кадр: меню может «всплыть»
+        // с опозданием на кадр (геоде-PopupManager показывает priority-попап
+        // через pauseGame(false); движок мог дособрать паузу позже).
+        state().pauseGuardUntil = std::chrono::steady_clock::now()
+                                + std::chrono::milliseconds(1000);
     }
 }
 
@@ -1800,6 +1857,20 @@ class $modify(BotBaseLayer, GJBaseGameLayer) {
 
         if (bot::isPlayLayer(this)) {
             ++bot::diagUpdateCount();
+
+            // [P1] Окно после авто-рестарта из меню паузы: если игра running,
+            // а PauseLayer всё ещё висит ребёнком — снимаем его. Сюда же
+            // попадаем, если меню «всплыло» на следующий кадр после рестарта.
+            if (std::chrono::steady_clock::now() < s.pauseGuardUntil) {
+                // forceResume: в этом окне любая пауза — посторонняя (движок
+                // или Geode не должны были её ставить сразу после рестарта).
+                if (bot::syncPauseState(PlayLayer::get(), true)) {
+                    // Сузим окно: починили — хватит, чтобы не спорить
+                    // с возможной РУЧНОЙ паузой игрока дальше.
+                    s.pauseGuardUntil = std::chrono::steady_clock::now()
+                                      + std::chrono::milliseconds(150);
+                }
+            }
         }
 
         if (!bot::isPlayLayer(this) || !s.isFrozen || s.mode != bot::Mode::Record) {
@@ -2393,10 +2464,12 @@ class $modify(BotPauseLayer, PauseLayer) {
             return;   // паузу не закрываем — игрок сам нажмёт Resume
         }
 
-        // 2) ПОСЛЕДНИМ: выход из паузы + рестарт одним вызовом. [B3]
-        //    Внутри resume PauseLayer уничтожается, поэтому после этой строки
-        //    не трогаем ни this, ни m_fields, ни sender — сразу выходим.
-        bot::restartFromMenu(pl);
+        // 2) ПОСЛЕДНИМ: выход из паузы + рестарт — но СО СЛЕДУЮЩЕГО ТИКА. [B3][P1]
+        //    Прямо из activate() нельзя: PauseLayer снимается посреди диспетчеризации
+        //    тача собственной кнопки, и меню после этого «переоткрывается» поверх
+        //    уже едущего кубика. На следующем тике диспетчеризация давно закончена.
+        //    После этой строки this/m_fields/sender не трогаем.
+        bot::later([pl] { bot::restartFromMenu(pl); });
     }
 };
 
