@@ -41,14 +41,20 @@
 //     удержание без разрыва на "отпустил-нажал".
 //
 //  4) Добавлен настраиваемый TPS (fixed-step аккумулятор), многослотовое сохранение/загрузка
-//     макросов и асинхронное сохранение — см. комментарии в соответствующих местах.
+//     макросов и асинхронное сохранение.
+//
+//  5) ИСПРАВЛЕНИЕ КОМПИЛЯЦИИ: в используемой версии Geode SDK нет шаблона geode::Popup<...>
+//     с API (setTitle/m_mainLayer/initAnchored/onClose) — отсюда каскад ошибок компиляции.
+//     Оба попапа (ввод текста и менеджер макросов) переписаны как самостоятельные модальные
+//     слои поверх cocos2d::CCLayerColor/CCMenu/ButtonSprite — без каких-либо
+//     версионно-зависимых Geode UI обёрток. Также исправлена неоднозначность
+//     gd::string/std::string в тернарном операторе явным приведением к std::string.
 // ---------------------------------------------------------------------
 
 #include <Geode/Geode.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
 #include <Geode/modify/PlayLayer.hpp>
 #include <Geode/modify/PauseLayer.hpp>
-#include <Geode/ui/Popup.hpp>
 #include <Geode/ui/TextInput.hpp>
 
 #include <algorithm>
@@ -969,51 +975,85 @@ class $modify(BotPlayLayer, PlayLayer) {
 };
 
 // =====================================================================
-//  Попапы: ввод текста/числа и менеджер макросов
+//  Модальные окна бота — ввод текста/числа и менеджер макросов.
 //
-//  ВНИМАНИЕ: сигнатуры geode::Popup<...>::initAnchored / setTitle и
-//  geode::TextInput::create / getString соответствуют распространённому
-//  в комьюнити паттерну Geode-попапов. Если в вашей версии SDK они
-//  немного отличаются — поправьте эти несколько мест, вся остальная
-//  (игровая) логика бота от этого не зависит.
+//  Реализованы на чистом cocos2d::CCLayerColor/CCMenu/ButtonSprite —
+//  БЕЗ использования geode::Popup<...> (в данной версии Geode SDK этого
+//  шаблона с ожидаемым API нет, из-за чего раньше была ошибка компиляции
+//  "unknown template name 'Popup'" и каскад связанных с ней ошибок).
+//  Это самодостаточные полноэкранные затемнённые слои, добавляемые
+//  напрямую в текущую сцену через show().
 // =====================================================================
 
-class BotPromptPopup : public geode::Popup<std::string, std::string, std::function<void(std::string)>> {
+class BotPromptPopup : public cocos2d::CCLayerColor {
 protected:
     geode::TextInput* m_input = nullptr;
     std::function<void(std::string)> m_callback;
 
-    bool setup(std::string title, std::string placeholder, std::function<void(std::string)> cb) override {
-        this->setTitle(title.c_str());
+    bool init(std::string const& title, std::string const& placeholder, std::function<void(std::string)> cb) {
+        auto winSize = CCDirector::get()->getWinSize();
+
+        if (!CCLayerColor::initWithColor(ccc4(0, 0, 0, 160), winSize.width, winSize.height)) {
+            return false;
+        }
+
+        this->setPosition({0.f, 0.f});
+        this->setZOrder(10000);
+
         m_callback = cb;
 
-        auto size = m_mainLayer->getContentSize();
+        float const panelW = 260.f;
+        float const panelH = 140.f;
+        float const px = (winSize.width - panelW) / 2.f;
+        float const py = (winSize.height - panelH) / 2.f;
 
-        m_input = geode::TextInput::create(200.f, placeholder);
-        m_input->setPosition({ size.width / 2.f, size.height / 2.f + 6.f });
-        m_mainLayer->addChild(m_input);
+        auto panel = CCLayerColor::create(ccc4(20, 20, 30, 255), panelW, panelH);
+        panel->setPosition({px, py});
+        this->addChild(panel);
+
+        auto titleLabel = CCLabelBMFont::create(title.c_str(), "bigFont.fnt");
+        titleLabel->setScale(.6f);
+        titleLabel->setPosition({panelW / 2.f, panelH - 22.f});
+        panel->addChild(titleLabel);
+
+        m_input = geode::TextInput::create(panelW - 40.f, placeholder);
+        m_input->setPosition({panelW / 2.f, panelH / 2.f + 6.f});
+        panel->addChild(m_input);
+
+        auto menu = CCMenu::create();
+        menu->setPosition({0.f, 0.f});
+        panel->addChild(menu);
 
         auto okSpr = ButtonSprite::create("OK", "bigFont.fnt", "GJ_button_01.png", .8f);
         auto okBtn = CCMenuItemSpriteExtra::create(okSpr, this, menu_selector(BotPromptPopup::onOk));
-        okBtn->setPosition({ 0.f, -34.f });
-
-        auto menu = CCMenu::create();
+        okBtn->setPosition({panelW / 2.f + 45.f, 24.f});
         menu->addChild(okBtn);
-        menu->setPosition({ size.width / 2.f, size.height / 2.f });
-        m_mainLayer->addChild(menu);
+
+        auto cancelSpr = ButtonSprite::create("Cancel", "bigFont.fnt", "GJ_button_06.png", .8f);
+        auto cancelBtn = CCMenuItemSpriteExtra::create(cancelSpr, this, menu_selector(BotPromptPopup::onCancel));
+        cancelBtn->setPosition({panelW / 2.f - 45.f, 24.f});
+        menu->addChild(cancelBtn);
 
         return true;
     }
 
 public:
     void onOk(CCObject*) {
-        std::string value = m_input ? m_input->getString() : std::string();
+        // getString() у TextInput возвращает "строковый" тип движка (не всегда
+        // буквально std::string на всех платформах сборки), поэтому приводим
+        // явно, чтобы не словить неоднозначность в тернарном операторе.
+        std::string value = m_input ? std::string(m_input->getString()) : std::string();
+        auto cb = m_callback;
 
-        if (m_callback) {
-            m_callback(value);
+        this->removeFromParentAndCleanup(true);
+
+        if (cb) {
+            cb(value);
         }
+    }
 
-        this->onClose(nullptr);
+    void onCancel(CCObject*) {
+        this->removeFromParentAndCleanup(true);
     }
 
     static BotPromptPopup* create(
@@ -1023,7 +1063,7 @@ public:
     ) {
         auto ret = new BotPromptPopup();
 
-        if (ret->initAnchored(240.f, 140.f, title, placeholder, cb)) {
+        if (ret->init(title, placeholder, cb)) {
             ret->autorelease();
             return ret;
         }
@@ -1031,30 +1071,64 @@ public:
         delete ret;
         return nullptr;
     }
+
+    void show() {
+        auto scene = CCDirector::get()->getRunningScene();
+        if (scene) {
+            scene->addChild(this, 10000);
+        }
+    }
 };
 
-class BotMacroPopup : public geode::Popup<> {
+class BotMacroPopup : public cocos2d::CCLayerColor {
 protected:
+    CCLayerColor* m_panel = nullptr;
     CCMenu* m_listMenu = nullptr;
     std::vector<std::string> m_names;
 
-    bool setup() override {
-        this->setTitle("GD Bot Macros");
+    bool init() {
+        auto winSize = CCDirector::get()->getWinSize();
+
+        if (!CCLayerColor::initWithColor(ccc4(0, 0, 0, 160), winSize.width, winSize.height)) {
+            return false;
+        }
+
+        this->setPosition({0.f, 0.f});
+        this->setZOrder(10000);
+
+        float const panelW = 360.f;
+        float const panelH = 260.f;
+        float const px = (winSize.width - panelW) / 2.f;
+        float const py = (winSize.height - panelH) / 2.f;
+
+        m_panel = CCLayerColor::create(ccc4(20, 20, 30, 255), panelW, panelH);
+        m_panel->setPosition({px, py});
+        this->addChild(m_panel);
+
+        auto titleLabel = CCLabelBMFont::create("GD Bot Macros", "bigFont.fnt");
+        titleLabel->setScale(.65f);
+        titleLabel->setPosition({panelW / 2.f, panelH - 20.f});
+        m_panel->addChild(titleLabel);
 
         m_listMenu = CCMenu::create();
-        m_listMenu->setPosition({ 0.f, 0.f });
-        m_mainLayer->addChild(m_listMenu);
-
-        auto size = m_mainLayer->getContentSize();
+        m_listMenu->setPosition({0.f, 0.f});
+        m_panel->addChild(m_listMenu);
 
         auto saveAsSpr = ButtonSprite::create("Save current as...", "bigFont.fnt", "GJ_button_04.png", .7f);
         saveAsSpr->setScale(.6f);
         auto saveAsBtn = CCMenuItemSpriteExtra::create(saveAsSpr, this, menu_selector(BotMacroPopup::onSaveAs));
+        saveAsBtn->setPosition({panelW / 2.f - 70.f, 20.f});
+
+        auto closeSpr = ButtonSprite::create("Close", "bigFont.fnt", "GJ_button_06.png", .7f);
+        closeSpr->setScale(.6f);
+        auto closeBtn = CCMenuItemSpriteExtra::create(closeSpr, this, menu_selector(BotMacroPopup::onCloseClicked));
+        closeBtn->setPosition({panelW / 2.f + 70.f, 20.f});
 
         auto bottomMenu = CCMenu::create();
         bottomMenu->addChild(saveAsBtn);
-        bottomMenu->setPosition({ size.width / 2.f, 22.f });
-        m_mainLayer->addChild(bottomMenu);
+        bottomMenu->addChild(closeBtn);
+        bottomMenu->setPosition({0.f, 0.f});
+        m_panel->addChild(bottomMenu);
 
         this->rebuildList();
         return true;
@@ -1063,9 +1137,9 @@ protected:
     void rebuildList() {
         m_listMenu->removeAllChildren();
 
-        // Удаляем старые текстовые лейблы строк (они дети m_mainLayer, не m_listMenu).
+        // Удаляем старые текстовые лейблы строк (они дети m_panel, не m_listMenu).
         CCObject* obj;
-        CCArray* children = m_mainLayer->getChildren();
+        CCArray* children = m_panel->getChildren();
         if (children) {
             std::vector<CCNode*> toRemove;
             CCARRAY_FOREACH(children, obj) {
@@ -1082,16 +1156,16 @@ protected:
         m_names.clear();
 
         auto slots = bot::listSlots();
-        auto size = m_mainLayer->getContentSize();
+        auto panelSize = m_panel->getContentSize();
 
-        float cx = size.width / 2.f;
-        float topY = size.height - 50.f;
+        float cx = panelSize.width / 2.f;
+        float topY = panelSize.height - 55.f;
 
         constexpr int kMaxVisible = 6;
         int shown = std::min<int>(kMaxVisible, static_cast<int>(slots.size()));
 
         for (int i = 0; i < shown; ++i) {
-            auto const& slot = slots[i];
+            auto const& slot = slots[static_cast<size_t>(i)];
             int tag = static_cast<int>(m_names.size());
             m_names.push_back(slot.name);
 
@@ -1100,23 +1174,23 @@ protected:
                 "chatFont.fnt"
             );
             label->setScale(.55f);
-            label->setAnchorPoint({ 0.f, .5f });
+            label->setAnchorPoint({0.f, .5f});
             label->setTag(12345);
-            label->setPosition({ 16.f, topY - i * 28.f });
-            m_mainLayer->addChild(label);
+            label->setPosition({16.f, topY - i * 28.f});
+            m_panel->addChild(label);
 
             auto loadSpr = ButtonSprite::create("Load", "bigFont.fnt", "GJ_button_01.png", .6f);
             loadSpr->setScale(.5f);
             auto loadBtn = CCMenuItemSpriteExtra::create(loadSpr, this, menu_selector(BotMacroPopup::onLoad));
             loadBtn->setTag(tag);
-            loadBtn->setPosition({ cx + 60.f, topY - i * 28.f });
+            loadBtn->setPosition({cx + 60.f, topY - i * 28.f});
             m_listMenu->addChild(loadBtn);
 
             auto delSpr = ButtonSprite::create("Del", "bigFont.fnt", "GJ_button_06.png", .6f);
             delSpr->setScale(.5f);
             auto delBtn = CCMenuItemSpriteExtra::create(delSpr, this, menu_selector(BotMacroPopup::onDelete));
             delBtn->setTag(tag);
-            delBtn->setPosition({ cx + 108.f, topY - i * 28.f });
+            delBtn->setPosition({cx + 108.f, topY - i * 28.f});
             m_listMenu->addChild(delBtn);
         }
 
@@ -1124,11 +1198,12 @@ protected:
             auto label = CCLabelBMFont::create("No saved macros yet", "chatFont.fnt");
             label->setScale(.6f);
             label->setTag(12345);
-            label->setPosition({ cx, topY });
-            m_mainLayer->addChild(label);
+            label->setPosition({cx, topY});
+            m_panel->addChild(label);
         }
     }
 
+public:
     void onLoad(CCObject* sender) {
         int tag = static_cast<CCNode*>(sender)->getTag();
         if (tag < 0 || tag >= static_cast<int>(m_names.size())) return;
@@ -1142,7 +1217,7 @@ protected:
             pl->resetLevelFromStart();
         }
 
-        this->onClose(nullptr);
+        this->removeFromParentAndCleanup(true);
     }
 
     void onDelete(CCObject* sender) {
@@ -1167,17 +1242,27 @@ protected:
         if (popup) popup->show();
     }
 
-public:
+    void onCloseClicked(CCObject*) {
+        this->removeFromParentAndCleanup(true);
+    }
+
     static BotMacroPopup* create() {
         auto ret = new BotMacroPopup();
 
-        if (ret->initAnchored(360.f, 260.f)) {
+        if (ret->init()) {
             ret->autorelease();
             return ret;
         }
 
         delete ret;
         return nullptr;
+    }
+
+    void show() {
+        auto scene = CCDirector::get()->getRunningScene();
+        if (scene) {
+            scene->addChild(this, 10000);
+        }
     }
 };
 
