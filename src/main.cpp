@@ -1,113 +1,129 @@
-// GD Bot — macro recorder / replayer для Geometry Dash 2.2081 (Geode 5.x)
+// =====================================================================
+//  GD Bot — macro recorder / replayer для Geometry Dash 2.2081 (Geode 5.x)
+//  ВЕРСИЯ 2 — исправленная сборка
 // =====================================================================
 //
-// МОДЕЛЬ
-//  * Единые часы мода — счётчик ФИЗИЧЕСКИХ ШАГОВ (s.step), увеличивается
-//    ровно один раз на каждый вызов processCommands(). И запись, и
-//    воспроизведение, и чекпоинты живут в этой одной шкале.
-//  * Макрос = отсортированный список {step, button, down, player1, held}.
-//  * Запись: хук handleButton пишет переходы с текущим s.step.
-//  * Воспроизведение: ПЕРЕД каждым шагом инжектим события этого шага
-//    через маску удержаний (applyHeldMask) — ровно так же, как это делает
-//    игра, поэтому орбы/кольца/пады срабатывают корректно.
-//  * Практика: загрузка чекпоинта откатывает s.step и обрезает запись.
-//  * После возрождения запись замирает на 150 мс РЕАЛЬНОГО времени, при
-//    этом физически зажатые клавиши ПРОДОЛЖАЮТ ДЕЙСТВОВАТЬ в игре
-//    (см. beginGrace/resolveGrace) и не пишутся в макрос.
+//  НАБОР ФУНКЦИЙ ПОЛНОСТЬЮ СОХРАНЁН:
+//   * три режима (Off / Record / Play) из меню паузы, кнопка «Bot» сворачивает
+//     панель, состояние свёрнутости запоминается;
+//   * TPS: ручной ввод 1..100000 (поле + пресеты), кнопки +/- крутят пресеты
+//     60..4000, рядом показывается «measured» — реальная частота шагов;
+//   * менеджер макросов: пагинация по 8, отметка текущего слота, Load/Del,
+//     подтверждение удаления и перезаписи, «Save current as...», санитизация имён;
+//   * слоты лежат в <save>/macros/<levelKey>/<slot>.gdbm, легаси-файлы
+//     <save>/macros/<levelKey>.gdbm переносятся автоматически;
+//   * формат v3 (читаются v1/v2/v3, при сохранении всё переносится в v3);
+//   * запись: переходы кнопок по шагам, авто-сохранение на смерти (обычный
+//     режим), на прохождении уровня и при выходе;
+//   * практика: чекпоинт откатывает шаг и обрезает макрос;
+//   * воспроизведение: маска удержаний инжектится ПЕРЕД processCommands,
+//     после конца макроса управление возвращается игроку;
+//   * окно возрождения 150 мс: физически зажатые клавиши продолжают действовать,
+//     в макрос пишется только итоговое состояние (фикс дэш-орба);
+//   * фоновая запись файла с атомарным rename и статусом «[saving...]».
 //
 // ---------------------------------------------------------------------
-// ИСПРАВЛЕНО В ЭТОЙ ВЕРСИИ
+//  ЧТО ИЗМЕНЕНО ОТНОСИТЕЛЬНО ПРЕДЫДУЩЕЙ ВЕРСИИ
 // ---------------------------------------------------------------------
-// КРАШИ:
-//  1) onBotMode(): вызов onResume(nullptr), а ПОТОМ обращение к sender и
-//     пересборка меню — PauseLayer к этому моменту уже удалён (use-after-free)
-//     + nullptr в селектор кнопки. Теперь: сначала пересборка (с retain
-//     sender), затем отложенный выход из паузы через scheduleOnce (0 мс).
-//  2) PlayLayer::init(level, useReplay, dontCreateObjects) — хук зависел от
-//     точной сигнатуры init в 2.2081 и, что хуже, onEnterLevel() вызывался на
-//     КАЖДЫЙ onEnter (включая возврат из паузы) и сбрасывал макрос/слот.
-//     Теперь инициализация уровня в PlayLayer::onEnter() + защита от
-//     повторного входа в тот же самый PlayLayer.
-//  3) onEnterLevel(): level->m_levelID.value() бросал исключение на уровне
-//     без ID. Теперь значение достаётся безопасно.
-//  4) Попапы вынесены в общий базовый класс BotPopupLayer (CCLayerColor):
-//     единая модальность, единые приоритеты тачей, единое безопасное
-//     закрытие closeSelf() с защитой от двойного закрытия и с отключением
-//     touch/keypad до удаления. Раньше каждый попап дублировал это вручную.
-//  5) rebuildList() удалял кнопки списка прямо внутри activate() той же
-//     кнопки (Del). Теперь пересборка списка отложена на 0 мс.
-//  6) «Save as» обновлял список через CCDelayTime(0.3) — гонка с фоновой
-//     записью файла. Теперь статус сохранения атомарный, список обновляется
-//     по факту завершения записи (опрос каждые 0.1 с).
-//  7) Отсутствовала проверка имени слота: "a/b", "..", "" давали выход за
-//     пределы каталога и падение на create_directories/rename. Добавлена
-//     санитизация.
-//  8) Все колбэки попапов держат Ref<> на владельца вместо сырого this,
-//     а отложенные действия планируются на узле, который их переживёт.
+//  БЛОКЕРЫ КОМПИЛЯЦИИ (проверено по bindings/2.2081 и geode-sdk v5.11.2):
+//   [B1] getModifiedDelta возвращает double, а не float:
+//        `double getModifiedDelta(float dt)` — сигнатура хука исправлена.
+//        Заодно дельта больше никогда не бывает 0 (при steps < 1 возвращается
+//        исходная base), иначе движок может получить 1/dt = inf.
+//   [B2] scheduleOnce(lambda, float) в Geode 5.x НЕ существует — есть только
+//        scheduleOnce(SEL_SCHEDULE, float). Все отложенные вызовы переведены на
+//        свой узел BotDeferred, который живёт на сцене и тикает даже когда
+//        PlayLayer стоит на паузе (старый вариант на pl->scheduleOnce просто
+//        никогда бы не сработал из меню паузы).
+//   [B3] PlayLayer::togglePauseGame не существует в 2.2081. Используются
+//        реальные методы: PlayLayer::resumeAndRestart(bool) и PlayLayer::resume().
+//   [B4] GJGameLevel::m_levelID — это geode::SeedValueRSV (античит-обёртка с
+//        operator int()), а не std::optional. Прежняя «безопасная» обёртка
+//        std::optional<int> компилировалась, но has_value() был всегда true,
+//        то есть не защищала ни от чего. Теперь: проверка level на nullptr +
+//        однократное чтение value().
+//   [B5] TextInput: setCommonFilter(CommonFilter::Uint)/setFilter + setMaxCharCount
+//        вместо ручного setAllowedChars; добавлен focus() после показа.
 //
-// ФУНКЦИОНАЛЬНОСТЬ:
-//  9) TPS теперь вводится вручную ЛЮБЫМ числом 1..100000 (поле ввода + пресеты),
-//     кнопки +/- крутят пресеты в диапазоне 60..4000.
-// 10) Менеджер макросов: пагинация (а не первые 6), отметка текущего слота,
-//     подтверждение перезаписи и удаления, нормальные имена.
+//  ЛОГИКА:
+//   [F1] inject(): состояние ДО событий шага теперь считается из реально
+//        применённых событий (playMask), а не из поля .held соседней записи.
+//        Побочно исправлена потеря первого ввода, записанного на шаге 0
+//        (раньше playIdx == 0 давал target = 0 и событие проглатывалось).
+//   [F2] save(): больше не сбрасывает чужой флаг занятости. Очередь из одной
+//        отложенной задачи + постоянный воркер вместо detached-потоков.
+//   [F3] resolveGrace(): applyHeldMask(gl, 0) заменён на forceReleaseAll(gl) —
+//        реальный отпуск всех кнопок независимо от того, что нам «кажется»
+//        про gameHeld (после loadFromCheckpoint оно могло расходиться).
+//   [F4] levelComplete(): запись теперь именно ЗАВЕРШАЕТСЯ (stopRecording),
+//        а не сохраняется с продолжающимся режимом Record.
+//   [F5] processCommands(): шаги и grace считаются только когда игра реально
+//        идёт (PlayLayer::m_isPaused == false). Иначе measured TPS и шкала шагов
+//        портились, если processCommands вызывается на паузе.
+//   [F6] s.finger обновляется в любом режиме, а не только в Record.
+//   [F7] onResume из паузы во время окна возрождения продлевает его на полные
+//        150 мс — иначе пауза «съедала» grace и орб терялся.
+//   [F8] Сериализация little-endian явно (не memcpy uint32) — формат переносим.
 //
-// ТОЧНОСТЬ ЗАПИСИ/ВОСПРОИЗВЕДЕНИЯ:
-// 11) Единая шкала шагов (s.step) вместо frame+playIdx, рассинхрон которых
-//     давал пропуск/дублирование первого ввода после чекпоинта.
-// 12) Запись автоматически завершается и сохраняется на СМЕРТИ в обычном
-//     режиме (раньше смерть писала мусор в хвост макроса, а после
-//     resetLevel запись молча начиналась заново).
-// 13) Воспроизведение: mask-before-events — состояние кнопок до событий
-//     текущего шага берётся из накопленной маски, а не из поля .held
-//     соседней записи (ошибка на стыке чекпоинтов и после seek).
-// 14) После окончания макроса управление возвращается игроку (раньше ввод
-//     глотался навсегда, если syncHeld залипал).
-// 15) load() больше не проверяет размер файла ДО чтения заголовка и
-//     корректно поддерживает v1/v2/v3. Файлы v1/v2 автоматически
-//     переносятся в v3 при первом сохранении.
+//  КРАШИ / ЖИВУЧЕСТЬ:
+//   [C1] Панель в PauseLayer больше НЕ пересобирается через removeAllChildren
+//        внутри activate() собственной кнопки. Виджеты создаются один раз,
+//        дальше обновляются только спрайты (setSprite) и текст (setString).
+//   [C2] s.enteredLayer чистится в PlayLayer::onExit — раньше висячий указатель
+//        мог совпасть с адресом нового PlayLayer, и уровень не инициализировался.
+//   [C3] Весь наш код в PauseLayer::onResume выполняется ДО вызова оригинала
+//        (оригинал уничтожает слой).
+//   [C4] Воркер записи — один постоянный поток с join(); detached-потоки,
+//        переживающие выгрузку мода, убраны. stopSaveWorker() — для вызова
+//        из $on_unload, если он вам нужен.
+//   [C5] getModifiedDelta не возвращает 0 (см. B1).
+//   [C6] Все действия, ломающие дерево узлов (закрытие попапа, рестарт уровня,
+//        пересборка списка), вынесены из колбэков кнопок на следующий тик.
 //
-// ДЭШ-ОРБ НА ЗАПИСИ (главный запрос):
-// 16) Окно возрождения (grace) больше НЕ разрешается внутри update() прямым
-//     вызовом handleButton — до processCommands() нажатие не доходило до
-//     системы ввода игрока корректно, орб не активировался и кубик падал.
-//     Теперь разрешение grace происходит в хуке processCommands() ПЕРЕД
-//     оригиналом — то есть ровно в той же точке, где инжектится ввод при
-//     воспроизведении (которое работает правильно).
-// 17) Маска grace теперь строится из РЕАЛЬНО зажатых клавиш (s.finger),
-//     а не из хвоста макроса, и перед её применением состояние кнопок игры
-//     принудительно сверяется (applyHeldMask(0) -> applyHeldMask(mask)),
-//     так что gameHeld никогда не расходится с реальностью после
-//     loadFromCheckpoint().
-// 18) Вводы, отжатые и снова зажатые внутри 150 мс паузы, не рвут удержание:
-//     пишется только итоговое состояние на первом шаге после паузы.
+//  UI:
+//   [U1] Попапы переведены на geode::Popup (наследник FLAlertLayer/CCBlockLayer):
+//        модальность, force-priority тачей, keypad, кнопка закрытия и show()
+//        берутся из фреймворка. Ручная схема с приоритетами -9000/-9100 удалена —
+//        она не гарантировала победу над CCBlockLayer самого PauseLayer.
+//   [U2] Диалог подтверждения — geode::createQuickPopup вместо своего класса.
+//   [U3] Кнопки списка создаются через CCMenuItemExt::createSpriteExtra с
+//        лямбдой, захватывающей имя слота: никаких setTag/индексов, которые
+//        разъезжались при пересборке списка.
 //
 // ---------------------------------------------------------------------
-// ОГРАНИЧЕНИЕ ПО TPS (честно)
+//  ОГРАНИЧЕНИЕ ПО TPS (честно, как и было)
 // ---------------------------------------------------------------------
-//  Реальная частота физики задаётся тем, как движок дробит
-//  getModifiedDelta() на свои подшаги (1/240). Мы квантуем дельту на сетку
-//  1/tps и копим остаток в аккумуляторе, поэтому количество ШАГОВ
-//  processCommands() действительно растёт вместе с tps — но только пока
-//  движок согласен дробить кадр на столько подшагов. На очень высоких tps
-//  упрётесь в потолок движка. В меню показывается «measured» — реальное
-//  число шагов в секунду; ориентируйтесь на него, а не на заданное число.
+//  Реальная частота физики задаётся тем, как движок дробит getModifiedDelta()
+//  на свои подшаги. Мы квантуем дельту на сетку 1/tps и копим остаток в
+//  аккумуляторе, поэтому число шагов processCommands() растёт вместе с tps —
+//  но только пока движок согласен дробить кадр, и не больше
+//  MAX_STEPS_PER_FRAME шагов за кадр. На очень высоких tps упрётесь в потолок
+//  движка. В меню показывается «measured» — ориентируйтесь на него.
 // =====================================================================
 
 #include <Geode/Geode.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
 #include <Geode/modify/PlayLayer.hpp>
 #include <Geode/modify/PauseLayer.hpp>
+#include <Geode/ui/Popup.hpp>
 #include <Geode/ui/TextInput.hpp>
+#include <Geode/ui/Layout.hpp>
+#include <Geode/binding/ButtonSprite.hpp>
+#include <Geode/binding/CCMenuItemSpriteExtra.hpp>
+#include <Geode/binding/CheckpointObject.hpp>
+#include <Geode/binding/GJGameLevel.hpp>
 
 #include <algorithm>
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <map>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -136,11 +152,11 @@ namespace bot {
         uint8_t button;
         bool down;
         bool p1;
-        uint8_t held;   // накопленная маска после этого события
+        uint8_t held;   // накопленная маска после этого события (формат/отладка)
     };
 
     struct State {
-        // Ручной ввод TPS: 1..100000.
+        // Ручной ввод TPS: 1..100000 (как и было).
         static constexpr uint32_t kMinTps = 1;
         static constexpr uint32_t kMaxTps = 100000;
         // Пресеты крутятся в более узком диапазоне.
@@ -153,6 +169,7 @@ namespace bot {
         uint32_t step = 0;              // сколько processCommands() уже выполнено
         std::vector<Input> macro;       // отсортировано по step
         size_t playIdx = 0;             // первое ещё не проигранное событие
+        uint8_t playMask = 0;           // маска, реально применённая к событию playIdx-1
 
         bool syncHeld = false;          // нужно принудительно выставить маску
         bool injecting = false;         // мы сами вызываем handleButton
@@ -171,6 +188,7 @@ namespace bot {
         bool inResetLevel = false;
         int cpLoadDepth = 0;
         bool cpLoadedInReset = false;
+        bool inExplicitRestart = false; // рестарт из меню, а не смерть
 
         bool panelOpen = false;
 
@@ -193,6 +211,12 @@ namespace bot {
 
     inline bool isPlayLayer(GJBaseGameLayer* gl) {
         return gl != nullptr && static_cast<GJBaseGameLayer*>(PlayLayer::get()) == gl;
+    }
+
+    /// Игра реально идёт: мы в PlayLayer и он не на паузе. [F5]
+    inline bool gameRunning() {
+        auto* pl = PlayLayer::get();
+        return pl != nullptr && !pl->m_isPaused;
     }
 
     inline uint8_t bitOf(bool p1, int button) {
@@ -236,7 +260,7 @@ namespace bot {
         }
     }
 
-    // Крутит пресеты, но вокруг текущего значения (которое может быть ручным).
+    // Крутит пресеты вокруг текущего значения (которое может быть ручным).
     inline void cycleTps(int dir) {
         auto& s = state();
         constexpr size_t n = sizeof(kTpsPresets) / sizeof(kTpsPresets[0]);
@@ -312,6 +336,27 @@ namespace bot {
     inline void truncateFrom(uint32_t step) {
         auto& s = state();
         s.macro.erase(s.macro.begin() + static_cast<std::ptrdiff_t>(lowerBoundIdx(step)), s.macro.end());
+        if (s.playIdx > s.macro.size()) s.playIdx = s.macro.size();
+        recomputePlayMask();
+    }
+
+    /// Маска удержаний после применения событий [0, idx). [F1]
+    inline uint8_t foldMaskBefore(size_t idx) {
+        auto const& m = state().macro;
+        uint8_t mask = 0;
+        for (size_t i = 0; i < idx && i < m.size(); ++i) {
+            uint8_t b = bitOf(m[i].p1, m[i].button);
+            if (!b) continue;
+            if (m[i].down) mask |= b;
+            else           mask &= static_cast<uint8_t>(~b);
+        }
+        return mask;
+    }
+
+    inline void recomputePlayMask() {
+        auto& s = state();
+        if (s.playIdx > s.macro.size()) s.playIdx = s.macro.size();
+        s.playMask = foldMaskBefore(s.playIdx);
     }
 
     inline void clearGrace() {
@@ -334,14 +379,12 @@ namespace bot {
             bool p1 = (p == 0);
             for (int b = 0; b < 4; ++b) {
                 uint8_t bit = bitOf(p1, b);
-
                 if ((cur & ~target) & bit) {
                     gl->handleButton(false, b, p1);
                 }
             }
             for (int b = 0; b < 4; ++b) {
                 uint8_t bit = bitOf(p1, b);
-
                 if ((target & ~cur) & bit) {
                     gl->handleButton(true, b, p1);
                 }
@@ -350,6 +393,25 @@ namespace bot {
 
         s.gameHeld = target;
         s.injecting = wasInjecting;
+    }
+
+    /// БЕЗУСЛОВНО отпускает все кнопки. Нужен после loadFromCheckpoint(),
+    /// где s.gameHeld может расходиться с реальным состоянием игры. [F3]
+    inline void forceReleaseAll(GJBaseGameLayer* gl) {
+        auto& s = state();
+
+        bool const wasInjecting = s.injecting;
+        s.injecting = true;
+
+        for (int p = 0; p < 2; ++p) {
+            bool const p1 = (p == 0);
+            for (int b = 0; b < 4; ++b) {
+                gl->handleButton(false, b, p1);
+            }
+        }
+
+        s.injecting = wasInjecting;
+        s.gameHeld = 0;
     }
 
     // ---------- окно возрождения (grace) ----------
@@ -365,59 +427,58 @@ namespace bot {
                         + std::chrono::milliseconds(RESPAWN_FREEZE_MS);
     }
 
-    // Разрешение окна возрождения. ВЫЗЫВАЕТСЯ ИЗ processCommands (до оригинала) —
-    // это и есть фикс дэш-орба на записи.
-    inline void resolveGrace(GJBaseGameLayer* gl) {
+    /// Пишет в макрос разницу между маской и состоянием чекпоинта.
+    inline void pushMaskDelta(uint8_t mask) {
         auto& s = state();
 
-        uint8_t mask = s.graceMask;
-        s.graceMask = 0;
-        s.isFrozen = false;
-        s.syncHeld = false;
-
-        // 1. Полностью синхронизируем игру с нашим представлением.
-        applyHeldMask(gl, 0);
-
-        // 2. Пишем в макрос только ИЗМЕНЕНИЯ относительно состояния чекпоинта.
         uint8_t base = heldNow();
         for (int p = 0; p < 2; ++p) {
-            bool p1 = (p == 0);
+            bool const p1 = (p == 0);
             for (int b = 0; b < 4; ++b) {
                 uint8_t bit = bitOf(p1, b);
-                bool nowHeld  = (mask & bit) != 0;
-                bool baseHeld = (base & bit) != 0;
+                bool const nowHeld  = (mask & bit) != 0;
+                bool const baseHeld = (base & bit) != 0;
 
                 if (nowHeld != baseHeld) {
                     push(s.step, static_cast<uint8_t>(b), nowHeld, p1);
                 }
             }
         }
+    }
+
+    // Разрешение окна возрождения. ВЫЗЫВАЕТСЯ ИЗ processCommands (до оригинала) —
+    // это и есть фикс дэш-орба на записи.
+    inline void resolveGrace(GJBaseGameLayer* gl) {
+        auto& s = state();
+
+        uint8_t const mask = s.graceMask;
+        s.graceMask = 0;
+        s.isFrozen = false;
+        s.syncHeld = false;
+
+        // 1. Честно отпускаем ВСЁ (не полагаясь на s.gameHeld). [F3]
+        forceReleaseAll(gl);
+
+        // 2. Пишем в макрос только изменения относительно состояния чекпоинта.
+        pushMaskDelta(mask);
 
         // 3. Возвращаем в игру всё, что физически зажато.
         applyHeldMask(gl, mask);
+
+        // 4. Маска воспроизведения могла измениться вместе с хвостом записи.
+        recomputePlayMask();
     }
 
     // Завершение записи без доступа к слою (выход/смена режима/levelComplete).
     inline void finishGraceOffline() {
         auto& s = state();
 
-        uint8_t mask = s.graceMask;
+        uint8_t const mask = s.graceMask;
         s.graceMask = 0;
         s.isFrozen = false;
 
-        uint8_t base = heldNow();
-        for (int p = 0; p < 2; ++p) {
-            bool p1 = (p == 0);
-            for (int b = 0; b < 4; ++b) {
-                uint8_t bit = bitOf(p1, b);
-                bool nowHeld  = (mask & bit) != 0;
-                bool baseHeld = (base & bit) != 0;
-
-                if (nowHeld != baseHeld) {
-                    push(s.step, static_cast<uint8_t>(b), nowHeld, p1);
-                }
-            }
-        }
+        pushMaskDelta(mask);
+        recomputePlayMask();
     }
 
     inline void seek(uint32_t step) {
@@ -427,8 +488,9 @@ namespace bot {
         s.playIdx = lowerBoundIdx(step);
         s.syncHeld = true;
         s.tpsAccumulator = 0.0;
+        recomputePlayMask();
         // gameHeld НЕ трогаем: loadFromCheckpoint может сам дёрнуть handleButton,
-        // а рассинхрон лечится applyHeldMask(0) в resolveGrace/inject.
+        // а рассинхрон лечится forceReleaseAll() в resolveGrace.
     }
 
     inline void resetToStart() {
@@ -436,23 +498,22 @@ namespace bot {
 
         seek(0);
         s.gameHeld = 0;
+        s.playMask = 0;
         clearGrace();
 
         if (s.mode == Mode::Record) {
             truncateFrom(0);
+            recomputePlayMask();
         }
     }
 
     inline void inject(GJBaseGameLayer* gl) {
         auto& s = state();
 
-        // Маска ДО событий текущего шага.
-        uint8_t target = 0;
-        if (s.playIdx > 0 && s.playIdx <= s.macro.size()) {
-            target = s.macro[s.playIdx - 1].held;
-        }
+        // Маска ДО событий текущего шага — из реально применённых событий. [F1]
+        uint8_t target = s.playMask;
 
-        size_t n = s.macro.size();
+        size_t const n = s.macro.size();
         while (s.playIdx < n && s.macro[s.playIdx].step <= s.step) {
             Input const& e = s.macro[s.playIdx++];
 
@@ -463,20 +524,9 @@ namespace bot {
             else        target &= static_cast<uint8_t>(~m);
         }
 
+        s.playMask = target;
         s.syncHeld = false;
         applyHeldMask(gl, target);
-    }
-
-    inline void save();   // fwd (используется в stopRecording)
-
-    inline void stopRecording() {
-        auto& s = state();
-        if (s.mode != Mode::Record) return;
-
-        finishGraceOffline();
-        s.mode = Mode::Off;
-        clearGrace();
-        save();
     }
 
     // ---------- пути и имена ----------
@@ -510,40 +560,102 @@ namespace bot {
     inline bool isValidName(std::string const& n) {
         return !n.empty() && n.size() <= 64 && n.find("..") == std::string::npos;
     }
+}
 
-    // ---------- сохранение ----------
+// =====================================================================
+//  Фоновое сохранение: очередь из одной задачи + постоянный воркер
+//  [F2][C4] Раньше save() сбрасывал чужой флаг занятости и плодил
+//  detached-потоки, которые переживали выгрузку мода.
+// =====================================================================
 
-    inline std::mutex& saveMutex() {
-        static std::mutex m;
-        return m;
-    }
+namespace bot {
+
+    struct SaveJob {
+        std::filesystem::path path;
+        std::vector<Input> macro;
+        uint32_t tps = 240;
+        std::string slot;
+    };
 
     inline std::atomic_bool& saveBusy() {
         static std::atomic_bool b{false};
         return b;
     }
 
-    // v3: [GDBM][version=3][count][tps] + count * (step:u32, button:u8, flags:u8)
+    // Сериализация не может идти параллельно с другой сериализацией
+    // (обе читают s.macro в главном потоке) — но главное, она не должна
+    // пересекаться с записью того же слота.
+    inline std::mutex& jobMutex() {
+        static std::mutex m;
+        return m;
+    }
+
+    inline std::condition_variable& jobCv() {
+        static std::condition_variable c;
+        return c;
+    }
+
+    inline std::optional<SaveJob>& pendingJob() {
+        static std::optional<SaveJob> j;
+        return j;
+    }
+
+    inline bool& workerStopping() {
+        static bool b = false;
+        return b;
+    }
+
+    inline std::mutex& fileMutex() {
+        static std::mutex m;
+        return m;
+    }
+
+    inline std::thread& saveWorker() {
+        static std::thread t;
+        return t;
+    }
+
+    // ---------- формат файла ----------
+    // v3: [GDBM][version=3][count][tps] + count * (step:u32 LE, button:u8, flags:u8)
+
+    inline void putU32LE(char* p, uint32_t v) {                       // [F8]
+        p[0] = static_cast<char>(v & 0xFF);
+        p[1] = static_cast<char>((v >> 8) & 0xFF);
+        p[2] = static_cast<char>((v >> 16) & 0xFF);
+        p[3] = static_cast<char>((v >> 24) & 0xFF);
+    }
+
+    inline uint32_t getU32LE(char const* p) {
+        return static_cast<uint32_t>(static_cast<uint8_t>(p[0]))
+             | (static_cast<uint32_t>(static_cast<uint8_t>(p[1])) << 8)
+             | (static_cast<uint32_t>(static_cast<uint8_t>(p[2])) << 16)
+             | (static_cast<uint32_t>(static_cast<uint8_t>(p[3])) << 24);
+    }
+
     inline std::vector<char> serializeMacro(std::vector<Input> const& macro, uint32_t tpsForSave) {
-        uint32_t version = 3;
-        uint32_t count = static_cast<uint32_t>(macro.size());
+        uint32_t const count = static_cast<uint32_t>(macro.size());
 
         std::vector<char> buf(16 + static_cast<size_t>(count) * 6);
 
         std::memcpy(buf.data(), "GDBM", 4);
-        std::memcpy(buf.data() + 4, &version, 4);
-        std::memcpy(buf.data() + 8, &count, 4);
-        std::memcpy(buf.data() + 12, &tpsForSave, 4);
+        putU32LE(buf.data() + 4, 3u);
+        putU32LE(buf.data() + 8, count);
+        putU32LE(buf.data() + 12, tpsForSave);
 
         char* p = buf.data() + 16;
         for (auto const& e : macro) {
-            uint8_t flags = static_cast<uint8_t>((e.down ? 1 : 0) | (e.p1 ? 2 : 0));
-            std::memcpy(p, &e.step, 4);
+            uint8_t const flags = static_cast<uint8_t>((e.down ? 1 : 0) | (e.p1 ? 2 : 0));
+            putU32LE(p, e.step);
             p[4] = static_cast<char>(e.button);
             p[5] = static_cast<char>(flags);
             p += 6;
         }
         return buf;
+    }
+
+    inline std::string tmpPathFor(std::filesystem::path const& path) {
+        return path.string() + "." +
+               std::to_string(std::hash<std::string>{}(path.filename().string())) + ".tmp";
     }
 
     inline bool writeMacroFile(std::filesystem::path const& path, std::vector<char> const& buf) {
@@ -554,17 +666,23 @@ namespace bot {
             return false;
         }
 
-        auto tmpPath = path.string() + ".tmp";
+        // Уникальное имя временного файла: два разных слота не должны
+        // писать в один и тот же .tmp (иначе гонка на rename).
+        auto const tmpPath = tmpPathFor(path);
 
-        std::ofstream f(tmpPath, std::ios::binary | std::ios::trunc);
-        if (!f) {
-            log::error("GDBot: can't open temp macro file: {}", tmpPath);
-            return false;
+        {
+            std::ofstream f(tmpPath, std::ios::binary | std::ios::trunc);
+            if (!f) {
+                log::error("GDBot: can't open temp macro file: {}", tmpPath);
+                return false;
+            }
+            f.write(buf.data(), static_cast<std::streamsize>(buf.size()));
+            f.flush();
+            if (!f) {
+                log::error("GDBot: write failed: {}", tmpPath);
+                return false;
+            }
         }
-
-        f.write(buf.data(), static_cast<std::streamsize>(buf.size()));
-        f.flush();
-        f.close();
 
         std::filesystem::rename(tmpPath, path, ec);
         if (ec) {
@@ -575,40 +693,125 @@ namespace bot {
         return true;
     }
 
-    inline void saveSlotSync(std::filesystem::path const& path,
-                             std::vector<Input> const& macroCopy,
-                             uint32_t tps) {
-        auto buf = serializeMacro(macroCopy, tps);
+    /// Записать то, что лежит в очереди, ПРЯМО СЕЙЧАС (в текущем потоке).
+    /// Используется на выходе из уровня, чтобы файл точно лёг на диск.
+    inline void drainSaveQueue() {
+        SaveJob job;
+        {
+            std::lock_guard<std::mutex> lk(jobMutex());
+            if (!pendingJob()) return;
+            job = std::move(*pendingJob());
+            pendingJob().reset();
+        }
 
+        auto buf = serializeMacro(job.macro, job.tps);
         bool ok = false;
         {
-            std::lock_guard<std::mutex> lock(saveMutex());
-            ok = writeMacroFile(path, buf);
+            std::lock_guard<std::mutex> lk(fileMutex());
+            ok = writeMacroFile(job.path, buf);
         }
-
         if (ok) {
-            log::info("GDBot: saved {} inputs to '{}'", macroCopy.size(), path.filename().string());
+            log::info("GDBot: saved {} inputs to '{}'", job.macro.size(), job.slot);
         }
         saveBusy().store(false);
+    }
+
+    inline void workerLoop() {
+        for (;;) {
+            SaveJob job;
+            {
+                std::unique_lock<std::mutex> lk(jobMutex());
+                jobCv().wait(lk, [] { return pendingJob().has_value() || workerStopping(); });
+
+                if (!pendingJob()) {
+                    if (workerStopping()) return;
+                    continue;
+                }
+
+                job = std::move(*pendingJob());
+                pendingJob().reset();
+            }
+
+            auto buf = serializeMacro(job.macro, job.tps);   // тяжёлое — вне jobMutex
+            bool ok = false;
+            {
+                std::lock_guard<std::mutex> lk(fileMutex());
+                ok = writeMacroFile(job.path, buf);
+            }
+            if (ok) {
+                log::info("GDBot: saved {} inputs to '{}'", job.macro.size(), job.slot);
+            }
+
+            // Флаг занятости снимаем только если в очереди ничего не осталось,
+            // иначе UI на мгновение показал бы «сохранено» посреди серии записей.
+            {
+                std::lock_guard<std::mutex> lk(jobMutex());
+                if (!pendingJob()) saveBusy().store(false);
+            }
+        }
+    }
+
+    inline void ensureWorker() {
+        if (!saveWorker().joinable()) {
+            workerStopping() = false;
+            saveWorker() = std::thread(workerLoop);
+        }
     }
 
     inline void save() {
         auto& s = state();
         if (s.levelKey.empty() || !isValidName(s.macroName)) return;
 
-        if (saveBusy().exchange(true)) {
-            log::warn("GDBot: previous save still in progress, skipping");
-            saveBusy().store(false);
-            return;
+        {
+            std::lock_guard<std::mutex> lk(jobMutex());
+            // Перезаписываем ещё не стартовавшую задачу — это НЕ потеря данных:
+            // в macroCopy лежит более свежий снимок того же слота.
+            pendingJob() = SaveJob{ macroPath(s.macroName), s.macro, s.tps, s.macroName };
+            saveBusy().store(true);
+            ensureWorker();
         }
+        jobCv().notify_one();
+    }
 
-        auto path = macroPath(s.macroName);
-        auto macroCopy = s.macro;
-        uint32_t tps = s.tps;
+    /// Синхронное сохранение (для onQuit/levelComplete): очередь дренируется
+    /// в главном потоке, файл гарантированно на диске до возврата.
+    inline void saveSync() {
+        auto& s = state();
+        if (s.levelKey.empty() || !isValidName(s.macroName)) return;
 
-        std::thread([path, tps, macroCopy = std::move(macroCopy)]() mutable {
-            saveSlotSync(path, macroCopy, tps);
-        }).detach();
+        save();
+
+        std::unique_lock<std::mutex> lk(fileMutex());   // ждём завершения текущей записи
+        lk.unlock();
+        drainSaveQueue();
+    }
+
+    /// Остановка воркера. Зовите из $on_unload, если выгружаете мод на ходу.
+    inline void stopSaveWorker() {
+        {
+            std::lock_guard<std::mutex> lk(jobMutex());
+            pendingJob().reset();
+            workerStopping() = true;
+        }
+        jobCv().notify_all();
+
+        if (saveWorker().joinable()) {
+            // Даём воркеру дописать текущий файл, но не держим главный поток вечно.
+            for (int i = 0; i < 40 && saveBusy().load(); ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(25));
+            }
+            saveWorker().join();
+        }
+    }
+
+    inline void stopRecording() {
+        auto& s = state();
+        if (s.mode != Mode::Record) return;
+
+        finishGraceOffline();
+        s.mode = Mode::Off;
+        clearGrace();
+        save();
     }
 
     inline bool saveAs(std::string const& name) {
@@ -637,14 +840,14 @@ namespace bot {
         if (f.gcount() != 16) return h;
         if (std::memcmp(hdr, "GDBM", 4) != 0) return h;
 
-        std::memcpy(&h.version, hdr + 4, 4);
-        std::memcpy(&h.count, hdr + 8, 4);
+        h.version = getU32LE(hdr + 4);
+        h.count   = getU32LE(hdr + 8);
 
         if (h.version == 1) {
             h.headerSize = 12;
             h.tps = 240;
         } else if (h.version == 2 || h.version == 3) {
-            std::memcpy(&h.tps, hdr + 12, 4);
+            h.tps = getU32LE(hdr + 12);
             h.headerSize = 16;
         } else {
             return h;
@@ -670,13 +873,13 @@ namespace bot {
             return 0;
         }
 
-        uint64_t size = std::filesystem::file_size(path, ec);
+        uint64_t const size = std::filesystem::file_size(path, ec);
         if (ec || size < 16) return 0;
 
         std::ifstream f(path, std::ios::binary);
         if (!f) return 0;
 
-        auto h = readHeader(f, size);
+        auto const h = readHeader(f, size);
         if (!h.ok) {
             log::warn("GDBot: bad macro file '{}'", path.filename().string());
             return 0;
@@ -686,9 +889,13 @@ namespace bot {
 
         std::vector<char> body(static_cast<size_t>(h.count) * 6);
         if (h.count > 0) {
+            f.clear();
             f.seekg(static_cast<std::streamoff>(h.headerSize));
             f.read(body.data(), static_cast<std::streamsize>(body.size()));
-            if (!f) return 0;
+            if (!f) {
+                log::warn("GDBot: truncated macro file '{}'", path.filename().string());
+                return 0;
+            }
         }
 
         out.reserve(h.count);
@@ -698,8 +905,7 @@ namespace bot {
         char const* p = body.data();
 
         for (uint32_t i = 0; i < h.count; ++i, p += 6) {
-            uint32_t step = 0;
-            std::memcpy(&step, p, 4);
+            uint32_t const step = getU32LE(p);
 
             if (step < lastStep) {
                 log::warn("GDBot: macro not sorted at record {}, stopping", i);
@@ -707,14 +913,14 @@ namespace bot {
             }
             lastStep = step;
 
-            uint8_t button = static_cast<uint8_t>(p[4]);
+            uint8_t const button = static_cast<uint8_t>(p[4]);
             if (button > 3) continue;
 
-            uint8_t flags = static_cast<uint8_t>(p[5]);
-            bool down = (flags & 1) != 0;
-            bool p1 = (flags & 2) != 0;
+            uint8_t const flags = static_cast<uint8_t>(p[5]);
+            bool const down = (flags & 1) != 0;
+            bool const p1   = (flags & 2) != 0;
 
-            uint8_t m = bitOf(p1, button);
+            uint8_t const m = bitOf(p1, button);
             if (!m) continue;
             if (((held & m) != 0) == down) continue;   // дедупликация
 
@@ -732,13 +938,14 @@ namespace bot {
 
         s.macro.clear();
         s.playIdx = 0;
+        s.playMask = 0;
         s.macroName = isValidName(name) ? name : std::string("default");
 
         if (s.levelKey.empty()) return;
 
         uint32_t fileTps = 240;
         std::vector<Input> loaded;
-        size_t n = loadFromFile(macroPath(s.macroName), loaded, fileTps);
+        size_t const n = loadFromFile(macroPath(s.macroName), loaded, fileTps);
 
         s.macro = std::move(loaded);
 
@@ -746,8 +953,9 @@ namespace bot {
         // на котором его имеет смысл играть. (Менять потом можно — шкала та же.)
         setTps(fileTps);
 
-        // ВАЖНО: индекс считаем уже по новому макросу.
+        // ВАЖНО: индекс и маска считаются уже по новому макросу.
         s.playIdx = lowerBoundIdx(s.step);
+        recomputePlayMask();
         s.syncHeld = true;
 
         log::info("GDBot: loaded {} inputs (slot '{}', tps {})", n, s.macroName, fileTps);
@@ -770,7 +978,7 @@ namespace bot {
         if (s.levelKey.empty()) return result;
 
         std::error_code ec;
-        auto dir = macroDir();
+        auto const dir = macroDir();
         if (!std::filesystem::exists(dir, ec) || !std::filesystem::is_directory(dir, ec)) {
             return result;
         }
@@ -786,15 +994,15 @@ namespace bot {
             info.name = path.stem().string();
             if (!isValidName(info.name)) continue;
 
+            uint64_t const size = std::filesystem::file_size(path, ec);
+            if (ec) continue;
+
             std::ifstream f(path, std::ios::binary);
             if (f) {
-                uint64_t size = std::filesystem::file_size(path, ec);
-                if (!ec) {
-                    auto h = readHeader(f, size);
-                    if (h.ok) {
-                        info.count = h.count;
-                        info.tps = h.tps;
-                    }
+                auto const h = readHeader(f, size);
+                if (h.ok) {
+                    info.count = h.count;
+                    info.tps = h.tps;
                 }
             }
 
@@ -817,9 +1025,10 @@ namespace bot {
         if (!isValidName(name)) return false;
 
         // Не удаляем файл, который прямо сейчас пишется.
-        std::lock_guard<std::mutex> lock(saveMutex());
+        std::lock_guard<std::mutex> lk(fileMutex());
+
         std::error_code ec;
-        std::filesystem::remove(macroPath(name).string() + ".tmp", ec);
+        std::filesystem::remove(tmpPathFor(macroPath(name)), ec);
         return std::filesystem::remove(macroPath(name), ec);
     }
 
@@ -828,11 +1037,11 @@ namespace bot {
         if (s.levelKey.empty()) return;
 
         std::error_code ec;
-        auto legacyPath = macrosRootDir() / (s.levelKey + ".gdbm");
+        auto const legacyPath = macrosRootDir() / (s.levelKey + ".gdbm");
         if (!std::filesystem::exists(legacyPath, ec)) return;
 
         std::filesystem::create_directories(macroDir(), ec);
-        auto newPath = macroPath("default");
+        auto const newPath = macroPath("default");
 
         if (!std::filesystem::exists(newPath, ec)) {
             std::filesystem::rename(legacyPath, newPath, ec);
@@ -841,19 +1050,15 @@ namespace bot {
     }
 
     inline std::string makeLevelKey(GJGameLevel* level) {
-        if (!level) return "unknown";
+        if (!level) return "unknown";                       // [B4]
 
-        // m_levelID в биндингах может быть std::optional<int> — берём безопасно.
-        int id = 0;
-        {
-            auto raw = level->m_levelID;
-            std::optional<int> opt{raw};
-            if (opt.has_value()) id = opt.value();
-        }
-
+        // m_levelID — geode::SeedValueRSV: у него есть int value() и operator int().
+        // Никакого std::optional там нет; value() не бросает. Читаем ОДИН раз,
+        // потому что value() мутирует внутреннее состояние античит-обёртки.
+        int const id = level->m_levelID.value();
         if (id > 0) return std::to_string(id);
 
-        std::string name = level->m_levelName;
+        std::string name = level->m_levelName;              // gd::string -> std::string
         for (auto& c : name) {
             unsigned char u = static_cast<unsigned char>(c);
             if (!std::isalnum(u) && c != '-' && c != '_') c = '_';
@@ -871,6 +1076,7 @@ namespace bot {
         s.mode = Mode::Off;
         s.step = 0;
         s.playIdx = 0;
+        s.playMask = 0;
         s.macro.clear();
 
         s.syncHeld = false;
@@ -879,6 +1085,7 @@ namespace bot {
         s.inResetLevel = false;
         s.cpLoadDepth = 0;
         s.cpLoadedInReset = false;
+        s.inExplicitRestart = false;
 
         s.panelOpen = false;
         s.finger = 0;
@@ -892,11 +1099,13 @@ namespace bot {
         clearGrace();
         resetMeasure();
 
-        s.levelKey = makeLevelKey(level);
+        s.levelKey = makeLevelKey(level);                   // [B4]: level может быть null
         s.macroName = "default";
 
         migrateLegacyMacro();
         load();
+
+        log::info("GDBot: level '{}' (slot '{}')", s.levelKey, s.macroName);
     }
 
     // Смена режима из меню паузы: состояние сбрасывается, слот НЕ перезагружается.
@@ -905,14 +1114,675 @@ namespace bot {
 
         s.step = 0;
         s.playIdx = 0;
+        s.playMask = 0;
         s.finger = 0;
         s.gameHeld = 0;
         s.tpsAccumulator = 0.0;
         s.cpFrames.clear();
+        s.syncHeld = true;
         clearGrace();
         resetMeasure();
     }
 }
+
+// =====================================================================
+//  ДИАГНОСТИКА (выключена по умолчанию)
+//
+//  Главный непроверенный допуск всей модели: что processCommands()
+//  вызывается НА КАЖДЫЙ физический подшаг, а не один раз на кадр.
+//  Поставьте kBotDiagnostics = true, пересоберите, зайдите на любой уровень
+//  с tps = 1000 и посмотрите в лог Geode строки вида:
+//
+//    GDBot[diag] 1.0s: update=144 pc=144 step=144 engineStep=240 tps=1000 measured=144
+//
+//  * pc/s == update/s           -> шаги = кадры; шкалу надо менять
+//                                  (или брать m_currentStep из движка);
+//  * pc/s ~ 240 при любом tps   -> подшаги фиксированные, tps влияет
+//                                  только на длительность кадра;
+//  * pc/s растёт вместе с tps   -> модель верна;
+//  * engineStep (m_currentStep) -> собственный счётчик физических шагов
+//                                  движка, которым пользуются нативные
+//                                  реплеи 2.2. Если он совпадает с step,
+//                                  можно просто перейти на него.
+// =====================================================================
+
+namespace bot {
+
+    inline constexpr bool kBotDiagnostics = false;
+
+    inline uint32_t& diagUpdateCount() { static uint32_t v = 0; return v; }
+    inline uint32_t& diagPcCount()     { static uint32_t v = 0; return v; }
+
+    /// Зовётся из processCommands (не чаще раза за шаг). Печатает раз в секунду.
+    inline void diagnosticsTick() {
+        if (!kBotDiagnostics) return;
+
+        static std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+
+        ++diagPcCount();
+
+        auto const now = std::chrono::steady_clock::now();
+        double const el = std::chrono::duration<double>(now - t0).count();
+        if (el < 1.0) return;
+
+        int engineStep = -1;
+        if (auto* gl = static_cast<GJBaseGameLayer*>(PlayLayer::get())) {
+            engineStep = gl->m_currentStep;
+        }
+
+        log::info(
+            "GDBot[diag] {:.1f}s: update={} pc={} step={} engineStep={} tps={} measured={}",
+            el, diagUpdateCount(), diagPcCount(), state().step,
+            engineStep, state().tps, state().measuredTps
+        );
+
+        diagUpdateCount() = 0;
+        diagPcCount() = 0;
+        t0 = now;
+    }
+}
+
+
+// =====================================================================
+//  Отложенные вызовы
+//
+//  [B2] scheduleOnce(лямбда, float) в Geode 5.x не существует.
+//  [C6] Плюс: узел, на котором висит scheduleOnce, во время паузы НЕ тикает,
+//       поэтому планировать «рестарт уровня» на PlayLayer из меню паузы
+//       бессмысленно. Deferred живёт на СЦЕНЕ и тикает всегда.
+// =====================================================================
+
+class BotDeferred : public cocos2d::CCNode {
+protected:
+    std::map<int, std::function<void()>> m_pending;
+    int m_nextId = 1;
+
+    bool init() override {
+        if (!CCNode::init()) return false;
+        this->setVisible(false);
+        this->schedule(schedule_selector(BotDeferred::onTick), 0.f);
+        return true;
+    }
+
+    void onTick(float) {
+        if (m_pending.empty()) return;
+
+        // Переносим пачку: колбэк имеет право класть новые задачи,
+        // а итерировать живой map в таком случае нельзя.
+        auto batch = std::move(m_pending);
+        m_pending.clear();
+
+        for (auto& entry : batch) {
+            if (entry.second) entry.second();
+        }
+    }
+
+public:
+    void onEnter() override {
+        CCNode::onEnter();
+        // После removeFromParent(cleanup) планировщик узла чистится — взводим снова.
+        this->schedule(schedule_selector(BotDeferred::onTick), 0.f);
+    }
+
+    static BotDeferred* get() {
+        static BotDeferred* inst = nullptr;
+
+        if (!inst) {
+            inst = new BotDeferred();
+            if (!inst->init()) {
+                delete inst;
+                inst = nullptr;
+                return nullptr;
+            }
+            inst->retain();          // живёт всю сессию, не зависит от сцены
+        }
+
+        // Переезжаем вместе со сценой: после смены сцены у узла нет родителя.
+        if (!inst->getParent()) {
+            if (auto* scene = CCDirector::get()->getRunningScene()) {
+                scene->addChild(inst, INT_MAX);
+            }
+        }
+        return inst;
+    }
+
+    /// Выполнить fn на следующем тике. Возвращает id для отмены.
+    int post(std::function<void()> fn) {
+        // Если узел сейчас не в дереве (смена сцены прямо в этот момент),
+        // планировщик не тикает — выполняем сразу, чтобы задача не потерялась.
+        if (!this->getParent()) {
+            if (fn) fn();
+            return -1;
+        }
+        int const id = m_nextId++;
+        m_pending.emplace(id, std::move(fn));
+        return id;
+    }
+
+    void cancel(int id) {
+        m_pending.erase(id);
+    }
+};
+
+namespace bot {
+
+    inline void alert(std::string const& text) {
+        FLAlertLayer::create("GD Bot", text, "OK")->show();
+    }
+
+    /// Отложить на следующий тик. Никогда не падает, даже если сцены нет.
+    inline void later(std::function<void()> fn) {
+        if (auto* d = BotDeferred::get()) {
+            d->post(std::move(fn));
+        } else if (fn) {
+            fn();      // крайний случай: выполняем сразу
+        }
+    }
+
+    /// Помечает, что сейчас последует ЯВНЫЙ рестарт уровня из меню
+    /// (PlayLayer::resumeAndRestart(true)). Нужен, чтобы хук resetLevel()
+    /// не принял его за смерть и не перезаписал слот пустым макросом.
+    inline void beginExplicitRestart() {
+        state().inExplicitRestart = true;
+    }
+
+    /// Выход из паузы + рестарт с начала.
+    /// Это замена несуществующему в 2.2081 togglePauseGame(false). [B3]
+    /// ВАЖНО: вызывать ПОСЛЕДНИМ в колбэке кнопки — внутри resume()
+    /// PauseLayer уничтожается.
+    inline void restartFromMenu(PlayLayer* pl) {
+        if (!pl) return;
+        beginExplicitRestart();
+        pl->resumeAndRestart(true);
+        state().inExplicitRestart = false;
+    }
+}
+
+// =====================================================================
+//  UI: попапы
+//
+//  [U1] База — geode::Popup (наследник FLAlertLayer -> CCBlockLayer ->
+//  CCLayerColor). Он сам:
+//    * затемняет экран и глотает тачи (force priority 2, targeted delegate -500),
+//      то есть корректно работает ПОВЕРХ PauseLayer, который тоже CCBlockLayer;
+//    * даёт m_mainLayer (размера попапа, центр в центре окна) и m_buttonMenu;
+//    * добавляет кнопку закрытия в левый верхний угол и обрабатывает Esc;
+//    * закрывается через виртуальный onClose(CCObject*).
+//  Позиционируем детей идиоматично — addChildAtPosition(node, Anchor, offset),
+//  как это делает сам Geode.
+// =====================================================================
+
+namespace botui {
+    inline constexpr float kMacroW = 400.f;
+    inline constexpr float kMacroH = 320.f;
+    inline constexpr float kPromptW = 340.f;
+}
+
+// ---------------- Ввод числа (TPS) / строки (имя слота) ----------------
+
+struct PromptParams {
+    std::string title;
+    std::string placeholder;
+    std::string initial;
+    bool digitsOnly = false;
+    std::function<void(std::string)> onOk;
+    std::vector<uint32_t> presets;   // пусто — пресетов нет
+};
+
+class BotPromptPopup : public geode::Popup {
+protected:
+    geode::TextInput* m_input = nullptr;
+    PromptParams m_params;
+
+    bool init(PromptParams params) {
+        m_params = std::move(params);
+
+        bool const hasPresets = !m_params.presets.empty();
+        float const h = hasPresets ? 170.f : 140.f;
+
+        if (!geode::Popup::init(botui::kPromptW, h, "GJ_square01.png")) {
+            return false;
+        }
+
+        this->setTitle(m_params.title.c_str(), "bigFont.fnt", .6f, 20.f);
+
+        float const w = m_size.width;
+
+        m_input = geode::TextInput::create(w - 50.f, m_params.placeholder);
+        if (!m_input) return false;
+
+        if (m_params.digitsOnly) {
+            m_input->setCommonFilter(geode::CommonFilter::Uint);
+            m_input->setMaxCharCount(6);
+        } else {
+            m_input->setFilter(
+                "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 _-."
+            );
+            m_input->setMaxCharCount(64);
+        }
+        m_input->setString(gd::string(m_params.initial));
+        m_mainLayer->addChildAtPosition(m_input, Anchor::Top, ccp(0.f, -52.f));
+        m_input->focus();          // [B5] клавиатура/каретка сразу активны
+
+        if (hasPresets) {
+            auto presetMenu = CCMenu::create();
+            presetMenu->setContentSize(CCSize{w - 30.f, 28.f});
+            presetMenu->setAnchorPoint({.5f, .5f});
+            presetMenu->ignoreAnchorPointForPosition(false);
+            // AutoScale не используем: он предполагает «родной» масштаб детей 1.0,
+            // а у ButtonSprite он свой. Even разложит пресеты равномерно.
+            presetMenu->setLayout(
+                RowLayout::create()
+                    ->setAxisAlignment(AxisAlignment::Even)
+                    ->setCrossAxisAlignment(AxisAlignment::Center)
+                    ->setGap(2.f)
+            );
+
+            for (uint32_t v : m_params.presets) {
+                auto spr = ButtonSprite::create(
+                    std::to_string(v).c_str(), "bigFont.fnt", "GJ_button_04.png", .4f
+                );
+                spr->setScale(.4f);
+
+                auto btn = CCMenuItemExt::createSpriteExtra(spr, [this, v](auto*) {
+                    if (m_input) m_input->setString(gd::string(std::to_string(v)));
+                });
+                presetMenu->addChild(btn);
+            }
+
+            m_mainLayer->addChildAtPosition(presetMenu, Anchor::Top, ccp(0.f, -88.f));
+        }
+
+        auto okSpr = ButtonSprite::create("OK", "bigFont.fnt", "GJ_button_01.png", .7f);
+        okSpr->setScale(.6f);
+        auto okBtn = CCMenuItemSpriteExtra::create(
+            okSpr, this, menu_selector(BotPromptPopup::onOkClicked)
+        );
+        m_buttonMenu->addChildAtPosition(okBtn, Anchor::Bottom, ccp(45.f, 22.f));
+
+        auto cancelSpr = ButtonSprite::create("Cancel", "bigFont.fnt", "GJ_button_06.png", .7f);
+        cancelSpr->setScale(.6f);
+        auto cancelBtn = CCMenuItemSpriteExtra::create(
+            cancelSpr, this, menu_selector(BotPromptPopup::onCancelClicked)
+        );
+        m_buttonMenu->addChildAtPosition(cancelBtn, Anchor::Bottom, ccp(-45.f, 22.f));
+
+        return true;
+    }
+
+    /// Закрываем попап и только ПОТОМ зовём колбэк: колбэк может открыть
+    /// другой попап или пересобрать UI, и делать это из-под нашего activate()
+    /// не стоит.
+    void finish(bool ok) {
+        std::string value;
+        if (m_input) value = std::string(m_input->getString());
+
+        auto cb = std::move(m_params.onOk);
+        m_params.onOk = nullptr;
+
+        this->onClose(nullptr);
+
+        if (ok && cb) cb(value);
+    }
+
+public:
+    void onOkClicked(CCObject*)     { this->finish(true);  }
+    void onCancelClicked(CCObject*) { this->finish(false); }
+
+    // Крестик и Esc -> отмена (колбэк не вызываем).
+    void onClose(CCObject* sender) override {
+        m_params.onOk = nullptr;
+        geode::Popup::onClose(sender);
+    }
+
+    static BotPromptPopup* create(PromptParams params) {
+        auto ret = new BotPromptPopup();
+
+        if (ret->init(std::move(params))) {
+            ret->autorelease();
+            return ret;
+        }
+
+        delete ret;
+        return nullptr;
+    }
+};
+
+// ---------------- Менеджер макросов ----------------
+
+class BotMacroPopup : public geode::Popup {
+protected:
+    static constexpr int kPerPage = 8;
+    static constexpr int kRowTag = 424242;
+
+    CCLabelBMFont* m_statusLabel = nullptr;
+    CCLabelBMFont* m_pageLabel = nullptr;
+    CCMenu* m_pageMenu = nullptr;
+    CCMenu* m_listMenu = nullptr;
+
+    std::vector<bot::MacroSlotInfo> m_slots;
+    int m_page = 0;
+    bool m_polling = false;
+
+public:
+    // Вызывается при закрытии попапа (чтобы меню паузы обновило статус).
+    std::function<void()> m_onClosed = nullptr;
+
+protected:
+    bool init() {
+        if (!geode::Popup::init(botui::kMacroW, botui::kMacroH, "GJ_square01.png")) {
+            return false;
+        }
+
+        this->setTitle("GD Bot Macros", "bigFont.fnt", .6f, 20.f);
+
+        float const w = m_size.width;
+
+        m_statusLabel = CCLabelBMFont::create("", "chatFont.fnt");
+        m_statusLabel->setScale(.45f);
+        m_mainLayer->addChildAtPosition(m_statusLabel, Anchor::Top, ccp(0.f, -44.f));
+
+        // --- постраничная навигация ---
+        m_pageMenu = CCMenu::create();
+        m_pageMenu->setContentSize(CCSize{w - 20.f, 30.f});
+        m_pageMenu->setAnchorPoint({.5f, .5f});
+        m_pageMenu->ignoreAnchorPointForPosition(false);
+        m_pageMenu->setLayout(
+            RowLayout::create()
+                ->setAxisAlignment(AxisAlignment::Between)
+                ->setCrossAxisAlignment(AxisAlignment::Center)
+        );
+
+        auto prevSpr = ButtonSprite::create("<", "bigFont.fnt", "GJ_button_04.png", 1.f);
+        prevSpr->setScale(.6f);
+        m_pageMenu->addChild(CCMenuItemSpriteExtra::create(
+            prevSpr, this, menu_selector(BotMacroPopup::onPrevPage)));
+
+        m_pageLabel = CCLabelBMFont::create("", "chatFont.fnt");
+        m_pageLabel->setScale(.5f);
+        m_pageMenu->addChild(m_pageLabel);
+
+        auto nextSpr = ButtonSprite::create(">", "bigFont.fnt", "GJ_button_04.png", 1.f);
+        nextSpr->setScale(.6f);
+        m_pageMenu->addChild(CCMenuItemSpriteExtra::create(
+            nextSpr, this, menu_selector(BotMacroPopup::onNextPage)));
+
+        m_mainLayer->addChildAtPosition(m_pageMenu, Anchor::Top, ccp(0.f, -68.f));
+
+        // --- список слотов ---
+        // Контейнер с «нулевым» размером в точке Top|(-92): дальше все строки
+        // позиционируются от его левого верхнего угла вниз, как в старой версии.
+        m_listMenu = CCMenu::create();
+        m_listMenu->setContentSize(CCSize{w - 20.f, 0.f});
+        m_listMenu->setAnchorPoint({.5f, 1.f});
+        m_listMenu->ignoreAnchorPointForPosition(false);
+        m_mainLayer->addChildAtPosition(m_listMenu, Anchor::Top, ccp(0.f, -92.f));
+
+        // --- низ: Save as / Close ---
+        auto saveSpr = ButtonSprite::create("Save current as...", "bigFont.fnt", "GJ_button_04.png", .6f);
+        saveSpr->setScale(.6f);
+        auto saveBtn = CCMenuItemSpriteExtra::create(
+            saveSpr, this, menu_selector(BotMacroPopup::onSaveAs));
+        m_buttonMenu->addChildAtPosition(saveBtn, Anchor::Bottom, ccp(-74.f, 22.f));
+
+        auto closeSpr = ButtonSprite::create("Close", "bigFont.fnt", "GJ_button_06.png", .7f);
+        closeSpr->setScale(.6f);
+        auto closeBtn = CCMenuItemSpriteExtra::create(
+            closeSpr, this, menu_selector(BotMacroPopup::onCloseClicked));
+        m_buttonMenu->addChildAtPosition(closeBtn, Anchor::Bottom, ccp(78.f, 22.f));
+
+        this->rebuildList();
+
+        return true;
+    }
+
+    // Обновление списка ПО ФАКТУ завершения фоновой записи (а не через 0.3 с наугад).
+    void startRefreshTimer() {
+        if (m_polling) return;
+        m_polling = true;
+        this->pollSave();
+    }
+
+    void pollSave() {
+        Ref<BotMacroPopup> self(this);
+        bot::later([self] {
+            if (!self->m_polling) return;
+
+            if (bot::saveBusy().load()) {
+                self->updateStatus();
+                self->pollSave();          // ещё пишем — опрашиваем дальше
+                return;
+            }
+
+            self->m_polling = false;
+            self->rebuildList();
+        });
+    }
+
+    void clearRows() {
+        m_listMenu->removeAllChildren();
+
+        // Подписи строк живут прямо в m_mainLayer — убираем старые по тегу.
+        std::vector<CCNode*> stale;
+        if (auto* children = m_mainLayer->getChildren()) {
+            for (auto* node : CCArrayExt<CCNode*>(children)) {
+                if (node->getTag() == kRowTag) stale.push_back(node);
+            }
+        }
+        for (auto* n : stale) n->removeFromParent();
+    }
+
+    void rebuildList() {
+        m_slots = bot::listSlots();
+
+        int const totalPages = std::max(1, (static_cast<int>(m_slots.size()) + kPerPage - 1) / kPerPage);
+        if (m_page >= totalPages) m_page = totalPages - 1;
+        if (m_page < 0) m_page = 0;
+
+        this->clearRows();
+
+        auto const& s = bot::state();
+
+        float const w = m_size.width;
+        float const rowH = 26.f;
+
+        int const first = m_page * kPerPage;
+        int const shown = std::min(kPerPage, static_cast<int>(m_slots.size()) - first);
+
+        for (int i = 0; i < shown; ++i) {
+            auto const& slot = m_slots[static_cast<size_t>(first + i)];
+            float const y = -static_cast<float>(i) * rowH;
+
+            bool const isCurrent = (slot.name == s.macroName);
+
+            auto label = CCLabelBMFont::create(
+                fmt::format("{}{} ({} inp, {} tps)", isCurrent ? "> " : "   ",
+                            slot.name, slot.count, slot.tps).c_str(),
+                "chatFont.fnt"
+            );
+            label->setScale(.5f);
+            if (isCurrent) label->setColor({120, 255, 140});
+            label->setTag(kRowTag);
+            m_mainLayer->addChildAtPosition(
+                label, Anchor::Top, ccp(-w / 2.f + 24.f, -92.f + y), ccp(0.f, .5f), false
+            );
+
+            // [U3] Имя слота захватывается в лямбду — никаких тегов/индексов,
+            // которые разъезжаются после пересборки списка.
+            auto loadSpr = ButtonSprite::create("Load", "bigFont.fnt", "GJ_button_01.png", 1.f);
+            loadSpr->setScale(.5f);
+            auto loadBtn = CCMenuItemExt::createSpriteExtra(loadSpr, [this, slot](auto*) {
+                this->onLoadSlot(slot.name);
+            });
+            loadBtn->setPosition(ccp(w / 2.f - 112.f, y - rowH / 2.f + 4.f));
+            m_listMenu->addChild(loadBtn);
+
+            auto delSpr = ButtonSprite::create("Del", "bigFont.fnt", "GJ_button_06.png", 1.f);
+            delSpr->setScale(.5f);
+            auto delBtn = CCMenuItemExt::createSpriteExtra(delSpr, [this, slot](auto*) {
+                this->onDeleteSlot(slot.name);
+            });
+            delBtn->setPosition(ccp(w / 2.f - 46.f, y - rowH / 2.f + 4.f));
+            m_listMenu->addChild(delBtn);
+        }
+
+        if (m_slots.empty()) {
+            auto label = CCLabelBMFont::create("No saved macros for this level yet", "chatFont.fnt");
+            label->setScale(.5f);
+            label->setTag(kRowTag);
+            m_mainLayer->addChildAtPosition(label, Anchor::Top, ccp(0.f, -92.f - rowH));
+        }
+
+        m_pageLabel->setString(fmt::format("Page {}/{}", m_page + 1, totalPages).c_str());
+        m_pageMenu->updateLayout();
+
+        this->updateStatus();
+    }
+
+    void updateStatus() {
+        auto const& s = bot::state();
+        std::string const saving = bot::saveBusy().load() ? "  [saving...]" : "";
+
+        m_statusLabel->setString(
+            fmt::format("Slot: {}   Inputs: {}   TPS: {} (measured {}){}",
+                        s.macroName, s.macro.size(), s.tps, s.measuredTps, saving).c_str()
+        );
+    }
+
+public:
+    void onPrevPage(CCObject*) {
+        if (m_page > 0) { --m_page; this->rebuildList(); }
+    }
+
+    void onNextPage(CCObject*) {
+        int const totalPages = std::max(1, (static_cast<int>(m_slots.size()) + kPerPage - 1) / kPerPage);
+        if (m_page + 1 < totalPages) { ++m_page; this->rebuildList(); }
+    }
+
+    void onLoadSlot(std::string const& name) {
+        if (name.empty()) return;
+
+        bot::load(name);
+
+        auto const mode = bot::state().mode;
+
+        Ref<BotMacroPopup> self(this);
+
+        // [C6] Закрытие попапа и рестарт уровня — НЕ из-под activate() кнопки.
+        bot::later([self, mode] {
+            self->onClose(nullptr);
+
+            if (mode == bot::Mode::Play || mode == bot::Mode::Record) {
+                // Уровень может уже быть другим — берём заново.
+                bot::restartFromMenu(PlayLayer::get());   // [B3]
+            }
+        });
+    }
+
+    void onDeleteSlot(std::string const& name) {
+        if (name.empty()) return;
+
+        // Ref держит этот попап живым, пока открыт диалог подтверждения.
+        Ref<BotMacroPopup> self(this);
+
+        // [U2] Подтверждение — штатный быстрый попап Geode.
+        geode::createQuickPopup(
+            "Delete macro",
+            fmt::format("Delete '{}'?", name),
+            "No", "Yes",
+            [self, name](FLAlertLayer*, bool btn2) {
+                if (!btn2) return;
+
+                bot::deleteSlot(name);
+
+                if (bot::state().macroName == name) {
+                    bot::state().macroName = "default";
+                }
+
+                // Кнопка Del к этому моменту уже может быть удалена из меню —
+                // пересборку списка откладываем на следующий тик.
+                bot::later([self] { self->rebuildList(); });
+            }
+        );
+    }
+
+    void onSaveAs(CCObject*) {
+        Ref<BotMacroPopup> self(this);
+
+        auto popup = BotPromptPopup::create(PromptParams{
+            "Save macro as",
+            "name",
+            bot::state().macroName,
+            false,
+            [self](std::string raw) { self->doSaveAs(raw); },
+            {}
+        });
+
+        if (popup) popup->show();
+    }
+
+    void doSaveAs(std::string const& raw) {
+        std::string const name = bot::sanitizeName(raw);
+
+        if (!bot::isValidName(name)) {
+            bot::alert("Invalid name.\nUse letters, digits, space, - _ .");
+            return;
+        }
+
+        if (bot::saveBusy().load()) {
+            bot::alert("Previous save is still in progress.");
+            return;
+        }
+
+        if (bot::slotExists(name)) {
+            Ref<BotMacroPopup> self(this);
+
+            geode::createQuickPopup(
+                "Overwrite macro",
+                fmt::format("Slot '{}' already exists.\nOverwrite?", name),
+                "No", "Yes",
+                [self, name](FLAlertLayer*, bool btn2) {
+                    if (!btn2) return;
+                    bot::saveAs(name);
+                    self->startRefreshTimer();
+                }
+            );
+            return;
+        }
+
+        bot::saveAs(name);
+        this->startRefreshTimer();
+    }
+
+    void onCloseClicked(CCObject*) {
+        this->onClose(nullptr);
+    }
+
+    // [C6] Снимаем опрос до вызова базового onClose, чтобы отложенный колбэк
+    // не обратился к попапу, которого уже нет в дереве.
+    void onClose(CCObject* sender) override {
+        m_polling = false;
+
+        auto cb = std::move(m_onClosed);
+        m_onClosed = nullptr;
+
+        geode::Popup::onClose(sender);
+
+        if (cb) cb();
+    }
+
+    static BotMacroPopup* create() {
+        auto ret = new BotMacroPopup();
+
+        if (ret->init()) {
+            ret->autorelease();
+            return ret;
+        }
+
+        delete ret;
+        return nullptr;
+    }
+};
 
 // =====================================================================
 //  Физический шаг и ввод
@@ -923,8 +1793,18 @@ class $modify(BotBaseLayer, GJBaseGameLayer) {
     void update(float dt) {
         auto& s = bot::state();
 
+        if (bot::isPlayLayer(this)) {
+            ++bot::diagUpdateCount();
+        }
+
         if (!bot::isPlayLayer(this) || !s.isFrozen || s.mode != bot::Mode::Record) {
             GJBaseGameLayer::update(dt);
+            return;
+        }
+
+        // [F5] На паузе окно возрождения не «тикает»: иначе пауза съедала
+        // все 150 мс и после Resume орб уже не активировался.
+        if (!bot::gameRunning()) {
             return;
         }
 
@@ -940,7 +1820,8 @@ class $modify(BotBaseLayer, GJBaseGameLayer) {
     }
 
     // Квантование дельты движка на сетку 1/tps + аккумулятор остатка.
-    float getModifiedDelta(float dt) {
+    // [B1] В 2.2081 сигнатура: double getModifiedDelta(float dt).
+    double getModifiedDelta(float dt) {
         auto& s = bot::state();
 
         if (!bot::isPlayLayer(this)) {
@@ -948,32 +1829,42 @@ class $modify(BotBaseLayer, GJBaseGameLayer) {
         }
 
         // Наследуем все штатные модификаторы (timeWarp, ускорения и т.п.).
-        float base = GJBaseGameLayer::getModifiedDelta(dt);
-        if (!(base > 0.f)) {
+        double const base = GJBaseGameLayer::getModifiedDelta(dt);
+        if (!(base > 0.0)) {
             s.tpsAccumulator = 0.0;
             return base;
         }
 
-        double spt = 1.0 / static_cast<double>(std::max<uint32_t>(s.tps, bot::State::kMinTps));
-
-        double total = static_cast<double>(base) + s.tpsAccumulator;
-
-        double maxTotal = spt * bot::MAX_STEPS_PER_FRAME;
-        if (total > maxTotal) total = maxTotal;
+        double const spt = 1.0 / static_cast<double>(std::max<uint32_t>(s.tps, bot::State::kMinTps));
+        double total = base + s.tpsAccumulator;
 
         double steps = std::floor(total / spt + 1e-9);
-        double newDelta = steps * spt;
 
+        // [C5] Никогда не возвращаем 0: ноль-дельта может дать 1/dt = inf
+        // в недрах движка. Копим остаток и отдаём исходную дельту.
+        if (steps < 1.0) {
+            s.tpsAccumulator = total;
+            return base;
+        }
+
+        if (steps > bot::MAX_STEPS_PER_FRAME) {
+            steps = bot::MAX_STEPS_PER_FRAME;
+        }
+
+        double const newDelta = steps * spt;
         s.tpsAccumulator = total - newDelta;
 
-        return static_cast<float>(newDelta);
+        return newDelta;
     }
 
     void processCommands(float dt, bool isHalfTick, bool isLastTick) {
         auto& s = bot::state();
-        bool inPlay = bot::isPlayLayer(this);
 
-        if (inPlay) {
+        // [F5] Шаг — это ФИЗИЧЕСКИЙ шаг. Пока игра на паузе, шкала стоит:
+        // иначе measured TPS и номера шагов в макросе уезжают.
+        bool const running = bot::isPlayLayer(this) && bot::gameRunning();
+
+        if (running) {
             bool const frozenOver =
                 s.isFrozen && std::chrono::steady_clock::now() >= s.freezeEndTime;
 
@@ -986,7 +1877,7 @@ class $modify(BotBaseLayer, GJBaseGameLayer) {
 
             // --- 2. Воспроизведение ---
             if (s.mode == bot::Mode::Play) {
-                bool hasMore = s.playIdx < s.macro.size();
+                bool const hasMore = s.playIdx < s.macro.size();
                 if (s.syncHeld || (hasMore && s.macro[s.playIdx].step <= s.step)) {
                     bot::inject(this);
                 }
@@ -995,9 +1886,10 @@ class $modify(BotBaseLayer, GJBaseGameLayer) {
 
         GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
 
-        if (inPlay) {
+        if (running) {
             ++s.step;
             bot::countStep();
+            bot::diagnosticsTick();
         }
     }
 
@@ -1008,6 +1900,15 @@ class $modify(BotBaseLayer, GJBaseGameLayer) {
         bool const inPlay = bot::isPlayLayer(this);
 
         if (!s.injecting && inPlay && gameButton) {
+
+            uint8_t const m = bot::bitOf(isPlayer1, button);
+
+            // [F6] Реально зажатые клавиши отслеживаем в ЛЮБОМ режиме —
+            // они нужны окну возрождения, которое стартует при смене режима.
+            if (m) {
+                if (down) s.finger |= m;
+                else      s.finger &= static_cast<uint8_t>(~m);
+            }
 
             if (s.mode == bot::Mode::Play) {
                 // Пока макрос не кончился — живой ввод игнорируется.
@@ -1024,11 +1925,6 @@ class $modify(BotBaseLayer, GJBaseGameLayer) {
                 bool const isEngineReset = s.inResetLevel || (s.cpLoadDepth > 0);
 
                 if (!isEngineReset) {
-                    uint8_t m = bot::bitOf(isPlayer1, button);
-
-                    if (down) s.finger |= m;
-                    else      s.finger &= static_cast<uint8_t>(~m);
-
                     if (s.isFrozen) {
                         // Внутри 150-мс окна ввод НЕ пишем и в игру НЕ передаём:
                         // итоговое состояние будет выставлено в resolveGrace().
@@ -1043,7 +1939,7 @@ class $modify(BotBaseLayer, GJBaseGameLayer) {
         GJBaseGameLayer::handleButton(down, button, isPlayer1);
 
         if (!s.injecting && inPlay && gameButton) {
-            uint8_t m = bot::bitOf(isPlayer1, button);
+            uint8_t const m = bot::bitOf(isPlayer1, button);
             if (m) {
                 if (down) s.gameHeld |= m;
                 else      s.gameHeld &= static_cast<uint8_t>(~m);
@@ -1053,7 +1949,7 @@ class $modify(BotBaseLayer, GJBaseGameLayer) {
 };
 
 // =====================================================================
-//  Уровень: вход, сбросы, чекпоинты, смерть
+//  Уровень: вход/выход, сбросы, чекпоинты, смерть, прохождение
 // =====================================================================
 
 class $modify(BotPlayLayer, PlayLayer) {
@@ -1063,14 +1959,27 @@ class $modify(BotPlayLayer, PlayLayer) {
 
         auto& s = bot::state();
 
-        // onEnter() срабатывает и при возврате из паузы — в таком случае
-        // уровень НЕ переинициализируем (иначе слот/макрос сбрасывались).
+        // onEnter() может сработать повторно — в таком случае уровень
+        // НЕ переинициализируем (иначе слот/макрос сбрасывались).
         if (s.enteredLayer == static_cast<void*>(this)) {
             return;
         }
         s.enteredLayer = static_cast<void*>(this);
 
         bot::onEnterLevel(m_level);
+    }
+
+    // [C2] Без этого указатель на умерший PlayLayer оставался в state, и новый
+    // слой с тем же адресом (куча охотно переиспользует блоки) считался
+    // «уже инициализированным» — уровень/слот не загружались.
+    void onExit() {
+        auto& s = bot::state();
+
+        if (s.enteredLayer == static_cast<void*>(this)) {
+            s.enteredLayer = nullptr;
+        }
+
+        PlayLayer::onExit();
     }
 
     void resetLevel() {
@@ -1087,7 +1996,10 @@ class $modify(BotPlayLayer, PlayLayer) {
         PlayLayer::resetLevel();
 
         if (!s.cpLoadedInReset) {
-            if (s.mode == bot::Mode::Record && !m_isPracticeMode) {
+            // inExplicitRestart: это рестарт по кнопке из меню, а НЕ смерть.
+            // Без этой проверки переход в Record перезаписал бы слот пустым
+            // макросом (stopRecording -> save).
+            if (s.mode == bot::Mode::Record && !m_isPracticeMode && !s.inExplicitRestart) {
                 // Обычный режим: смерть = конец попытки. Фиксируем и сохраняем.
                 bot::stopRecording();
             }
@@ -1111,7 +2023,7 @@ class $modify(BotPlayLayer, PlayLayer) {
             return;
         }
 
-        bool wasInResetLevel = s.inResetLevel;
+        bool const wasInResetLevel = s.inResetLevel;
         s.inResetLevel = true;
 
         PlayLayer::resetLevelFromStart();
@@ -1138,7 +2050,7 @@ class $modify(BotPlayLayer, PlayLayer) {
 
         --s.cpLoadDepth;
 
-        auto it = s.cpFrames.find(cp);
+        auto const it = s.cpFrames.find(cp);
 
         if (it == s.cpFrames.end()) {
             log::warn("GDBot: unknown checkpoint, restarting macro from the beginning");
@@ -1161,10 +2073,11 @@ class $modify(BotPlayLayer, PlayLayer) {
         }
     }
 
+    // [F4] Запись именно ЗАВЕРШАЕТСЯ: раньше mode оставался Record, и шаги
+    // с вводами продолжали писаться всю энд-анимацию и LevelCompleteLayer.
     void levelComplete() {
         if (bot::state().mode == bot::Mode::Record) {
-            bot::finishGraceOffline();
-            bot::save();
+            bot::stopRecording();     // finishGraceOffline + mode=Off + save
         }
         PlayLayer::levelComplete();
     }
@@ -1174,7 +2087,9 @@ class $modify(BotPlayLayer, PlayLayer) {
 
         if (s.mode == bot::Mode::Record) {
             bot::finishGraceOffline();
-            bot::save();
+            bot::saveSync();          // синхронно: файл точно ляжет на диск
+        } else {
+            bot::drainSaveQueue();    // дописываем то, что уже было в очереди
         }
 
         s.mode = bot::Mode::Off;
@@ -1186,635 +2101,30 @@ class $modify(BotPlayLayer, PlayLayer) {
 };
 
 // =====================================================================
-//  UI: попапы
-//
-//  В этой версии Geode нет шаблона Popup<>, поэтому попапы — обычные
-//  CCLayerColor поверх сцены. Модальность обеспечивается так:
-//    * сам слой имеет touch priority = kPrio и ccTouchBegan -> true,
-//      то есть глотает всё, что не досталось его меню;
-//    * все меню/поле ввода внутри получают priority = kPrio - 1,
-//      то есть обрабатывают тач РАНЬШЕ затемняющего слоя.
-//  Меньшее число = более высокий приоритет. Prompt открывается поверх
-//  Macro-попапа, поэтому у него число ещё меньше.
-//
-//  Закрытие — только через closeSelf() (retain/remove/autorelease), чтобы
-//  колбэк кнопки не работал с уже освобождённым this.
-// =====================================================================
-
-namespace botui {
-    constexpr int kMacroPrio  = -9000;
-    constexpr int kPromptPrio = -9100;
-}
-
-// Базовый модальный попап.
-class BotPopupLayer : public CCLayerColor {
-protected:
-    CCSize m_panelSize;
-    CCPoint m_panelPos;
-    bool m_closing = false;
-
-    bool initPopup(ccColor4B dim, float w, float h, int prio) {
-        auto win = CCDirector::get()->getWinSize();
-
-        if (!CCLayerColor::initWithColor(dim, win.width, win.height)) {
-            return false;
-        }
-
-        m_panelSize = CCSize{w, h};
-        m_panelPos = CCPoint{(win.width - w) / 2.f, (win.height - h) / 2.f};
-
-        this->setPosition({0.f, 0.f});
-        this->setTouchMode(kCCTouchesOneByOne);
-        this->setTouchPriority(prio);
-        this->setTouchEnabled(true);
-        this->setKeypadEnabled(true);
-
-        return true;
-    }
-
-    CCLayerColor* makePanel() {
-        auto panel = CCLayerColor::create(ccc4(20, 20, 30, 255), m_panelSize.width, m_panelSize.height);
-        panel->setPosition(m_panelPos);
-        this->addChild(panel);
-        return panel;
-    }
-
-    CCMenu* makeMenu(CCLayer* parent, int prio) {
-        auto menu = CCMenu::create();
-        menu->setPosition({0.f, 0.f});
-        menu->setHandlerPriority(prio);
-        parent->addChild(menu);
-        return menu;
-    }
-
-public:
-    bool ccTouchBegan(CCTouch*, CCEvent*) override { return true; }
-    void keyBackClicked() override { this->closeSelf(); }
-
-    // Безопасное закрытие из колбэка собственной кнопки.
-    // ВИРТУАЛЬНЫЙ: производные попапы снимают свои таймеры/колбэки.
-    virtual void closeSelf() {
-        if (m_closing) return;
-        m_closing = true;
-
-        this->setTouchEnabled(false);
-        this->setKeypadEnabled(false);
-        this->retain();
-        this->removeFromParentAndCleanup(true);
-        this->autorelease();
-    }
-
-    void show() {
-        if (auto* scene = CCDirector::get()->getRunningScene()) {
-            scene->addChild(this, 10000);
-        }
-    }
-};
-
-// ---------------- Ввод числа (TPS) / строки (имя слота) ----------------
-
-struct PromptParams {
-    std::string title;
-    std::string placeholder;
-    std::string initial;
-    bool digitsOnly = false;
-    std::function<void(std::string)> onOk;
-    std::vector<uint32_t> presets;   // пусто — пресетов нет
-};
-
-class BotPromptPopup : public BotPopupLayer {
-protected:
-    geode::TextInput* m_input = nullptr;
-    PromptParams m_params;
-
-    bool init(PromptParams params) {
-        m_params = std::move(params);
-
-        bool const hasPresets = !m_params.presets.empty();
-        float const panelH = hasPresets ? 160.f : 130.f;
-
-        if (!this->initPopup(ccc4(0, 0, 0, 160), 320.f, panelH, botui::kPromptPrio)) {
-            return false;
-        }
-
-        auto* panel = this->makePanel();
-        float const w = m_panelSize.width;
-        float const h = m_panelSize.height;
-
-        auto title = CCLabelBMFont::create(m_params.title.c_str(), "bigFont.fnt");
-        title->setScale(.6f);
-        title->setPosition({w / 2.f, h - 20.f});
-        panel->addChild(title);
-
-        m_input = geode::TextInput::create(w - 40.f, m_params.placeholder);
-        if (!m_input) return false;
-
-        m_input->setString(m_params.initial);
-        m_input->setPosition({w / 2.f, h - 52.f});
-        panel->addChild(m_input);
-
-        // Поле ввода должно получать тач раньше затемняющего слоя.
-        if (auto* node = m_input->getInputNode()) {
-            node->setTouchPriority(botui::kPromptPrio - 1);
-            if (m_params.digitsOnly) {
-                node->setAllowedChars("0123456789");
-                node->setMaxLabelLength(6);
-            }
-        }
-
-        if (hasPresets) {
-            auto presetMenu = this->makeMenu(panel, botui::kPromptPrio - 1);
-
-            int n = static_cast<int>(m_params.presets.size());
-            float const stepX = (w - 30.f) / static_cast<float>(n);
-
-            for (int i = 0; i < n; ++i) {
-                uint32_t v = m_params.presets[static_cast<size_t>(i)];
-
-                auto spr = ButtonSprite::create(
-                    std::to_string(v).c_str(), "bigFont.fnt", "GJ_button_04.png", .5f
-                );
-                spr->setScale(.5f);
-
-                auto btn = CCMenuItemSpriteExtra::create(
-                    spr, this, menu_selector(BotPromptPopup::onPreset)
-                );
-                btn->setTag(static_cast<int>(v));
-                btn->setPosition({15.f + stepX * (static_cast<float>(i) + .5f), h - 84.f});
-                presetMenu->addChild(btn);
-            }
-        }
-
-        auto menu = this->makeMenu(panel, botui::kPromptPrio - 1);
-
-        auto okSpr = ButtonSprite::create("OK", "bigFont.fnt", "GJ_button_01.png", .7f);
-        okSpr->setScale(.6f);
-        auto ok = CCMenuItemSpriteExtra::create(okSpr, this, menu_selector(BotPromptPopup::onOkClicked));
-        ok->setPosition({w / 2.f + 45.f, 22.f});
-        menu->addChild(ok);
-
-        auto cancelSpr = ButtonSprite::create("Cancel", "bigFont.fnt", "GJ_button_06.png", .7f);
-        cancelSpr->setScale(.6f);
-        auto cancel = CCMenuItemSpriteExtra::create(cancelSpr, this, menu_selector(BotPromptPopup::onCancelClicked));
-        cancel->setPosition({w / 2.f - 45.f, 22.f});
-        menu->addChild(cancel);
-
-        return true;
-    }
-
-public:
-    void onPreset(CCObject* sender) {
-        if (!sender || !m_input) return;
-        m_input->setString(std::to_string(static_cast<CCNode*>(sender)->getTag()));
-    }
-
-    void onOkClicked(CCObject*) {
-        std::string value = m_input ? std::string(m_input->getString()) : std::string();
-        auto cb = m_params.onOk;
-
-        this->closeSelf();
-
-        if (cb) cb(value);
-    }
-
-    void onCancelClicked(CCObject*) {
-        this->closeSelf();
-    }
-
-    static BotPromptPopup* create(PromptParams params) {
-        auto ret = new BotPromptPopup();
-
-        if (ret->init(std::move(params))) {
-            ret->autorelease();
-            return ret;
-        }
-
-        delete ret;
-        return nullptr;
-    }
-};
-
-// ---------------- Подтверждение (Да/Нет) ----------------
-
-struct ConfirmParams {
-    std::string title;
-    std::string text;
-    std::function<void()> onYes;
-};
-
-class BotConfirmPopup : public BotPopupLayer {
-protected:
-    ConfirmParams m_params;
-
-    bool init(ConfirmParams params) {
-        m_params = std::move(params);
-
-        if (!this->initPopup(ccc4(0, 0, 0, 160), 300.f, 140.f, botui::kPromptPrio)) {
-            return false;
-        }
-
-        auto* panel = this->makePanel();
-        float const w = m_panelSize.width;
-        float const h = m_panelSize.height;
-
-        auto title = CCLabelBMFont::create(m_params.title.c_str(), "bigFont.fnt");
-        title->setScale(.55f);
-        title->setPosition({w / 2.f, h - 20.f});
-        panel->addChild(title);
-
-        auto text = CCLabelBMFont::create(m_params.text.c_str(), "chatFont.fnt");
-        text->setScale(.55f);
-        text->setAlignment(kCCTextAlignmentCenter);
-        text->setPosition({w / 2.f, h / 2.f + 4.f});
-        panel->addChild(text);
-
-        auto menu = this->makeMenu(panel, botui::kPromptPrio - 1);
-
-        auto yesSpr = ButtonSprite::create("Yes", "bigFont.fnt", "GJ_button_01.png", .7f);
-        yesSpr->setScale(.6f);
-        auto yes = CCMenuItemSpriteExtra::create(yesSpr, this, menu_selector(BotConfirmPopup::onYesClicked));
-        yes->setPosition({w / 2.f + 42.f, 22.f});
-        menu->addChild(yes);
-
-        auto noSpr = ButtonSprite::create("No", "bigFont.fnt", "GJ_button_06.png", .7f);
-        noSpr->setScale(.6f);
-        auto no = CCMenuItemSpriteExtra::create(noSpr, this, menu_selector(BotConfirmPopup::onNoClicked));
-        no->setPosition({w / 2.f - 38.f, 22.f});
-        menu->addChild(no);
-
-        return true;
-    }
-
-public:
-    void onYesClicked(CCObject*) {
-        auto cb = m_params.onYes;
-        this->closeSelf();
-        if (cb) cb();
-    }
-
-    void onNoClicked(CCObject*) {
-        this->closeSelf();
-    }
-
-    static BotConfirmPopup* create(ConfirmParams params) {
-        auto ret = new BotConfirmPopup();
-
-        if (ret->init(std::move(params))) {
-            ret->autorelease();
-            return ret;
-        }
-
-        delete ret;
-        return nullptr;
-    }
-};
-
-// ---------------- Менеджер макросов ----------------
-
-class BotMacroPopup : public BotPopupLayer {
-protected:
-    static constexpr int kPerPage = 8;
-    static constexpr int kRowTag = 424242;
-
-    CCLayerColor* m_panel = nullptr;
-    CCMenu* m_listMenu = nullptr;
-    CCLabelBMFont* m_pageLabel = nullptr;
-    CCLabelBMFont* m_statusLabel = nullptr;
-
-    std::vector<bot::MacroSlotInfo> m_slots;
-    int m_page = 0;
-    bool m_polling = false;
-
-public:
-    // Вызывается при закрытии попапа (чтобы меню паузы обновило статус).
-    std::function<void()> m_onClosed = nullptr;
-
-protected:
-    bool init() {
-        if (!this->initPopup(ccc4(0, 0, 0, 160), 400.f, 320.f, botui::kMacroPrio)) {
-            return false;
-        }
-
-        m_panel = this->makePanel();
-
-        float const w = m_panelSize.width;
-        float const h = m_panelSize.height;
-
-        auto title = CCLabelBMFont::create("GD Bot Macros", "bigFont.fnt");
-        title->setScale(.6f);
-        title->setPosition({w / 2.f, h - 20.f});
-        m_panel->addChild(title);
-
-        m_statusLabel = CCLabelBMFont::create("", "chatFont.fnt");
-        m_statusLabel->setScale(.45f);
-        m_statusLabel->setPosition({w / 2.f, h - 40.f});
-        m_panel->addChild(m_statusLabel);
-
-        // Кнопки страниц — сверху.
-        auto pageMenu = this->makeMenu(m_panel, botui::kMacroPrio - 1);
-
-        auto prevSpr = ButtonSprite::create("<", "bigFont.fnt", "GJ_button_04.png", .7f);
-        prevSpr->setScale(.6f);
-        auto prev = CCMenuItemSpriteExtra::create(prevSpr, this, menu_selector(BotMacroPopup::onPrevPage));
-        prev->setPosition({40.f, h - 60.f});
-        pageMenu->addChild(prev);
-
-        auto nextSpr = ButtonSprite::create(">", "bigFont.fnt", "GJ_button_04.png", .7f);
-        nextSpr->setScale(.6f);
-        auto next = CCMenuItemSpriteExtra::create(nextSpr, this, menu_selector(BotMacroPopup::onNextPage));
-        next->setPosition({w - 40.f, h - 60.f});
-        pageMenu->addChild(next);
-
-        m_pageLabel = CCLabelBMFont::create("", "chatFont.fnt");
-        m_pageLabel->setScale(.5f);
-        m_pageLabel->setPosition({w / 2.f, h - 60.f});
-        m_panel->addChild(m_pageLabel);
-
-        // Список слотов.
-        m_listMenu = this->makeMenu(m_panel, botui::kMacroPrio - 1);
-
-        // Низ: Save as / Close.
-        auto bottomMenu = this->makeMenu(m_panel, botui::kMacroPrio - 1);
-
-        auto saveSpr = ButtonSprite::create("Save current as...", "bigFont.fnt", "GJ_button_04.png", .6f);
-        saveSpr->setScale(.6f);
-        auto saveBtn = CCMenuItemSpriteExtra::create(saveSpr, this, menu_selector(BotMacroPopup::onSaveAs));
-        saveBtn->setPosition({w / 2.f - 74.f, 22.f});
-        bottomMenu->addChild(saveBtn);
-
-        auto closeSpr = ButtonSprite::create("Close", "bigFont.fnt", "GJ_button_06.png", .7f);
-        closeSpr->setScale(.6f);
-        auto closeBtn = CCMenuItemSpriteExtra::create(closeSpr, this, menu_selector(BotMacroPopup::onCloseClicked));
-        closeBtn->setPosition({w / 2.f + 78.f, 22.f});
-        bottomMenu->addChild(closeBtn);
-
-        this->rebuildList();
-        this->startRefreshTimer();
-
-        return true;
-    }
-
-    // Обновление списка ПО ФАКТУ завершения фоновой записи (а не через 0.3 с наугад).
-    void startRefreshTimer() {
-        if (m_polling) return;
-        m_polling = true;
-        this->pollSave();
-    }
-
-    void pollSave() {
-        this->scheduleOnce(
-            [this](float) {
-                if (!m_polling) return;
-
-                if (bot::saveBusy().load()) {
-                    this->updateStatus();
-                    this->pollSave();          // ещё пишем — опрашиваем дальше
-                    return;
-                }
-
-                m_polling = false;
-                this->rebuildList();
-            },
-            0.1f
-        );
-    }
-
-    void rebuildList() {
-        m_slots = bot::listSlots();
-
-        int const totalPages = std::max(1, (static_cast<int>(m_slots.size()) + kPerPage - 1) / kPerPage);
-        if (m_page >= totalPages) m_page = totalPages - 1;
-        if (m_page < 0) m_page = 0;
-
-        m_listMenu->removeAllChildren();
-
-        // Строки-подписи живут не в меню — убираем старые по тегу.
-        std::vector<CCNode*> stale;
-        if (auto* children = m_panel->getChildren()) {
-            for (auto* node : CCArrayExt<CCNode*>(children)) {
-                if (node->getTag() == kRowTag) stale.push_back(node);
-            }
-        }
-        for (auto* n : stale) n->removeFromParent();
-
-        auto const& s = bot::state();
-
-        float const w = m_panelSize.width;
-        float const h = m_panelSize.height;
-        float const topY = h - 86.f;
-        float const rowH = 24.f;
-
-        int const first = m_page * kPerPage;
-        int const shown = std::min(kPerPage, static_cast<int>(m_slots.size()) - first);
-
-        for (int i = 0; i < shown; ++i) {
-            auto const& slot = m_slots[static_cast<size_t>(first + i)];
-            float const y = topY - static_cast<float>(i) * rowH;
-
-            bool const isCurrent = (slot.name == s.macroName);
-
-            auto label = CCLabelBMFont::create(
-                fmt::format("{}{} ({} inp, {} tps)", isCurrent ? "> " : "   ",
-                            slot.name, slot.count, slot.tps).c_str(),
-                "chatFont.fnt"
-            );
-            label->setScale(.5f);
-            label->setAnchorPoint({0.f, .5f});
-            label->setTag(kRowTag);
-            if (isCurrent) label->setColor({120, 255, 140});
-            label->setPosition({14.f, y});
-            m_panel->addChild(label);
-
-            auto loadSpr = ButtonSprite::create("Load", "bigFont.fnt", "GJ_button_01.png", .6f);
-            loadSpr->setScale(.5f);
-            auto loadBtn = CCMenuItemSpriteExtra::create(loadSpr, this, menu_selector(BotMacroPopup::onLoadSlot));
-            loadBtn->setTag(first + i);
-            loadBtn->setPosition({w - 112.f, y});
-            m_listMenu->addChild(loadBtn);
-
-            auto delSpr = ButtonSprite::create("Del", "bigFont.fnt", "GJ_button_06.png", .6f);
-            delSpr->setScale(.5f);
-            auto delBtn = CCMenuItemSpriteExtra::create(delSpr, this, menu_selector(BotMacroPopup::onDeleteSlot));
-            delBtn->setTag(first + i);
-            delBtn->setPosition({w - 46.f, y});
-            m_listMenu->addChild(delBtn);
-        }
-
-        if (m_slots.empty()) {
-            auto label = CCLabelBMFont::create("No saved macros for this level yet", "chatFont.fnt");
-            label->setScale(.5f);
-            label->setTag(kRowTag);
-            label->setPosition({w / 2.f, topY - rowH});
-            m_panel->addChild(label);
-        }
-
-        m_pageLabel->setString(fmt::format("Page {}/{}", m_page + 1, totalPages).c_str());
-
-        updateStatus();
-    }
-
-    void updateStatus() {
-        auto const& s = bot::state();
-        std::string saving = bot::saveBusy().load() ? "  [saving...]" : "";
-
-        m_statusLabel->setString(
-            fmt::format("Slot: {}   Inputs: {}   TPS: {} (measured {}){}",
-                        s.macroName, s.macro.size(), s.tps, s.measuredTps, saving).c_str()
-        );
-    }
-
-    std::string nameAt(CCObject* sender) const {
-        if (!sender) return {};
-        int idx = static_cast<CCNode*>(sender)->getTag();
-        if (idx < 0 || idx >= static_cast<int>(m_slots.size())) return {};
-        return m_slots[static_cast<size_t>(idx)].name;
-    }
-
-public:
-    void onPrevPage(CCObject*) { if (m_page > 0) { --m_page; rebuildList(); } }
-    void onNextPage(CCObject*) {
-        int const totalPages = std::max(1, (static_cast<int>(m_slots.size()) + kPerPage - 1) / kPerPage);
-        if (m_page + 1 < totalPages) { ++m_page; rebuildList(); }
-    }
-
-    void onLoadSlot(CCObject* sender) {
-        std::string name = this->nameAt(sender);
-        if (name.empty()) return;
-
-        bot::load(name);
-
-        auto* pl = PlayLayer::get();
-        auto const mode = bot::state().mode;
-
-        // Закрываем попап ДО любых действий с уровнем.
-        this->closeSelf();
-
-        if (pl && (mode == bot::Mode::Play || mode == bot::Mode::Record)) {
-            // Отложенно: resetLevelFromStart() НЕ должен выполняться внутри
-            // activate() кнопки попапа (иначе сносим узлы, которые ещё в стеке).
-            pl->scheduleOnce([pl](float) {
-                if (PlayLayer::get() == pl) pl->resetLevelFromStart();
-            }, 0.f);
-        }
-    }
-
-    void onDeleteSlot(CCObject* sender) {
-        std::string name = this->nameAt(sender);
-        if (name.empty()) return;
-
-        // Ref держит этот попап живым, пока открыт диалог подтверждения.
-        Ref<BotMacroPopup> self(this);
-
-        auto popup = BotConfirmPopup::create(ConfirmParams{
-            "Delete macro",
-            fmt::format("Delete '{}'?", name),
-            [self, name]() {
-                bot::deleteSlot(name);
-
-                if (bot::state().macroName == name) {
-                    bot::state().macroName = "default";
-                }
-
-                // Кнопка Del к этому моменту уже может быть удалена из меню —
-                // пересборку списка откладываем на следующий тик.
-                self->scheduleOnce([self](float) { self->rebuildList(); }, 0.f);
-            }
-        });
-
-        if (popup) popup->show();
-    }
-
-    void onSaveAs(CCObject*) {
-        Ref<BotMacroPopup> self(this);
-
-        auto popup = BotPromptPopup::create(PromptParams{
-            "Save macro as",
-            "name",
-            bot::state().macroName,
-            false,
-            [self](std::string raw) { self->doSaveAs(raw); },
-            {}
-        });
-
-        if (popup) popup->show();
-    }
-
-    void doSaveAs(std::string const& raw) {
-        std::string name = bot::sanitizeName(raw);
-
-        if (!bot::isValidName(name)) {
-            FLAlertLayer::create("GD Bot", "Invalid name.\nUse letters, digits, space, - _ .", "OK")->show();
-            return;
-        }
-
-        if (bot::saveBusy().load()) {
-            FLAlertLayer::create("GD Bot", "Previous save is still in progress.", "OK")->show();
-            return;
-        }
-
-        if (bot::slotExists(name)) {
-            Ref<BotMacroPopup> self(this);
-
-            auto popup = BotConfirmPopup::create(ConfirmParams{
-                "Overwrite macro",
-                fmt::format("Slot '{}' already exists.\nOverwrite?", name),
-                [self, name]() {
-                    bot::saveAs(name);
-                    self->startRefreshTimer();
-                }
-            });
-            if (popup) popup->show();
-            return;
-        }
-
-        bot::saveAs(name);
-        this->startRefreshTimer();
-    }
-
-    void onCloseClicked(CCObject*) {
-        this->closeSelf();
-    }
-
-    void closeSelf() override {
-        m_polling = false;
-
-        auto cb = m_onClosed;
-        m_onClosed = nullptr;
-
-        BotPopupLayer::closeSelf();
-
-        if (cb) cb();
-    }
-
-    static BotMacroPopup* create() {
-        auto ret = new BotMacroPopup();
-
-        if (ret->init()) {
-            ret->autorelease();
-            return ret;
-        }
-
-        delete ret;
-        return nullptr;
-    }
-};
-
-// =====================================================================
 //  Меню паузы
+//
+//  [C1] Панель строится ОДИН раз. Дальше обновляются только спрайты кнопок
+//  (CCMenuItemSpriteExtra::setSprite — Geode-добавление) и тексты лейблов.
+//  Никакого removeAllChildren() из-под activate() собственной кнопки:
+//  Ref<> на sender спасал только sender, а cleanup() по соседям и по самой
+//  кнопке в середине activate() — это и был источник плавающих крашей.
 // =====================================================================
 
 class $modify(BotPauseLayer, PauseLayer) {
 
     struct Fields {
         CCMenu* menu = nullptr;          // кнопка «Bot»
-        CCMenu* panel = nullptr;         // вся панель (пересоздаётся целиком)
+        CCMenu* panel = nullptr;         // вся панель (строится один раз)
         CCLabelBMFont* info = nullptr;   // ребёнок PauseLayer, НЕ panel
+
+        CCMenuItemSpriteExtra* modeBtns[3] = { nullptr, nullptr, nullptr };
+        CCLabelBMFont* tpsLabel = nullptr;
     };
 
     void customSetup() {
         PauseLayer::customSetup();
 
-        auto win = CCDirector::get()->getWinSize();
+        auto const win = CCDirector::get()->getWinSize();
 
         float const x = 95.f;
         float const topY = win.height * 0.62f;
@@ -1844,48 +2154,35 @@ class $modify(BotPauseLayer, PauseLayer) {
         m_fields->info->setPosition({x, topY - 26.f * 6 - 26.f});
         this->addChild(m_fields->info);
 
-        this->rebuildBotMenu();
+        this->buildBotPanel(x, topY);
+        this->refreshBotPanel();
     }
 
-    CCMenuItemSpriteExtra* makeBotButton(char const* text, bot::Mode mode) {
-        bool selected = (bot::state().mode == mode);
-
+    ButtonSprite* makeModeSprite(char const* text, bool selected) {
         auto spr = ButtonSprite::create(
-            text,
-            "bigFont.fnt",
+            text, "bigFont.fnt",
             selected ? "GJ_button_01.png" : "GJ_button_04.png",
             .7f
         );
         spr->setScale(.6f);
-
-        auto btn = CCMenuItemSpriteExtra::create(
-            spr, this, menu_selector(BotPauseLayer::onBotMode)
-        );
-        btn->setTag(static_cast<int>(mode));
-        return btn;
+        return spr;
     }
 
-    void rebuildBotMenu() {
-        auto panel = m_fields ? m_fields->panel : nullptr;
-        if (!panel || !m_fields->info) return;
-
-        auto& s = bot::state();
-        auto win = CCDirector::get()->getWinSize();
-
-        float const x = 95.f;
-        float const topY = win.height * 0.62f;
-
-        // removeAllChildren() у CCMenu безопасен, если вызывающая кнопка
-        // удержана снаружи (см. rebuildKeeping) либо вызов идёт не из activate().
-        panel->removeAllChildren();
+    void buildBotPanel(float x, float topY) {
+        auto panel = m_fields->panel;
 
         char const* names[3] = { "Record", "Off", "Play" };
-        bot::Mode modes[3] = { bot::Mode::Record, bot::Mode::Off, bot::Mode::Play };
+        bot::Mode const modes[3] = { bot::Mode::Record, bot::Mode::Off, bot::Mode::Play };
 
         for (int i = 0; i < 3; ++i) {
-            auto btn = this->makeBotButton(names[i], modes[i]);
+            auto btn = CCMenuItemSpriteExtra::create(
+                this->makeModeSprite(names[i], false),
+                this, menu_selector(BotPauseLayer::onBotMode)
+            );
+            btn->setTag(static_cast<int>(modes[i]));
             btn->setPosition({x, topY - 26.f * static_cast<float>(i + 1)});
             panel->addChild(btn);
+            m_fields->modeBtns[i] = btn;
         }
 
         // --- Строка TPS:  [-] [+]  <число>  [Set] ---
@@ -1903,10 +2200,10 @@ class $modify(BotPauseLayer, PauseLayer) {
         incBtn->setPosition({x - 30.f, tpsRowY});
         panel->addChild(incBtn);
 
-        auto tpsLabel = CCLabelBMFont::create(fmt::format("{}", s.tps).c_str(), "bigFont.fnt");
-        tpsLabel->setScale(.42f);
-        tpsLabel->setPosition({x + 8.f, tpsRowY});
-        panel->addChild(tpsLabel);
+        m_fields->tpsLabel = CCLabelBMFont::create("240", "bigFont.fnt");
+        m_fields->tpsLabel->setScale(.42f);
+        m_fields->tpsLabel->setPosition({x + 8.f, tpsRowY});
+        panel->addChild(m_fields->tpsLabel);
 
         auto setSpr = ButtonSprite::create("Set", "bigFont.fnt", "GJ_button_04.png", .6f);
         setSpr->setScale(.55f);
@@ -1920,18 +2217,40 @@ class $modify(BotPauseLayer, PauseLayer) {
         auto macrosBtn = CCMenuItemSpriteExtra::create(macrosSpr, this, menu_selector(BotPauseLayer::onOpenMacros));
         macrosBtn->setPosition({x, topY - 26.f * 5});
         panel->addChild(macrosBtn);
+    }
 
-        panel->setVisible(s.panelOpen);
+    // Обновление «выбранности» кнопок, числа TPS и видимости панели.
+    // Дёргать можно откуда угодно, в том числе из колбэка кнопки панели.
+    void refreshBotPanel() {
+        if (!m_fields || !m_fields->panel) return;
+
+        auto const& s = bot::state();
+
+        m_fields->panel->setVisible(s.panelOpen);
         m_fields->info->setVisible(s.panelOpen);
+
+        char const* names[3] = { "Record", "Off", "Play" };
+        bot::Mode const modes[3] = { bot::Mode::Record, bot::Mode::Off, bot::Mode::Play };
+
+        for (int i = 0; i < 3; ++i) {
+            auto btn = m_fields->modeBtns[i];
+            if (!btn) continue;
+            // setSprite — Geode-добавление, сам разбирается с размером/позицией.
+            btn->setSprite(this->makeModeSprite(names[i], s.mode == modes[i]));
+        }
+
+        if (m_fields->tpsLabel) {
+            m_fields->tpsLabel->setString(fmt::format("{}", s.tps).c_str());
+        }
 
         this->refreshInfo();
     }
 
-    // Только текст статуса — без пересборки кнопок.
+    // Только текст статуса.
     void refreshInfo() {
         if (!m_fields || !m_fields->info) return;
 
-        auto& s = bot::state();
+        auto const& s = bot::state();
 
         m_fields->info->setString(
             fmt::format(
@@ -1945,26 +2264,19 @@ class $modify(BotPauseLayer, PauseLayer) {
         );
     }
 
-    // Пересборка панели ИЗ колбэка её же кнопки: удерживаем sender,
-    // пока выполняется его activate().
-    void rebuildKeeping(CCObject* sender) {
-        Ref<CCObject> keep(sender);
-        this->rebuildBotMenu();
-    }
-
-    void onBotToggle(CCObject* sender) {
+    void onBotToggle(CCObject*) {
         bot::state().panelOpen = !bot::state().panelOpen;
-        this->rebuildKeeping(sender);
+        this->refreshBotPanel();
     }
 
-    void onTpsDec(CCObject* sender) {
+    void onTpsDec(CCObject*) {
         bot::cycleTps(-1);
-        this->rebuildKeeping(sender);
+        this->refreshBotPanel();
     }
 
-    void onTpsInc(CCObject* sender) {
+    void onTpsInc(CCObject*) {
         bot::cycleTps(+1);
-        this->rebuildKeeping(sender);
+        this->refreshBotPanel();
     }
 
     // РУЧНОЙ ВВОД TPS: любое целое 1..100000.
@@ -1976,24 +2288,20 @@ class $modify(BotPauseLayer, PauseLayer) {
             "Custom TPS",
             "1 - 100000",
             fmt::format("{}", bot::state().tps),
-            true,   // digitsOnly: поле принимает только цифры, до 6 символов
+            true,   // digitsOnly: только цифры, до 6 символов
             [self](std::string value) {
                 auto v = bot::parseTps(value);
                 if (!v) {
-                    FLAlertLayer::create(
-                        "GD Bot",
-                        "Enter a number from 1 to 100000.",
-                        "OK"
-                    )->show();
+                    bot::alert("Enter a number from 1 to 100000.");
                     return;
                 }
 
                 bot::setTps(*v);
                 bot::resetMeasure();
 
-                // Пересобираем панель только если слой ещё живой и в сцене.
+                // Обновляем панель только если слой ещё живой и в сцене.
                 if (self && self->getParent()) {
-                    self->rebuildBotMenu();
+                    self->refreshBotPanel();
                 }
             },
             { 60, 120, 240, 480, 1000, 2000, 4000, 10000 }
@@ -2017,25 +2325,39 @@ class $modify(BotPauseLayer, PauseLayer) {
         popup->show();
     }
 
+    // [C3] Весь наш код — ДО вызова оригинала: PauseLayer::onResume
+    // снимает слой с дерева и чистит его, после этого трогать this нельзя.
     void onResume(CCObject* sender) {
-        PauseLayer::onResume(sender);
-
         auto& s = bot::state();
+
         bot::resetMeasure();
 
         if (s.mode == bot::Mode::Play) {
             s.syncHeld = true;
+            bot::recomputePlayMask();
         }
+
+        // [F7] Пауза не должна «съедать» окно возрождения.
+        if (s.mode == bot::Mode::Record && s.isFrozen) {
+            s.freezeEndTime = std::chrono::steady_clock::now()
+                            + std::chrono::milliseconds(bot::RESPAWN_FREEZE_MS);
+        }
+
+        PauseLayer::onResume(sender);
     }
 
     void onBotMode(CCObject* sender) {
         auto& s = bot::state();
-        auto* pl = PlayLayer::get();
 
-        if (!pl) return;
         if (!sender) return;
 
-        auto mode = static_cast<bot::Mode>(static_cast<CCNode*>(sender)->getTag());
+        auto* pl = PlayLayer::get();
+        if (!pl) return;
+
+        auto const mode = static_cast<bot::Mode>(static_cast<CCNode*>(sender)->getTag());
+        if (mode != bot::Mode::Off && mode != bot::Mode::Record && mode != bot::Mode::Play) {
+            return;
+        }
         if (mode == s.mode) return;
 
         // Сохраняем предыдущую запись, если она шла.
@@ -2045,11 +2367,7 @@ class $modify(BotPauseLayer, PauseLayer) {
         }
 
         if (mode == bot::Mode::Play && s.macro.empty()) {
-            FLAlertLayer::create(
-                "GD Bot",
-                "Macro is empty.\nRecord one first.",
-                "OK"
-            )->show();
+            bot::alert("Macro is empty.\nRecord one first.");
             return;
         }
 
@@ -2059,25 +2377,28 @@ class $modify(BotPauseLayer, PauseLayer) {
         if (mode == bot::Mode::Record) {
             s.macro.clear();
             s.macro.reserve(std::max<size_t>(1u << 14, static_cast<size_t>(s.tps) * 60u));
+            bot::recomputePlayMask();
         }
 
-        // 1) СНАЧАЛА пересборка панели (sender ещё жив, мы внутри его activate()).
-        this->rebuildKeeping(sender);
+        // 1) Панель обновляем, пока sender жив и мы внутри его activate().
+        //    Ничего не удаляем — только спрайты и текст. [C1]
+        this->refreshBotPanel();
 
         if (mode == bot::Mode::Off) {
             return;   // паузу не закрываем — игрок сам нажмёт Resume
         }
 
-        // 2) Рестарт уровня.
-        pl->resetLevelFromStart();
-
-        // 3) Выход из паузы — ПОСЛЕДНИМ и ОТЛОЖЕННО: PauseLayer уничтожается,
-        //    а мы всё ещё находимся внутри activate() его кнопки.
-        //    Именно здесь был краш в прошлой версии (onResume(nullptr) в середине колбэка).
-        this->scheduleOnce([pl](float) {
-            if (PlayLayer::get() == pl) {
-                pl->togglePauseGame(false);
-            }
-        }, 0.f);
+        // 2) ПОСЛЕДНИМ: выход из паузы + рестарт одним вызовом. [B3]
+        //    Внутри resume PauseLayer уничтожается, поэтому после этой строки
+        //    не трогаем ни this, ни m_fields, ни sender — сразу выходим.
+        bot::restartFromMenu(pl);
     }
 };
+
+// =====================================================================
+//  Если вы выгружаете мод на ходу — раскомментируйте и остановите воркер:
+//
+//  void $on_unload(dynamic) {
+//      bot::stopSaveWorker();
+//  }
+// =====================================================================
