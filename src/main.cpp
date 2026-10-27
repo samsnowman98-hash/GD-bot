@@ -3,10 +3,17 @@
 // Модель работы:
 //  * Макрос = список событий {frame, button, down, player1}, где frame — номер физического шага (240 TPS).
 //  * Запись: хук GJBaseGameLayer::handleButton пишет все нажатия/отпускания с текущим номером шага.
-//  * Воспроизведение: перед каждым шагом (processCommands) инжектим события этого шага,
-//    а реальный ввод блокируем.
+//  * Воспроизведение: перед каждым шагом (processCommands) инжектим события этого шага.
+//    Реальный ввод блокируется, пока в макросе есть непроигранные события; после конца макроса
+//    управление возвращается игроку.
 //  * Практика: при загрузке чекпоинта счётчик шагов откатывается на шаг, на котором чекпоинт был создан,
 //    а запись обрезается до этого шага — дальше она перезаписывается.
+//  * Запись + чекпоинт: если кнопка была зажата в момент чекпоинта, то повторное нажатие сразу после
+//    возрождения (в окне 0.15 с) НЕ пишется как новый клик — зажатие в макросе просто продолжается.
+//    Если за окно кнопку не нажали — в конце окна пишется отпускание.
+//  * Запись: после каждого возрождения игра замирает на 0.15 с (реального времени, не зависит от
+//    скорости игры), чтобы успеть зажать кнопку.
+//  * Воспроизведение: после выхода из паузы зажатые ботом кнопки восстанавливаются.
 
 #include <Geode/Geode.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
@@ -15,6 +22,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -26,6 +34,8 @@ using namespace geode::prelude;
 namespace bot {
 
     enum class Mode { Off = 0, Record = 1, Play = 2 };
+
+    constexpr float RESPAWN_FREEZE = 0.15f; // секунд реального времени
 
     struct Input {
         uint32_t frame;
@@ -39,11 +49,18 @@ namespace bot {
         uint32_t frame = 0;                 // номер текущего физического шага
         std::vector<Input> macro;           // всегда отсортирован по frame
         size_t playIdx = 0;                 // следующее событие для воспроизведения
-        bool syncHeld = false;              // после перемотки нужно восстановить зажатые кнопки
+        bool syncHeld = false;              // нужно восстановить зажатые кнопки (после перемотки / паузы)
         bool injecting = false;             // сейчас вводим события сами
         bool loadedFromCheckpoint = false;  // resetLevel загрузил чекпоинт
         std::unordered_map<CheckpointObject*, uint32_t> cpFrames;
         std::string levelKey;
+
+        // кнопки, которые макрос считает зажатыми после загрузки чекпоинта
+        // (повторное нажатие в окне возрождения не пишется как новый клик)
+        bool grace[2][4] = {};
+        float freezeLeft = 0.f;             // сколько ещё осталось заморозки после возрождения
+
+        bool panelOpen = false;             // раскрыто ли меню бота в паузе
     };
 
     inline State& state() {
@@ -67,19 +84,29 @@ namespace bot {
         s.macro.erase(it, s.macro.end());
     }
 
-    // после обрезки: если макрос оставил какую-то кнопку зажатой, а игра после
-    // загрузки чекпоинта её отпустила — добавляем явное отпускание на шаге f
-    inline void releaseHeld(uint32_t f) {
-        auto& s = state();
-        bool held[2][4] = {};
-        for (auto const& e : s.macro) {
+    // какие кнопки макрос держит зажатыми к текущему концу записи
+    inline void heldAtEnd(bool (&held)[2][4]) {
+        std::memset(held, 0, sizeof(held));
+        for (auto const& e : state().macro) {
             if (e.button < 4) held[e.p1 ? 0 : 1][e.button] = e.down;
         }
+    }
+
+    inline void clearGrace() {
+        auto& s = state();
+        std::memset(s.grace, 0, sizeof(s.grace));
+        s.freezeLeft = 0.f;
+    }
+
+    // конец окна возрождения: кнопки, которые так и не нажали заново, отпускаем в макросе
+    inline void endGrace() {
+        auto& s = state();
         for (int p = 0; p < 2; ++p) {
             for (uint8_t b = 0; b < 4; ++b) {
-                if (held[p][b]) s.macro.push_back({f, b, false, p == 0});
+                if (s.grace[p][b]) s.macro.push_back({s.frame, b, false, p == 0});
             }
         }
+        clearGrace();
     }
 
     // перемотка счётчика шагов (и указателя воспроизведения) на шаг f
@@ -97,6 +124,7 @@ namespace bot {
     inline void resetToStart() {
         auto& s = state();
         seek(0);
+        std::memset(s.grace, 0, sizeof(s.grace));
         if (s.mode == Mode::Record) truncateFrom(0);
     }
 
@@ -204,7 +232,9 @@ namespace bot {
         s.playIdx = 0;
         s.syncHeld = false;
         s.injecting = false;
+        s.panelOpen = false;
         s.cpFrames.clear();
+        clearGrace();
 
         int id = level->m_levelID.value();
         if (id > 0) {
@@ -233,6 +263,23 @@ namespace bot {
 // =====================================================================
 
 class $modify(BotBaseLayer, GJBaseGameLayer) {
+    void update(float dt) {
+        auto& s = bot::state();
+
+        // заморозка после возрождения (только при записи), реальное время — не зависит от скорости игры
+        if (bot::isPlayLayer(this) && s.freezeLeft > 0.f) {
+            if (s.mode != bot::Mode::Record) {
+                bot::clearGrace();
+            } else {
+                s.freezeLeft -= dt;
+                if (s.freezeLeft <= 0.f) bot::endGrace();
+                return;
+            }
+        }
+
+        GJBaseGameLayer::update(dt);
+    }
+
     void processCommands(float dt, bool isHalfTick, bool isLastTick) {
         auto& s = bot::state();
         bool inPlay = bot::isPlayLayer(this);
@@ -247,9 +294,22 @@ class $modify(BotBaseLayer, GJBaseGameLayer) {
     void handleButton(bool down, int button, bool isPlayer1) {
         auto& s = bot::state();
         if (bot::isPlayLayer(this) && !s.injecting) {
-            // при воспроизведении реальный ввод игнорируем
-            if (s.mode == bot::Mode::Play) return;
+            // при воспроизведении реальный ввод блокируем, пока в макросе остались события;
+            // когда макрос закончился — управление у игрока
+            if (s.mode == bot::Mode::Play && s.playIdx < s.macro.size()) return;
+
             if (s.mode == bot::Mode::Record) {
+                int p = isPlayer1 ? 0 : 1;
+                if (button >= 0 && button < 4 && s.grace[p][button]) {
+                    s.grace[p][button] = false;
+                    if (down) {
+                        // повторное зажатие сразу после возрождения: в макросе кнопка уже зажата,
+                        // это продолжение того же зажатия — новый клик не пишем
+                        GJBaseGameLayer::handleButton(down, button, isPlayer1);
+                        return;
+                    }
+                    // отпускание — пишем как обычно (ниже)
+                }
                 s.macro.push_back({s.frame, static_cast<uint8_t>(button), down, isPlayer1});
             }
         }
@@ -274,6 +334,9 @@ class $modify(BotPlayLayer, PlayLayer) {
         PlayLayer::resetLevel();
         // если чекпоинт не загружался — это рестарт с начала
         if (!s.loadedFromCheckpoint) bot::resetToStart();
+
+        // при записи: короткая заморозка после возрождения, чтобы успеть зажать кнопку
+        if (s.mode == bot::Mode::Record) s.freezeLeft = bot::RESPAWN_FREEZE;
     }
 
     void resetLevelFromStart() {
@@ -304,7 +367,9 @@ class $modify(BotPlayLayer, PlayLayer) {
         bot::seek(f);
         if (s.mode == bot::Mode::Record) {
             bot::truncateFrom(f);   // всё после чекпоинта перезаписывается
-            bot::releaseHeld(f);
+            // кнопки, зажатые в макросе на момент чекпоинта: если игрок заново зажмёт их
+            // в окне возрождения — это продолжение зажатия, иначе в конце окна пишем отпускание
+            bot::heldAtEnd(s.grace);
         }
     }
 
@@ -316,17 +381,19 @@ class $modify(BotPlayLayer, PlayLayer) {
     void onQuit() {
         if (bot::state().mode == bot::Mode::Record) bot::save();
         bot::state().mode = bot::Mode::Off;
+        bot::clearGrace();
         PlayLayer::onQuit();
     }
 };
 
 // =====================================================================
-//  Меню паузы: Record / Off / Play
+//  Меню паузы: кнопка "Bot" слева -> раскрывает Record / Off / Play
 // =====================================================================
 
 class $modify(BotPauseLayer, PauseLayer) {
     struct Fields {
-        CCMenu* menu = nullptr;
+        CCMenu* menu = nullptr;     // кнопка-переключатель (всегда видна)
+        CCMenu* panel = nullptr;    // кнопки режимов (раскрываются)
         CCLabelBMFont* label = nullptr;
     };
 
@@ -335,17 +402,35 @@ class $modify(BotPauseLayer, PauseLayer) {
 
         auto win = CCDirector::get()->getWinSize();
 
-        m_fields->label = CCLabelBMFont::create("", "bigFont.fnt");
-        m_fields->label->setScale(.45f);
-        m_fields->label->setPosition({win.width / 2, 68.f});
-        this->addChild(m_fields->label);
+        // позиции подобраны под пустую область слева (справа от неё — ползунки, снизу — клавиши)
+        float const x = 95.f;
+        float const topY = win.height * 0.62f;
 
+        // кнопка-переключатель
         auto menu = CCMenu::create();
-        menu->setPosition({win.width / 2, 38.f});
-        menu->setContentSize({300.f, 40.f});
-        menu->setLayout(RowLayout::create()->setGap(10.f)->setAutoScale(false));
+        menu->setPosition({0.f, 0.f});
         this->addChild(menu);
         m_fields->menu = menu;
+
+        auto toggleSpr = ButtonSprite::create("Bot", "bigFont.fnt", "GJ_button_04.png", .7f);
+        toggleSpr->setScale(.7f);
+        auto toggle = CCMenuItemSpriteExtra::create(
+            toggleSpr, this, menu_selector(BotPauseLayer::onBotToggle)
+        );
+        toggle->setPosition({x, topY});
+        menu->addChild(toggle);
+
+        // раскрывающаяся панель
+        auto panel = CCMenu::create();
+        panel->setPosition({0.f, 0.f});
+        this->addChild(panel);
+        m_fields->panel = panel;
+
+        m_fields->label = CCLabelBMFont::create("", "bigFont.fnt");
+        m_fields->label->setScale(.32f);
+        m_fields->label->setAlignment(kCCTextAlignmentCenter);
+        m_fields->label->setPosition({x, topY - 26.f * 3 - 30.f});
+        this->addChild(m_fields->label);
 
         this->rebuildBotMenu();
     }
@@ -357,6 +442,7 @@ class $modify(BotPauseLayer, PauseLayer) {
             selected ? "GJ_button_01.png" : "GJ_button_04.png",
             .7f
         );
+        spr->setScale(.6f);
         auto btn = CCMenuItemSpriteExtra::create(
             spr, this, menu_selector(BotPauseLayer::onBotMode)
         );
@@ -366,15 +452,40 @@ class $modify(BotPauseLayer, PauseLayer) {
 
     void rebuildBotMenu() {
         auto& s = bot::state();
-        m_fields->menu->removeAllChildren();
-        m_fields->menu->addChild(this->makeBotButton("Record", bot::Mode::Record));
-        m_fields->menu->addChild(this->makeBotButton("Off", bot::Mode::Off));
-        m_fields->menu->addChild(this->makeBotButton("Play", bot::Mode::Play));
-        m_fields->menu->updateLayout();
+        auto win = CCDirector::get()->getWinSize();
+        float const x = 95.f;
+        float const topY = win.height * 0.62f;
+
+        auto panel = m_fields->panel;
+        panel->removeAllChildren();
+
+        char const* names[3] = { "Record", "Off", "Play" };
+        bot::Mode modes[3] = { bot::Mode::Record, bot::Mode::Off, bot::Mode::Play };
+        for (int i = 0; i < 3; ++i) {
+            auto btn = this->makeBotButton(names[i], modes[i]);
+            btn->setPosition({x, topY - 26.f * (i + 1)});
+            panel->addChild(btn);
+        }
 
         m_fields->label->setString(
-            fmt::format("GD Bot: {} | {} inputs", bot::modeName(s.mode), s.macro.size()).c_str()
+            fmt::format("GD Bot: {}\n{} inputs", bot::modeName(s.mode), s.macro.size()).c_str()
         );
+
+        panel->setVisible(s.panelOpen);
+        m_fields->label->setVisible(s.panelOpen);
+    }
+
+    void onBotToggle(CCObject*) {
+        auto& s = bot::state();
+        s.panelOpen = !s.panelOpen;
+        this->rebuildBotMenu();
+    }
+
+    void onResume(CCObject* sender) {
+        PauseLayer::onResume(sender);
+        // при выходе из паузы восстанавливаем кнопки, которые бот держал зажатыми
+        auto& s = bot::state();
+        if (s.mode == bot::Mode::Play) s.syncHeld = true;
     }
 
     void onBotMode(CCObject* sender) {
@@ -385,7 +496,10 @@ class $modify(BotPauseLayer, PauseLayer) {
         auto mode = static_cast<bot::Mode>(static_cast<CCNode*>(sender)->getTag());
         if (mode == s.mode) return;
 
-        if (s.mode == bot::Mode::Record) bot::save();
+        if (s.mode == bot::Mode::Record) {
+            bot::endGrace();
+            bot::save();
+        }
 
         if (mode == bot::Mode::Play && s.macro.empty()) {
             FLAlertLayer::create("GD Bot", "Macro is empty. Record one first.", "OK")->show();
@@ -393,6 +507,7 @@ class $modify(BotPauseLayer, PauseLayer) {
         }
 
         s.mode = mode;
+        bot::clearGrace();
 
         if (mode == bot::Mode::Off) {
             this->rebuildBotMenu();
