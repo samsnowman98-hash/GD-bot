@@ -117,7 +117,9 @@
 #include <atomic>
 #include <cctype>
 #include <chrono>
+#include <climits>          // INT_MAX
 #include <condition_variable>
+#include <cstddef>          // size_t, std::byte
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -333,13 +335,6 @@ namespace bot {
         );
     }
 
-    inline void truncateFrom(uint32_t step) {
-        auto& s = state();
-        s.macro.erase(s.macro.begin() + static_cast<std::ptrdiff_t>(lowerBoundIdx(step)), s.macro.end());
-        if (s.playIdx > s.macro.size()) s.playIdx = s.macro.size();
-        recomputePlayMask();
-    }
-
     /// Маска удержаний после применения событий [0, idx). [F1]
     inline uint8_t foldMaskBefore(size_t idx) {
         auto const& m = state().macro;
@@ -357,6 +352,13 @@ namespace bot {
         auto& s = state();
         if (s.playIdx > s.macro.size()) s.playIdx = s.macro.size();
         s.playMask = foldMaskBefore(s.playIdx);
+    }
+
+    inline void truncateFrom(uint32_t step) {
+        auto& s = state();
+        s.macro.erase(s.macro.begin() + static_cast<std::ptrdiff_t>(lowerBoundIdx(step)), s.macro.end());
+        if (s.playIdx > s.macro.size()) s.playIdx = s.macro.size();
+        recomputePlayMask();
     }
 
     inline void clearGrace() {
@@ -1469,7 +1471,10 @@ public:
     std::function<void()> m_onClosed = nullptr;
 
 protected:
-    bool init() {
+    // override: совпадает по сигнатуре с виртуальным CCLayer::init().
+    // Никакой другой init() у geode::Popup не вызывается автоматически,
+    // а наш create() зовёт его явно — так что переопределение безопасно.
+    bool init() override {
         if (!geode::Popup::init(botui::kMacroW, botui::kMacroH, "GJ_square01.png")) {
             return false;
         }
@@ -2222,7 +2227,7 @@ class $modify(BotPauseLayer, PauseLayer) {
     // Обновление «выбранности» кнопок, числа TPS и видимости панели.
     // Дёргать можно откуда угодно, в том числе из колбэка кнопки панели.
     void refreshBotPanel() {
-        if (!m_fields || !m_fields->panel) return;
+        if (!m_fields->panel) return;
 
         auto const& s = bot::state();
 
@@ -2248,7 +2253,7 @@ class $modify(BotPauseLayer, PauseLayer) {
 
     // Только текст статуса.
     void refreshInfo() {
-        if (!m_fields || !m_fields->info) return;
+        if (!m_fields->info) return;
 
         auto const& s = bot::state();
 
