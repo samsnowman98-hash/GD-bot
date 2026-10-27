@@ -233,13 +233,13 @@ namespace bot {
 // =====================================================================
 
 class $modify(BotBaseLayer, GJBaseGameLayer) {
-    void processCommands(float dt) {
+    void processCommands(float dt, bool isHalfTick, bool isLastTick) {
         auto& s = bot::state();
         bool inPlay = bot::isPlayLayer(this);
 
         if (inPlay && s.mode == bot::Mode::Play) bot::inject(this);
 
-        GJBaseGameLayer::processCommands(dt);
+        GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
 
         if (inPlay) s.frame++;
     }
