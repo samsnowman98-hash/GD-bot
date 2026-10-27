@@ -1,56 +1,29 @@
 // GD Bot — macro recorder / replayer for Geometry Dash 2.2081 (Geode)
 //
 // Модель работы:
-//  * Макрос = список событий {frame, button, down, player1}, где frame — номер физического шага.
-//  * Запись: хук GJBaseGameLayer::handleButton пишет нажатия/отпускания с текущим номером шага.
-//    Дубли (нажатие уже зажатой кнопки / отпускание уже отпущенной) в макрос не попадают.
+//  * Макрос = список событий {frame, button, down, player1}, frame — номер физического шага.
+//  * Запись: хук handleButton пишет нажатия/отпускания с текущим номером шага.
 //  * Воспроизведение: перед каждым шагом (processCommands) инжектим события этого шага.
-//    Реальный ввод блокируется, пока в макросе есть непроигранные события; после конца — управление игроку.
-//  * Практика: при загрузке чекпоинта счётчик шагов откатывается на шаг чекпоинта,
-//    а запись обрезается до этого шага — дальше она перезаписывается.
+//  * Практика: при загрузке чекпоинта счётчик шагов откатывается, запись обрезается.
 //  * Запись: после каждого возрождения игра замирает на 0.15 с РЕАЛЬНОГО времени.
-//    Время заморозки не зависит от скорости игры и от TPS.
-//  * TPS: частота физических шагов задаётся ботом (не зависит от FPS рендера) через
-//    fixed-step аккумулятор поверх GJBaseGameLayer::update(). Поддерживается от 60 до 4000.
-//  * Оптимизация воспроизведения/записи: события одного кадра схлопываются в итоговую маску
-//    зажатых кнопок, в игру отправляются только реально изменившиеся нажатия/отпускания.
-//    Это критично при высоком TPS и спам-кликах — без схлопывания игра бы захлёбывалась
-//    количеством вызовов handleButton.
-//  * Макросы хранятся слотами (именованными файлами) на уровень — можно сохранить несколько
-//    записей под разными именами и переключаться между ними через меню паузы.
-//  * Сохранение на диск асинхронное (в фоновом потоке) — большой макрос (миллионы событий
-//    при высоком TPS) не подвешивает игру в момент levelComplete()/onQuit().
+//  * Слоты макросов на уровень, асинхронное сохранение.
 //
-// ---------------------------------------------------------------------
-// ИСПРАВЛЕНИЯ / ДОПОЛНЕНИЯ В ЭТОЙ ВЕРСИИ:
+// ИСПРАВЛЕНИЯ В ЭТОЙ ВЕРСИИ (поверх предыдущих):
+//  A) КРАШ: удалён кэшируемый m_fields->tpsLabel (висячий указатель после
+//     removeAllChildren()). Лейбл TPS создаётся заново при каждой пересборке.
+//  B) КРАШ: пересборка меню из колбэка кнопки идёт через rebuildKeeping(sender)
+//     (retain/autorelease), чтобы не уничтожить кнопку во время её activate().
+//  C) Попапы модальные: глотают тачи (ccTouchBegan), имеют свой приоритет,
+//     меню/TextInput внутри — приоритетом выше слоя. Back-кнопка закрывает попап.
+//  D) Закрытие попапов через closeSelf() (retain/remove/autorelease) —
+//     колбэк не работает с уже освобождённым this.
+//  E) Колбэки попапов держат Ref на владельца (нет dangling this).
+//  F) Список макросов обновляется с задержкой после "Save as" (запись асинхронная,
+//     файл ещё мог не появиться на диске).
 //
-//  1) endGrace(): ресинк зажатых кнопок после заморозки проходит по ОБОИМ источникам —
-//     macroHeld (что держал макрос на момент чекпоинта) И fingerHeld (что физически
-//     зажато игроком прямо сейчас), разбирая все 4 комбинации. Раньше кнопки, которых
-//     не было в graceMask, полностью терялись — это "съедало" зажатия дэш-орбов.
-//
-//  2) resetLevelFromStart(): обёрнут в s.inResetLevel, как и resetLevel(), чтобы вложенный
-//     вызов resetLevel() изнутри оригинала не дублировал логику бота.
-//
-//  3) handleButton(): пока мы находимся ВНУТРИ служебного resetLevel()/resetLevelFromStart()/
-//     loadFromCheckpoint() (флаги inResetLevel / cpLoadDepth), входящие вызовы handleButton
-//     считаются служебными вызовами движка (игра может сама "отпустить" кнопку визуально
-//     при смерти/рестарте ещё до того, как бот выставит graceMask) и НЕ трогают s.finger
-//     и макрос. Благодаря этому, если игрок физически держит дэш-орб через смерть/чекпоинт,
-//     зажатие не прерывается — s.finger остаётся true, и endGrace() корректно продолжает
-//     удержание без разрыва на "отпустил-нажал".
-//
-//  4) Добавлен настраиваемый TPS (fixed-step аккумулятор), многослотовое сохранение/загрузка
-//     макросов и асинхронное сохранение.
-//
-//  5) Попапы (ввод текста и менеджер макросов) переписаны как самостоятельные модальные
-//     слои поверх cocos2d::CCLayerColor/CCMenu/ButtonSprite — без версионно-зависимых
-//     Geode UI обёрток (geode::Popup<...> с нужным API в этой версии SDK нет).
-//
-//  6) ИСПРАВЛЕНИЕ КОМПИЛЯЦИИ: в Geode v5 макрос CCARRAY_FOREACH удалён (static_assert
-//     на использование). Перебор детей CCArray в BotMacroPopup::rebuildList() переписан
-//     через CCArrayExt (range-based for), как того требует актуальный SDK.
-// ---------------------------------------------------------------------
+// ИЗВЕСТНОЕ ОГРАНИЧЕНИЕ: «TPS» здесь — только fixed-step аккумулятор поверх
+// GJBaseGameLayer::update(). Движок сам режет dt на свои шаги, поэтому реальная
+// частота физики этим не меняется. Для настоящего TPS нужна правка шага внутри игры.
 
 #include <Geode/Geode.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
@@ -78,10 +51,9 @@ namespace bot {
 
     enum class Mode { Off = 0, Record = 1, Play = 2 };
 
-    constexpr int RESPAWN_FREEZE_MS = 150; // 0.15 секунды реального времени
+    constexpr int RESPAWN_FREEZE_MS = 150;
     constexpr uint32_t MAX_MACRO_INPUTS = 10'000'000;
 
-    // Пресеты TPS для кнопок +/- в меню.
     inline constexpr uint32_t kTpsPresets[] = {
         60, 120, 240, 480, 960, 1000, 1440, 2000, 3000, 4000
     };
@@ -91,7 +63,7 @@ namespace bot {
         uint8_t button;
         bool down;
         bool p1;
-        uint8_t held;   // маска зажатых кнопок ПОСЛЕ этого события (не сохраняется в файл)
+        uint8_t held;
     };
 
     struct State {
@@ -99,38 +71,39 @@ namespace bot {
         static constexpr uint32_t kMaxTps = 4000;
 
         Mode mode = Mode::Off;
-        uint32_t frame = 0;                 // номер текущего физического шага
-        std::vector<Input> macro;           // всегда отсортирован по frame
-        size_t playIdx = 0;                 // следующее событие для воспроизведения
+        uint32_t frame = 0;
+        std::vector<Input> macro;
+        size_t playIdx = 0;
 
-        bool syncHeld = false;              // нужно восстановить зажатые кнопки (после перемотки / паузы)
-        bool injecting = false;             // сейчас вводим события сами
+        bool syncHeld = false;
+        bool injecting = false;
 
-        bool loadedFromCheckpoint = false;  // legacy flag, оставлен для совместимости логики
+        bool loadedFromCheckpoint = false;
         std::unordered_map<CheckpointObject*, uint32_t> cpFrames;
         std::string levelKey;
 
-        // Текущий "слот" (имя файла) макроса для этого уровня.
         std::string macroName = "default";
 
-        uint8_t graceMask = 0;              // кнопки, зажатые в макросе на момент чекпоинта
-        uint8_t finger = 0;                 // какие кнопки сейчас реально зажаты игроком
-        uint8_t gameHeld = 0;               // какие кнопки сейчас зажаты в самой игре по состоянию бота
+        uint8_t graceMask = 0;
+        uint8_t finger = 0;
+        uint8_t gameHeld = 0;
 
-        // Реальное время заморозки после возрождения
         bool isFrozen = false;
         std::chrono::steady_clock::time_point freezeEndTime{};
 
-        // Защита от реентерабельности при сбросе/загрузке чекпоинта
         bool inResetLevel = false;
         int cpLoadDepth = 0;
         bool cpLoadedInReset = false;
 
-        bool panelOpen = false;             // раскрыто ли меню бота в паузе
+        bool panelOpen = false;
 
-        // --- TPS ---
-        uint32_t tps = 240;                 // целевая частота физических шагов (шагов/сек)
-        double tpsAccumulator = 0.0;        // накопитель fixed-step по игровому dt
+        uint32_t tps = 240;
+        double tpsAccumulator = 0.0;        // остаток времени getModifiedDelta (в игровых секундах)
+
+        // Замер РЕАЛЬНОГО TPS (сколько раз в секунду вызывается processCommands).
+        uint32_t measureCount = 0;
+        std::chrono::steady_clock::time_point measureStart{};
+        uint32_t measuredTps = 0;
     };
 
     inline State& state() {
@@ -142,7 +115,6 @@ namespace bot {
         return gl != nullptr && static_cast<GJBaseGameLayer*>(PlayLayer::get()) == gl;
     }
 
-    // бит кнопки в маске: P1 -> биты 0..3, P2 -> биты 4..7
     inline uint8_t bitOf(bool p1, int button) {
         if (button < 0 || button > 3) return 0;
         return static_cast<uint8_t>(1u << ((p1 ? 0 : 4) + button));
@@ -155,6 +127,26 @@ namespace bot {
         v = std::clamp(v, State::kMinTps, State::kMaxTps);
         s.tps = v;
         s.tpsAccumulator = 0.0;
+    }
+
+    inline void resetMeasure() {
+        auto& s = state();
+        s.measureCount = 0;
+        s.measureStart = std::chrono::steady_clock::now();
+    }
+
+    inline void countStep() {
+        auto& s = state();
+        ++s.measureCount;
+
+        auto now = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration<double>(now - s.measureStart).count();
+
+        if (elapsed >= 1.0) {
+            s.measuredTps = static_cast<uint32_t>(s.measureCount / elapsed + 0.5);
+            s.measureCount = 0;
+            s.measureStart = now;
+        }
     }
 
     inline void cycleTps(int dir) {
@@ -181,7 +173,6 @@ namespace bot {
         return m.empty() ? 0 : m.back().held;
     }
 
-    // добавить событие; возвращает false, если оно ничего не меняет (дубль)
     inline bool push(uint32_t f, uint8_t button, bool down, bool p1) {
         auto& s = state();
 
@@ -199,17 +190,12 @@ namespace bot {
         return true;
     }
 
-    // удалить все события с frame >= f
     inline void truncateFrom(uint32_t f) {
         auto& s = state();
 
         auto it = std::lower_bound(
-            s.macro.begin(),
-            s.macro.end(),
-            f,
-            [](Input const& i, uint32_t v) {
-                return i.frame < v;
-            }
+            s.macro.begin(), s.macro.end(), f,
+            [](Input const& i, uint32_t v) { return i.frame < v; }
         );
 
         s.macro.erase(it, s.macro.end());
@@ -221,7 +207,6 @@ namespace bot {
         s.isFrozen = false;
     }
 
-    // Применяет маску зажатых кнопок, отправляя события ТОЛЬКО для изменившихся битов.
     inline void applyHeldMask(GJBaseGameLayer* gl, uint8_t target) {
         auto& s = state();
 
@@ -237,12 +222,9 @@ namespace bot {
             for (int b = 0; b < 4; ++b) {
                 uint8_t bit = bitOf(p1, b);
 
-                // Было зажато, должно быть отпущено
                 if ((cur & ~target) & bit) {
                     gl->handleButton(false, b, p1);
                 }
-
-                // Не было зажато, должно быть зажато
                 if ((target & ~cur) & bit) {
                     gl->handleButton(true, b, p1);
                 }
@@ -253,26 +235,8 @@ namespace bot {
         s.injecting = wasInjecting;
     }
 
-    // ---------------------------------------------------------------
-    // Конец окна возрождения.
-    //
-    // gl == nullptr — просто закрыть окно без вмешательства в игру
-    // (например, при levelComplete()/onQuit()).
-    //
-    // Разбираются ОБА источника:
-    //   mask       — что держал МАКРОС на момент чекпоинта/рестарта;
-    //   s.finger   — что ФИЗИЧЕСКИ зажато игроком прямо сейчас (с учётом того,
-    //                что служебные вызовы движка во время сброса/загрузки
-    //                чекпоинта НЕ трогают s.finger — см. handleButton()).
-    //
-    //   macroHeld=1, fingerHeld=1 -> держим дальше, в макрос новое событие
-    //                                не пишем — это продолжение удержания.
-    //   macroHeld=1, fingerHeld=0 -> палец отпущен за время заморозки:
-    //                                отпускаем в игре и пишем "up" в макрос.
-    //   macroHeld=0, fingerHeld=1 -> кнопка зажата заново:
-    //                                зажимаем в игре и пишем "down" в макрос.
-    //   macroHeld=0, fingerHeld=0 -> ничего не делаем.
-    // ---------------------------------------------------------------
+    // Конец окна возрождения (gl == nullptr — просто закрыть окно).
+    // Разбираются оба источника: macroHeld (graceMask) и fingerHeld (s.finger).
     inline void endGrace(GJBaseGameLayer* gl) {
         auto& s = state();
 
@@ -320,31 +284,22 @@ namespace bot {
         }
     }
 
-    // Перемотка счётчика шагов и указателя воспроизведения на шаг f.
     inline void seek(uint32_t f) {
         auto& s = state();
 
         s.frame = f;
         s.playIdx = static_cast<size_t>(
             std::lower_bound(
-                s.macro.begin(),
-                s.macro.end(),
-                f,
-                [](Input const& i, uint32_t v) {
-                    return i.frame < v;
-                }
+                s.macro.begin(), s.macro.end(), f,
+                [](Input const& i, uint32_t v) { return i.frame < v; }
             ) - s.macro.begin()
         );
 
         s.syncHeld = true;
         s.gameHeld = 0;
-
-        // Сбрасываем накопитель TPS, чтобы реальное время, потраченное на
-        // перемотку/загрузку, не вылилось в лавину "догоняющих" шагов.
         s.tpsAccumulator = 0.0;
     }
 
-    // Сброс уровня на самое начало.
     inline void resetToStart() {
         auto& s = state();
 
@@ -358,7 +313,6 @@ namespace bot {
         }
     }
 
-    // Инжекция событий текущего шага (схлопнуты в маску — см. шапку файла).
     inline void inject(GJBaseGameLayer* gl) {
         auto& s = state();
 
@@ -387,7 +341,7 @@ namespace bot {
         applyHeldMask(gl, target);
     }
 
-    // ---------- сохранение / загрузка (многослотовое) ----------
+    // ---------- сохранение / загрузка ----------
 
     inline std::filesystem::path macrosRootDir() {
         return Mod::get()->getSaveDir() / "macros";
@@ -406,17 +360,19 @@ namespace bot {
         return m;
     }
 
-    inline std::vector<char> serializeMacro(std::vector<Input> const& macro) {
-        uint32_t version = 1;
+    inline std::vector<char> serializeMacro(std::vector<Input> const& macro, uint32_t tpsForSave) {
+        uint32_t version = 2;
         uint32_t count = static_cast<uint32_t>(macro.size());
+        uint32_t tps = tpsForSave;
 
-        std::vector<char> buf(12 + static_cast<size_t>(count) * 6);
+        std::vector<char> buf(16 + static_cast<size_t>(count) * 6);
 
         std::memcpy(buf.data(), "GDBM", 4);
         std::memcpy(buf.data() + 4, &version, 4);
         std::memcpy(buf.data() + 8, &count, 4);
+        std::memcpy(buf.data() + 12, &tps, 4);
 
-        char* p = buf.data() + 12;
+        char* p = buf.data() + 16;
 
         for (auto const& e : macro) {
             uint8_t flags = static_cast<uint8_t>((e.down ? 1 : 0) | (e.p1 ? 2 : 0));
@@ -455,9 +411,8 @@ namespace bot {
         return true;
     }
 
-    // Синхронная запись слота (используется из фонового потока и для миграции).
-    inline void saveSlotSync(std::filesystem::path const& path, std::vector<Input> const& macroCopy) {
-        auto buf = serializeMacro(macroCopy);
+    inline void saveSlotSync(std::filesystem::path const& path, std::vector<Input> const& macroCopy, uint32_t tps) {
+        auto buf = serializeMacro(macroCopy, tps);
 
         std::lock_guard<std::mutex> lock(saveMutex());
         if (writeMacroFile(path, buf)) {
@@ -465,19 +420,16 @@ namespace bot {
         }
     }
 
-    // Асинхронное сохранение текущего макроса (s.macroName) для текущего уровня.
-    // Копируем вектор СРАЗУ в основном потоке и уводим сериализацию+запись в фоновый
-    // поток, чтобы большой макрос (миллионы событий при высоком TPS) не подвешивал
-    // игру в момент levelComplete()/onQuit()/переключения режима.
     inline void save() {
         auto& s = state();
         if (s.levelKey.empty() || s.macroName.empty()) return;
 
         auto path = macroPath(s.macroName);
         auto macroCopy = s.macro;
+        uint32_t tps = s.tps;
 
-        std::thread([path, macroCopy = std::move(macroCopy)]() mutable {
-            saveSlotSync(path, macroCopy);
+        std::thread([path, tps, macroCopy = std::move(macroCopy)]() mutable {
+            saveSlotSync(path, macroCopy, tps);
         }).detach();
     }
 
@@ -503,7 +455,7 @@ namespace bot {
         auto size = std::filesystem::file_size(path, ec);
         if (ec || size < 12) return;
 
-        if (size > 12 + static_cast<uint64_t>(MAX_MACRO_INPUTS) * 6) {
+        if (size > 16 + static_cast<uint64_t>(MAX_MACRO_INPUTS) * 6) {
             log::warn("GDBot: macro file too large, ignoring");
             return;
         }
@@ -522,12 +474,26 @@ namespace bot {
         std::memcpy(&version, buf.data() + 4, 4);
         std::memcpy(&count, buf.data() + 8, 4);
 
-        if (std::memcmp(buf.data(), "GDBM", 4) != 0 || version != 1) return;
-        if (static_cast<uint64_t>(count) * 6 + 12 != size) return;
+        if (std::memcmp(buf.data(), "GDBM", 4) != 0 || (version != 1 && version != 2)) return;
+
+        // v1: заголовок 12 байт, TPS не хранится (макрос писался при 240).
+        // v2: заголовок 16 байт, в конце заголовка — TPS записи.
+        size_t headerSize = (version == 2) ? 16 : 12;
+        if (size < headerSize) return;
+        if (static_cast<uint64_t>(count) * 6 + headerSize != size) return;
+
+        uint32_t fileTps = 240;
+        if (version == 2) {
+            std::memcpy(&fileTps, buf.data() + 12, 4);
+        }
+
+        // Макрос привязан к номерам физических шагов, поэтому воспроизводить
+        // его нужно на том же TPS, на котором он записан.
+        setTps(fileTps);
 
         s.macro.reserve(static_cast<size_t>(count) + 1024);
 
-        char const* p = buf.data() + 12;
+        char const* p = buf.data() + headerSize;
 
         uint32_t lastFrame = 0;
         size_t loadedCount = 0;
@@ -544,9 +510,7 @@ namespace bot {
             lastFrame = frame;
 
             uint8_t button = static_cast<uint8_t>(p[4]);
-            if (button > 3) {
-                continue;
-            }
+            if (button > 3) continue;
 
             uint8_t flags = static_cast<uint8_t>(p[5]);
             bool down = (flags & 1) != 0;
@@ -618,7 +582,6 @@ namespace bot {
         return std::filesystem::remove(macroPath(name), ec);
     }
 
-    // Миграция из старого плоского формата (<levelKey>.gdbm) в новый слот "default".
     inline void migrateLegacyMacro() {
         auto& s = state();
 
@@ -661,8 +624,6 @@ namespace bot {
         s.freezeEndTime = {};
 
         s.tpsAccumulator = 0.0;
-        // s.tps сознательно НЕ сбрасываем — настройка TPS сохраняется между уровнями
-        // в рамках сессии игры.
 
         s.cpFrames.clear();
         clearGrace();
@@ -706,13 +667,10 @@ class $modify(BotBaseLayer, GJBaseGameLayer) {
         auto& s = bot::state();
 
         if (!bot::isPlayLayer(this)) {
-            // Не игровой слой (например, редактор) — TPS-степпинг бота не нужен.
             GJBaseGameLayer::update(dt);
             return;
         }
 
-        // Заморозка после возрождения: ровно 0.15 с РЕАЛЬНОГО времени,
-        // независимо от TPS и скорости игры.
         if (s.isFrozen) {
             if (s.mode != bot::Mode::Record) {
                 s.isFrozen = false;
@@ -720,56 +678,47 @@ class $modify(BotBaseLayer, GJBaseGameLayer) {
             } else {
                 if (std::chrono::steady_clock::now() >= s.freezeEndTime) {
                     bot::endGrace(this);
-                    // проваливаемся ниже — в этом же вызове можно начать считать физику
                 } else {
-                    return; // не даём игре тикать, пока идёт заморозка
+                    return;
                 }
             }
         }
 
-        // -------------------------------------------------------------
-        // Fixed-step аккумулятор: частота физических шагов (TPS) задаётся
-        // ботом (s.tps) и НЕ зависит от FPS рендера. За один визуальный
-        // кадр мы можем прогнать 0, 1 или несколько физических шагов —
-        // это и позволяет писать/воспроизводить макросы на 1000/2000+
-        // шагов в секунду, даже если экран рендерится на 60/144 Гц.
-        //
-        // maxSteps защищает от "spiral of death": если устройство не
-        // успевает считать физику с заданным TPS, лишнее накопленное
-        // время сбрасывается вместо попытки "нагнать" его разом большим
-        // количеством шагов за один кадр (что само по себе вызвало бы
-        // ещё более сильный лаг/зависание).
-        // -------------------------------------------------------------
-        double stepDt = 1.0 / static_cast<double>(std::max<uint32_t>(s.tps, bot::State::kMinTps));
+        // Реальная частота физики задаётся хуком getModifiedDelta (ниже).
+        GJBaseGameLayer::update(dt);
+    }
 
-        s.tpsAccumulator += static_cast<double>(dt);
+    // Подменяет квантование времени движка (1/240 с) на 1/tps. Остаток времени
+    // копится в s.tpsAccumulator, поэтому физика не зависит от FPS рендера.
+    // Вне PlayLayer (редактор) поведение оригинальное.
+    float getModifiedDelta(float dt) {
+        auto& s = bot::state();
 
-        uint32_t maxSteps = std::max<uint32_t>(8u, s.tps / 4u); // не более ~0.25с "долга" за кадр
-        uint32_t steps = 0;
-
-        while (s.tpsAccumulator >= stepDt && steps < maxSteps) {
-            GJBaseGameLayer::update(static_cast<float>(stepDt));
-            s.tpsAccumulator -= stepDt;
-            ++steps;
-
-            // Чекпоинт/смерть могли включить заморозку посреди "догоняющего"
-            // цикла — прерываемся, остаток докрутим в следующих кадрах.
-            if (s.isFrozen) {
-                s.tpsAccumulator = 0.0;
-                break;
-            }
+        if (!bot::isPlayLayer(this)) {
+            return GJBaseGameLayer::getModifiedDelta(dt);
         }
 
-        if (steps >= maxSteps) {
-            s.tpsAccumulator = 0.0;
-        }
+        double warp = std::max<double>(m_gameState.m_timeWarp, 0.01);
+        double spt = 1.0 / static_cast<double>(std::max<uint32_t>(s.tps, bot::State::kMinTps));
+
+        double total = static_cast<double>(dt) * warp + s.tpsAccumulator;
+
+        // Защита от "spiral of death" после долгого фриза/лага.
+        double maxTotal = spt * std::max<uint32_t>(8u, s.tps / 4u);
+        if (total > maxTotal) total = maxTotal;
+
+        double steps = std::floor(total / spt + 1e-9);
+        double newDelta = steps * spt;
+
+        s.tpsAccumulator = total - newDelta;
+
+        return static_cast<float>(newDelta);
     }
 
     void processCommands(float dt, bool isHalfTick, bool isLastTick) {
         auto& s = bot::state();
         bool inPlay = bot::isPlayLayer(this);
 
-        // Быстрый путь: инжектим только если есть что восстанавливать или проигрывать.
         if (
             inPlay &&
             s.mode == bot::Mode::Play &&
@@ -785,6 +734,7 @@ class $modify(BotBaseLayer, GJBaseGameLayer) {
 
         if (inPlay) {
             s.frame++;
+            bot::countStep();
         }
     }
 
@@ -794,8 +744,6 @@ class $modify(BotBaseLayer, GJBaseGameLayer) {
         const bool gameButton = (button >= 0 && button <= 3);
 
         if (!s.injecting && bot::isPlayLayer(this)) {
-            // Во время воспроизведения блокируем только игровые кнопки 0..3.
-            // Системные кнопки, включая паузу, должны продолжать работать.
             if (
                 s.mode == bot::Mode::Play &&
                 gameButton &&
@@ -805,15 +753,8 @@ class $modify(BotBaseLayer, GJBaseGameLayer) {
             }
 
             if (s.mode == bot::Mode::Record && gameButton) {
-                // Пока мы внутри служебного сброса уровня (resetLevel/
-                // resetLevelFromStart) или загрузки чекпоинта, игра может
-                // САМА вызвать handleButton(false, ...), чтобы визуально
-                // снять удержание кнопки (например, отпустить дэш-орб) ещё
-                // до того, как мы выставим graceMask/заморозку. Это НЕ
-                // реальное отпускание пальца — физическая клавиша/тач всё
-                // ещё зажаты, и новое "нажатие" от ОС не придёт. Такие
-                // служебные вызовы не должны менять s.finger и не должны
-                // попадать в макрос.
+                // Служебные вызовы движка во время reset/загрузки чекпоинта
+                // не являются реальным вводом игрока.
                 bool isEngineReset = s.inResetLevel || (s.cpLoadDepth > 0);
 
                 if (!isEngineReset) {
@@ -976,13 +917,18 @@ class $modify(BotPlayLayer, PlayLayer) {
 };
 
 // =====================================================================
-//  Модальные окна бота — ввод текста/числа и менеджер макросов.
+//  Модальные окна бота
 //
-//  Реализованы на чистом cocos2d::CCLayerColor/CCMenu/ButtonSprite —
-//  БЕЗ использования geode::Popup<...> (в данной версии Geode SDK этого
-//  шаблона с ожидаемым API нет). Это самодостаточные полноэкранные
-//  затемнённые слои, добавляемые напрямую в текущую сцену через show().
+//  Приоритеты касаний (меньше число = выше приоритет):
+//    слой попапа  : base      — глотает всё, что не попало в кнопки
+//    меню/ввод    : base - 1  — получают тач раньше слоя
+//  Prompt открывается поверх Macro-попапа, поэтому у него base ниже.
 // =====================================================================
+
+namespace botui {
+    constexpr int kMacroPopupPrio  = -9000;
+    constexpr int kPromptPopupPrio = -9100;
+}
 
 class BotPromptPopup : public cocos2d::CCLayerColor {
 protected:
@@ -999,7 +945,13 @@ protected:
         this->setPosition({0.f, 0.f});
         this->setZOrder(10000);
 
-        m_callback = cb;
+        // Модальность: слой глотает все касания.
+        this->setTouchMode(kCCTouchesOneByOne);
+        this->setTouchPriority(botui::kPromptPopupPrio);
+        this->setTouchEnabled(true);
+        this->setKeypadEnabled(true);
+
+        m_callback = std::move(cb);
 
         float const panelW = 260.f;
         float const panelH = 140.f;
@@ -1019,8 +971,14 @@ protected:
         m_input->setPosition({panelW / 2.f, panelH / 2.f + 6.f});
         panel->addChild(m_input);
 
+        // Поле ввода должно получать тач раньше затемняющего слоя.
+        if (auto node = m_input->getInputNode()) {
+            node->setTouchPriority(botui::kPromptPopupPrio - 1);
+        }
+
         auto menu = CCMenu::create();
         menu->setPosition({0.f, 0.f});
+        menu->setHandlerPriority(botui::kPromptPopupPrio - 1);
         panel->addChild(menu);
 
         auto okSpr = ButtonSprite::create("OK", "bigFont.fnt", "GJ_button_01.png", .8f);
@@ -1036,15 +994,22 @@ protected:
         return true;
     }
 
+    // Безопасное закрытие из колбэка собственной кнопки.
+    void closeSelf() {
+        this->retain();
+        this->removeFromParentAndCleanup(true);
+        this->autorelease();
+    }
+
 public:
+    bool ccTouchBegan(CCTouch*, CCEvent*) override { return true; }
+    void keyBackClicked() override { this->closeSelf(); }
+
     void onOk(CCObject*) {
-        // getString() у TextInput возвращает "строковый" тип движка (не всегда
-        // буквально std::string на всех платформах сборки), поэтому приводим
-        // явно, чтобы не словить неоднозначность в тернарном операторе.
         std::string value = m_input ? std::string(m_input->getString()) : std::string();
         auto cb = m_callback;
 
-        this->removeFromParentAndCleanup(true);
+        this->closeSelf();
 
         if (cb) {
             cb(value);
@@ -1052,7 +1017,7 @@ public:
     }
 
     void onCancel(CCObject*) {
-        this->removeFromParentAndCleanup(true);
+        this->closeSelf();
     }
 
     static BotPromptPopup* create(
@@ -1062,7 +1027,7 @@ public:
     ) {
         auto ret = new BotPromptPopup();
 
-        if (ret->init(title, placeholder, cb)) {
+        if (ret->init(title, placeholder, std::move(cb))) {
             ret->autorelease();
             return ret;
         }
@@ -1095,6 +1060,11 @@ protected:
         this->setPosition({0.f, 0.f});
         this->setZOrder(10000);
 
+        this->setTouchMode(kCCTouchesOneByOne);
+        this->setTouchPriority(botui::kMacroPopupPrio);
+        this->setTouchEnabled(true);
+        this->setKeypadEnabled(true);
+
         float const panelW = 360.f;
         float const panelH = 260.f;
         float const px = (winSize.width - panelW) / 2.f;
@@ -1111,6 +1081,7 @@ protected:
 
         m_listMenu = CCMenu::create();
         m_listMenu->setPosition({0.f, 0.f});
+        m_listMenu->setHandlerPriority(botui::kMacroPopupPrio - 1);
         m_panel->addChild(m_listMenu);
 
         auto saveAsSpr = ButtonSprite::create("Save current as...", "bigFont.fnt", "GJ_button_04.png", .7f);
@@ -1127,19 +1098,28 @@ protected:
         bottomMenu->addChild(saveAsBtn);
         bottomMenu->addChild(closeBtn);
         bottomMenu->setPosition({0.f, 0.f});
+        bottomMenu->setHandlerPriority(botui::kMacroPopupPrio - 1);
         m_panel->addChild(bottomMenu);
 
         this->rebuildList();
         return true;
     }
 
+    void closeSelf() {
+        this->retain();
+        this->removeFromParentAndCleanup(true);
+        this->autorelease();
+    }
+
     void rebuildList() {
+        // Кнопки в списке: колбэк кнопки Del вызывает rebuildList(), поэтому
+        // удаляем детей, удерживая сам popup от освобождения.
+        this->retain();
+
         m_listMenu->removeAllChildren();
 
-        // Удаляем старые текстовые лейблы строк (они дети m_panel, не m_listMenu).
-        // ВАЖНО: в Geode v5 макрос CCARRAY_FOREACH удалён (static_assert при
-        // попытке использовать) — перебор элементов CCArray теперь делается
-        // через CCArrayExt (range-based for), как показано ниже.
+        // Старые лейблы строк (дети m_panel, не m_listMenu).
+        // В Geode v5 CCARRAY_FOREACH удалён — используем CCArrayExt.
         CCArray* children = m_panel->getChildren();
         if (children) {
             std::vector<CCNode*> toRemove;
@@ -1203,9 +1183,19 @@ protected:
             label->setPosition({cx, topY});
             m_panel->addChild(label);
         }
+
+        this->autorelease();
     }
 
 public:
+    bool ccTouchBegan(CCTouch*, CCEvent*) override { return true; }
+    void keyBackClicked() override { this->closeSelf(); }
+
+    // Вызывается через CCCallFunc после асинхронного сохранения.
+    void onRefresh() {
+        this->rebuildList();
+    }
+
     void onLoad(CCObject* sender) {
         int tag = static_cast<CCNode*>(sender)->getTag();
         if (tag < 0 || tag >= static_cast<int>(m_names.size())) return;
@@ -1215,11 +1205,12 @@ public:
         auto pl = PlayLayer::get();
         auto& s = bot::state();
 
+        // Закрываемся ДО сброса уровня: дальше код может перестроить сцену.
+        this->closeSelf();
+
         if (pl && (s.mode == bot::Mode::Play || s.mode == bot::Mode::Record)) {
             pl->resetLevelFromStart();
         }
-
-        this->removeFromParentAndCleanup(true);
     }
 
     void onDelete(CCObject* sender) {
@@ -1227,17 +1218,31 @@ public:
         if (tag < 0 || tag >= static_cast<int>(m_names.size())) return;
 
         bot::deleteSlot(m_names[static_cast<size_t>(tag)]);
+
+        // sender будет уничтожен внутри rebuildList(), пока выполняется его
+        // же activate() — удерживаем до конца колбэка.
+        sender->retain();
         this->rebuildList();
+        sender->autorelease();
     }
 
     void onSaveAs(CCObject*) {
+        Ref<BotMacroPopup> self(this);
+
         auto popup = BotPromptPopup::create(
             "Save macro as",
             "name",
-            [this](std::string name) {
+            [self](std::string name) {
                 if (name.empty()) return;
+
                 bot::saveAs(name);
-                this->rebuildList();
+
+                // Запись идёт в фоне — даём файлу появиться и обновляем список.
+                self->runAction(CCSequence::create(
+                    CCDelayTime::create(0.3f),
+                    CCCallFunc::create(self, callfunc_selector(BotMacroPopup::onRefresh)),
+                    nullptr
+                ));
             }
         );
 
@@ -1245,7 +1250,7 @@ public:
     }
 
     void onCloseClicked(CCObject*) {
-        this->removeFromParentAndCleanup(true);
+        this->closeSelf();
     }
 
     static BotMacroPopup* create() {
@@ -1269,16 +1274,16 @@ public:
 };
 
 // =====================================================================
-//  Меню паузы: кнопка "Bot" слева -> раскрывает Record / Off / Play,
-//  управление TPS и менеджер макросов.
+//  Меню паузы
 // =====================================================================
 
 class $modify(BotPauseLayer, PauseLayer) {
     struct Fields {
-        CCMenu* menu = nullptr;             // кнопка-переключатель (всегда видна)
-        CCMenu* panel = nullptr;            // кнопки режимов (раскрываются)
+        CCMenu* menu = nullptr;
+        CCMenu* panel = nullptr;
         CCLabelBMFont* label = nullptr;
-        CCLabelBMFont* tpsLabel = nullptr;
+        // tpsLabel намеренно отсутствует: это ребёнок panel, который
+        // удаляется в removeAllChildren(); сырой указатель висел бы.
     };
 
     void customSetup() {
@@ -1361,7 +1366,7 @@ class $modify(BotPauseLayer, PauseLayer) {
             panel->addChild(btn);
         }
 
-        // --- Строка TPS: [-] [ 1000 ] [+]  [Set...] ---
+        // --- Строка TPS: [-] [ 1000 ] [+]  [Set] ---
         float tpsRowY = topY - 26.f * 4;
 
         auto decSpr = ButtonSprite::create("-", "bigFont.fnt", "GJ_button_04.png", .7f);
@@ -1382,20 +1387,13 @@ class $modify(BotPauseLayer, PauseLayer) {
         setBtn->setPosition({x + 55.f, tpsRowY});
         panel->addChild(setBtn);
 
-        if (!m_fields->tpsLabel) {
-            m_fields->tpsLabel = CCLabelBMFont::create("", "bigFont.fnt");
-            m_fields->tpsLabel->setScale(.4f);
-        }
-        m_fields->tpsLabel->setString(fmt::format("{}", s.tps).c_str());
-        m_fields->tpsLabel->setPosition({x + 14.f, tpsRowY});
-        if (m_fields->tpsLabel->getParent() != panel) {
-            if (m_fields->tpsLabel->getParent()) {
-                m_fields->tpsLabel->removeFromParentAndCleanup(false);
-            }
-            panel->addChild(m_fields->tpsLabel);
-        }
+        // Лейбл создаётся заново при каждой пересборке — никаких висячих указателей.
+        auto tpsLabel = CCLabelBMFont::create(fmt::format("{}", s.tps).c_str(), "bigFont.fnt");
+        tpsLabel->setScale(.4f);
+        tpsLabel->setPosition({x + 14.f, tpsRowY});
+        panel->addChild(tpsLabel);
 
-        // --- Кнопка менеджера макросов ---
+        // --- Менеджер макросов ---
         auto macrosSpr = ButtonSprite::create("Macros...", "bigFont.fnt", "GJ_button_04.png", .7f);
         macrosSpr->setScale(.6f);
         auto macrosBtn = CCMenuItemSpriteExtra::create(macrosSpr, this, menu_selector(BotPauseLayer::onOpenMacros));
@@ -1405,10 +1403,12 @@ class $modify(BotPauseLayer, PauseLayer) {
         m_fields->label->setPosition({x, topY - 26.f * 6 - 20.f});
         m_fields->label->setString(
             fmt::format(
-                "GD Bot: {}\nSlot: {} ({} inputs)",
+                "GD Bot: {}\nSlot: {} ({} inputs)\nTPS: {} (measured: {})",
                 bot::modeName(s.mode),
                 s.macroName,
-                s.macro.size()
+                s.macro.size(),
+                s.tps,
+                s.measuredTps
             ).c_str()
         );
 
@@ -1416,30 +1416,40 @@ class $modify(BotPauseLayer, PauseLayer) {
         m_fields->label->setVisible(s.panelOpen);
     }
 
-    void onBotToggle(CCObject*) {
+    // Пересборка меню из колбэка кнопки: удерживаем sender, пока его
+    // activate() ещё выполняется, иначе removeAllChildren() его освободит.
+    void rebuildKeeping(CCObject* sender) {
+        if (sender) sender->retain();
+        this->rebuildBotMenu();
+        if (sender) sender->autorelease();
+    }
+
+    void onBotToggle(CCObject* sender) {
         auto& s = bot::state();
         s.panelOpen = !s.panelOpen;
-        this->rebuildBotMenu();
+        this->rebuildKeeping(sender);
     }
 
-    void onTpsDec(CCObject*) {
+    void onTpsDec(CCObject* sender) {
         bot::cycleTps(-1);
-        this->rebuildBotMenu();
+        this->rebuildKeeping(sender);
     }
 
-    void onTpsInc(CCObject*) {
+    void onTpsInc(CCObject* sender) {
         bot::cycleTps(+1);
-        this->rebuildBotMenu();
+        this->rebuildKeeping(sender);
     }
 
     void onTpsCustom(CCObject*) {
+        // Ref удерживает слой паузы, пока открыт попап.
+        Ref<CCObject> keep(this);
+
         auto popup = BotPromptPopup::create(
             "Custom TPS",
             fmt::format("{}", bot::state().tps),
-            [this](std::string value) {
+            [this, keep](std::string value) {
                 if (value.empty()) return;
 
-                // Оставляем только цифры на случай мусора во вводе.
                 std::string digits;
                 for (char c : value) {
                     if (std::isdigit(static_cast<unsigned char>(c))) digits += c;
@@ -1454,7 +1464,7 @@ class $modify(BotPauseLayer, PauseLayer) {
                 }
 
                 bot::setTps(v);
-                this->rebuildBotMenu();
+                this->rebuildBotMenu(); // вызов из попапа — sender не нужен
             }
         );
 
@@ -1470,6 +1480,7 @@ class $modify(BotPauseLayer, PauseLayer) {
         PauseLayer::onResume(sender);
 
         auto& s = bot::state();
+        bot::resetMeasure();
 
         if (s.mode == bot::Mode::Play) {
             s.syncHeld = true;
@@ -1508,15 +1519,12 @@ class $modify(BotPauseLayer, PauseLayer) {
         s.gameHeld = 0;
 
         if (mode == bot::Mode::Off) {
-            this->rebuildBotMenu();
+            this->rebuildKeeping(sender);
             return;
         }
 
         if (mode == bot::Mode::Record) {
             s.macro.clear();
-            // Резервируем ёмкость с запасом под ~60 секунд записи при текущем TPS,
-            // чтобы избежать реаллокаций вектора (и связанных с ними микро-лагов)
-            // в разгар записи на высоком TPS.
             s.macro.reserve(std::max<size_t>(1u << 14, static_cast<size_t>(s.tps) * 60));
         }
 
