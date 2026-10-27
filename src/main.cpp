@@ -3,7 +3,6 @@
 #include <Geode/modify/PlayLayer.hpp>
 #include <Geode/modify/PauseLayer.hpp>
 #include <fstream>
-#include <chrono>
 #include <algorithm>
 
 using namespace geode::prelude;
@@ -21,10 +20,6 @@ static BotMode g_mode = BotMode::Off;
 static std::vector<RawClick> g_macro;
 static size_t g_index = 0;
 static bool g_injecting = false;
-
-using Clock = std::chrono::steady_clock;
-static double g_levelTimeAtUpdateEnd = 0.0;
-static Clock::time_point g_clockAtUpdateEnd = Clock::now();
 
 static CCLabelBMFont* g_statusLabel = nullptr;
 
@@ -74,7 +69,6 @@ static void updateStatus() {
 static void setMode(BotMode newMode, PlayLayer* pl) {
     if (newMode == g_mode) return;
 
-    // Выход из записи: сохраняем
     if (g_mode == BotMode::Record) saveMacro(pl);
 
     g_mode = newMode;
@@ -89,51 +83,27 @@ static void setMode(BotMode newMode, PlayLayer* pl) {
 }
 
 class $modify(RawBotBase, GJBaseGameLayer) {
-    void update(float dt) {
-        GJBaseGameLayer::update(dt);
-        g_levelTimeAtUpdateEnd = m_gameState.m_levelTime;
-        g_clockAtUpdateEnd = Clock::now();
-    }
-
-    // Сырое время клика: время уровня + реальное время после последнего кадра
-    double rawTime() {
-        double elapsed = std::chrono::duration<double>(Clock::now() - g_clockAtUpdateEnd).count();
-        elapsed = std::clamp(elapsed, 0.0, 1.0 / 30.0);
-        return g_levelTimeAtUpdateEnd + elapsed;
-    }
-
-    void pushButton(int button, bool isPlayer1) {
+    void handleButton(bool down, int button, bool isPlayer1) {
         if (!g_injecting && PlayLayer::get()) {
-            if (g_mode == BotMode::Play) return;
+            if (g_mode == BotMode::Play) return; // блок ручного ввода при воспроизведении
             if (g_mode == BotMode::Record) {
-                g_macro.push_back({this->rawTime(), true, button, isPlayer1});
+                g_macro.push_back({m_gameState.m_levelTime, down, button, isPlayer1});
             }
         }
-        GJBaseGameLayer::pushButton(button, isPlayer1);
+        GJBaseGameLayer::handleButton(down, button, isPlayer1);
     }
 
-    void releaseButton(int button, bool isPlayer1) {
-        if (!g_injecting && PlayLayer::get()) {
-            if (g_mode == BotMode::Play) return;
-            if (g_mode == BotMode::Record) {
-                g_macro.push_back({this->rawTime(), false, button, isPlayer1});
-            }
-        }
-        GJBaseGameLayer::releaseButton(button, isPlayer1);
-    }
-
-    void processCommands(float dt) {
+    void processCommands(float dt, bool isHalfTick, bool isLastTick) {
         if (g_mode == BotMode::Play && PlayLayer::get()) {
             double t = m_gameState.m_levelTime;
             while (g_index < g_macro.size() && g_macro[g_index].time <= t + dt * 0.5) {
                 auto& c = g_macro[g_index++];
                 g_injecting = true;
-                if (c.down) GJBaseGameLayer::pushButton(c.button, c.player1);
-                else        GJBaseGameLayer::releaseButton(c.button, c.player1);
+                GJBaseGameLayer::handleButton(c.down, c.button, c.player1);
                 g_injecting = false;
             }
         }
-        GJBaseGameLayer::processCommands(dt);
+        GJBaseGameLayer::processCommands(dt, isHalfTick, isLastTick);
     }
 };
 
@@ -181,7 +151,7 @@ class $modify(RawBotPlay, PlayLayer) {
     }
 };
 
-// Три кнопки в меню паузы: Запись / Off / Воспроизведение
+// Три кнопки в меню паузы: Rec / Off / Play
 class $modify(RawBotPause, PauseLayer) {
     void customSetup() {
         PauseLayer::customSetup();
@@ -193,11 +163,12 @@ class $modify(RawBotPause, PauseLayer) {
 
         struct Entry { const char* text; BotMode mode; const char* sprite; };
         Entry entries[3] = {
-            {"Rec",  BotMode::Record, "GJ_button_06.png"}, // красноватая
-            {"Off",  BotMode::Off,    "GJ_button_04.png"}, // серая
-            {"Play", BotMode::Play,   "GJ_button_01.png"}  // зелёная
+            {"Rec",  BotMode::Record, "GJ_button_06.png"},
+            {"Off",  BotMode::Off,    "GJ_button_04.png"},
+            {"Play", BotMode::Play,   "GJ_button_01.png"}
         };
 
+        auto buttons = std::make_shared<std::vector<ButtonSprite*>>();
         float startX = win.width - 150.f;
         float y = 40.f;
 
@@ -205,18 +176,19 @@ class $modify(RawBotPause, PauseLayer) {
             auto mode = entries[i].mode;
             auto spr = ButtonSprite::create(entries[i].text, 60, true, "goldFont.fnt",
                                             entries[i].sprite, 35.f, 0.7f);
-            // Подсветка активного режима
             spr->setOpacity(g_mode == mode ? 255 : 130);
+            buttons->push_back(spr);
 
-            auto btn = CCMenuItemExt::createSpriteExtra(spr, [mode](CCObject*) {
+            auto btn = CCMenuItemExt::createSpriteExtra(spr, [mode, buttons](CCObject*) {
                 setMode(mode, PlayLayer::get());
+                // живая подсветка активного режима
+                static const BotMode order[3] = {BotMode::Record, BotMode::Off, BotMode::Play};
+                for (int k = 0; k < 3; k++) {
+                    (*buttons)[k]->setOpacity(g_mode == order[k] ? 255 : 130);
+                }
             });
-            btn->setTag(static_cast<int>(mode));
             btn->setPosition({startX + i * 70.f, y});
             menu->addChild(btn);
         }
-
-        // Обновление подсветки после нажатия
-        menu->schedule(schedule_selector(CCMenu::update), 0.1f);
     }
 };
