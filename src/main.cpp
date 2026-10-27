@@ -43,12 +43,13 @@
 //  4) Добавлен настраиваемый TPS (fixed-step аккумулятор), многослотовое сохранение/загрузка
 //     макросов и асинхронное сохранение.
 //
-//  5) ИСПРАВЛЕНИЕ КОМПИЛЯЦИИ: в используемой версии Geode SDK нет шаблона geode::Popup<...>
-//     с API (setTitle/m_mainLayer/initAnchored/onClose) — отсюда каскад ошибок компиляции.
-//     Оба попапа (ввод текста и менеджер макросов) переписаны как самостоятельные модальные
-//     слои поверх cocos2d::CCLayerColor/CCMenu/ButtonSprite — без каких-либо
-//     версионно-зависимых Geode UI обёрток. Также исправлена неоднозначность
-//     gd::string/std::string в тернарном операторе явным приведением к std::string.
+//  5) Попапы (ввод текста и менеджер макросов) переписаны как самостоятельные модальные
+//     слои поверх cocos2d::CCLayerColor/CCMenu/ButtonSprite — без версионно-зависимых
+//     Geode UI обёрток (geode::Popup<...> с нужным API в этой версии SDK нет).
+//
+//  6) ИСПРАВЛЕНИЕ КОМПИЛЯЦИИ: в Geode v5 макрос CCARRAY_FOREACH удалён (static_assert
+//     на использование). Перебор детей CCArray в BotMacroPopup::rebuildList() переписан
+//     через CCArrayExt (range-based for), как того требует актуальный SDK.
 // ---------------------------------------------------------------------
 
 #include <Geode/Geode.hpp>
@@ -979,10 +980,8 @@ class $modify(BotPlayLayer, PlayLayer) {
 //
 //  Реализованы на чистом cocos2d::CCLayerColor/CCMenu/ButtonSprite —
 //  БЕЗ использования geode::Popup<...> (в данной версии Geode SDK этого
-//  шаблона с ожидаемым API нет, из-за чего раньше была ошибка компиляции
-//  "unknown template name 'Popup'" и каскад связанных с ней ошибок).
-//  Это самодостаточные полноэкранные затемнённые слои, добавляемые
-//  напрямую в текущую сцену через show().
+//  шаблона с ожидаемым API нет). Это самодостаточные полноэкранные
+//  затемнённые слои, добавляемые напрямую в текущую сцену через show().
 // =====================================================================
 
 class BotPromptPopup : public cocos2d::CCLayerColor {
@@ -1138,16 +1137,19 @@ protected:
         m_listMenu->removeAllChildren();
 
         // Удаляем старые текстовые лейблы строк (они дети m_panel, не m_listMenu).
-        CCObject* obj;
+        // ВАЖНО: в Geode v5 макрос CCARRAY_FOREACH удалён (static_assert при
+        // попытке использовать) — перебор элементов CCArray теперь делается
+        // через CCArrayExt (range-based for), как показано ниже.
         CCArray* children = m_panel->getChildren();
         if (children) {
             std::vector<CCNode*> toRemove;
-            CCARRAY_FOREACH(children, obj) {
-                auto node = static_cast<CCNode*>(obj);
+
+            for (auto node : CCArrayExt<CCNode*>(children)) {
                 if (node->getTag() == 12345) {
                     toRemove.push_back(node);
                 }
             }
+
             for (auto* n : toRemove) {
                 n->removeFromParentAndCleanup(true);
             }
