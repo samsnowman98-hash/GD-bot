@@ -8,16 +8,11 @@
 //    Реальный ввод блокируется, пока в макросе есть непроигранные события; после конца — управление игроку.
 //  * Практика: при загрузке чекпоинта счётчик шагов откатывается на шаг чекпоинта,
 //    а запись обрезается до этого шага — дальше она перезаписывается.
-//  * Запись: после каждого возрождения игра замирает на 0.15 с реального времени.
-//    Во время заморозки ввод в игру НЕ проходит и в макрос не пишется — только запоминается,
-//    зажата ли кнопка. В конце заморозки:
-//       - кнопка была зажата в макросе на чекпоинте И ты её держишь -> зажатие продолжается
-//         без нового клика (в макросе ничего не добавляется);
-//       - кнопка была зажата в макросе, но ты её не держишь -> в макрос пишется отпускание;
-//       - любые другие нажатия во время заморозки игнорируются.
-//  * Оптимизация: у каждого события хранится маска зажатых кнопок после него, поэтому
-//    восстановление зажатий (пауза, чекпоинт) — O(1), а не проход по всему макросу;
-//    файл читается/пишется одним блоком.
+//  * Запись: после каждого возрождения игра замирает на 0.15 с РЕАЛЬНОГО времени (не зависит от скорости игры).
+//    Во время заморозки ввод в игру НЕ проходит и в макрос не пишется.
+//  * Оптимизация: у каждого события хранится маска зажатых кнопок после него.
+//    Восстановление зажатий (пауза, чекпоинт) работает за O(1) и применяет только изменённые биты,
+//    что исключает лаги от избыточных вызовов handleButton. Файл читается/пишется атомарно.
 
 #include <Geode/Geode.hpp>
 #include <Geode/modify/GJBaseGameLayer.hpp>
@@ -25,6 +20,7 @@
 #include <Geode/modify/PauseLayer.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -32,14 +28,13 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <cctype>
 
 using namespace geode::prelude;
 
 namespace bot {
 
     enum class Mode { Off = 0, Record = 1, Play = 2 };
-
-    constexpr float RESPAWN_FREEZE = 0.15f; // секунд реального времени
 
     struct Input {
         uint32_t frame;
@@ -62,8 +57,17 @@ namespace bot {
 
         uint8_t graceMask = 0;              // кнопки, зажатые в макросе на момент чекпоинта
         uint8_t finger = 0;                 // какие кнопки сейчас реально зажаты игроком
-        float freezeLeft = 0.f;             // сколько осталось заморозки после возрождения
+        
+        // Реальное время заморозки
+        bool isFrozen = false;
+        std::chrono::steady_clock::time_point freezeEndTime;
 
+        // Защита от реентерабельности при сбросе/загрузке чекпоинта
+        bool inResetLevel = false;
+        int cpLoadDepth = 0;
+        bool cpLoadedInReset = false;
+
+        uint8_t injectedHeld = 0;           // маска кнопок, которые бот реально зажал в игре
         bool panelOpen = false;             // раскрыто ли меню бота в паузе
     };
 
@@ -76,7 +80,6 @@ namespace bot {
         return gl != nullptr && static_cast<GJBaseGameLayer*>(PlayLayer::get()) == gl;
     }
 
-    // бит кнопки в маске: P1 -> биты 0..3, P2 -> биты 4..7 (0, если кнопка вне диапазона)
     inline uint8_t bitOf(bool p1, int button) {
         if (button < 0 || button > 3) return 0;
         return static_cast<uint8_t>(1u << ((p1 ? 0 : 4) + button));
@@ -89,21 +92,19 @@ namespace bot {
         return m.empty() ? 0 : m.back().held;
     }
 
-    // добавить событие; возвращает false, если оно ничего не меняет (дубль)
     inline bool push(uint32_t f, uint8_t button, bool down, bool p1) {
         auto& s = state();
         uint8_t cur = heldNow();
         uint8_t m = bitOf(p1, button);
         if (m) {
             bool isHeld = (cur & m) != 0;
-            if (isHeld == down) return false;
+            if (isHeld == down) return false; // Дубль, игнорируем
             cur = down ? (cur | m) : (cur & ~m);
         }
         s.macro.push_back({f, button, down, p1, cur});
         return true;
     }
 
-    // удалить все события с frame >= f
     inline void truncateFrom(uint32_t f) {
         auto& s = state();
         auto it = std::lower_bound(
@@ -116,15 +117,39 @@ namespace bot {
     inline void clearGrace() {
         auto& s = state();
         s.graceMask = 0;
-        s.freezeLeft = 0.f;
+        s.isFrozen = false;
     }
 
-    // конец окна возрождения. gl == nullptr — просто закрыть окно без вмешательства в игру
+    // Применяет маску зажатых кнопок, отправляя события ТОЛЬКО для изменившихся битов.
+    // Это критически важно для устранения лагов при синхронизации состояния.
+    inline void applyHeldMask(GJBaseGameLayer* gl, uint8_t target) {
+        auto& s = state();
+        const uint8_t cur = s.injectedHeld;
+        if (cur == target) return; // Ничего не изменилось, вызовов не будет
+
+        const bool wasInjecting = s.injecting;
+        s.injecting = true;
+
+        for (int p = 0; p < 2; ++p) {
+            for (int b = 0; b < 4; ++b) {
+                uint8_t bit = bitOf(p == 0, b);
+                if ((cur & ~target) & bit) {
+                    gl->handleButton(false, b, p == 0); // Отпускание
+                }
+                if ((target & ~cur) & bit) {
+                    gl->handleButton(true, b, p == 0);  // Нажатие
+                }
+            }
+        }
+        s.injectedHeld = target;
+        s.injecting = wasInjecting;
+    }
+
     inline void endGrace(GJBaseGameLayer* gl) {
         auto& s = state();
         uint8_t mask = s.graceMask;
         s.graceMask = 0;
-        s.freezeLeft = 0.f;
+        s.isFrozen = false;
 
         for (int p = 0; p < 2; ++p) {
             for (int b = 0; b < 4; ++b) {
@@ -132,11 +157,10 @@ namespace bot {
                 if (!(mask & bit)) continue;
 
                 if (s.finger & bit) {
-                    // чистое продолжение зажатия: в макрос ничего не пишем,
-                    // но игре кнопку зажимаем, чтобы состояние совпало с макросом
                     if (gl) {
                         s.injecting = true;
                         gl->handleButton(true, b, p == 0);
+                        s.injectedHeld |= bit;
                         s.injecting = false;
                     }
                 } else {
@@ -146,7 +170,6 @@ namespace bot {
         }
     }
 
-    // перемотка счётчика шагов (и указателя воспроизведения) на шаг f
     inline void seek(uint32_t f) {
         auto& s = state();
         s.frame = f;
@@ -155,43 +178,45 @@ namespace bot {
             [](Input const& i, uint32_t v) { return i.frame < v; }
         ) - s.macro.begin();
         s.syncHeld = true;
+        s.injectedHeld = 0; // Сброс для корректного применения новой маски
     }
 
-    // сброс уровня на самое начало
     inline void resetToStart() {
         auto& s = state();
         seek(0);
         s.graceMask = 0;
+        s.isFrozen = false;
         if (s.mode == Mode::Record) truncateFrom(0);
     }
 
-    // инжект событий текущего шага
     inline void inject(GJBaseGameLayer* gl) {
         auto& s = state();
         s.injecting = true;
 
         if (s.syncHeld) {
             s.syncHeld = false;
-            // O(1): маска зажатых кнопок хранится в последнем уже проигранном событии
             uint8_t held = (s.playIdx > 0 && s.playIdx <= s.macro.size())
-                ? s.macro[s.playIdx - 1].held : 0;
-            for (int p = 0; p < 2; ++p) {
-                for (int b = 0; b < 4; ++b) {
-                    if (held & bitOf(p == 0, b)) gl->handleButton(true, b, p == 0);
-                }
-            }
+                ? s.macro[s.playIdx - 1].held
+                : 0;
+            applyHeldMask(gl, held);
         }
 
         auto const n = s.macro.size();
         while (s.playIdx < n && s.macro[s.playIdx].frame <= s.frame) {
             auto const& e = s.macro[s.playIdx++];
             gl->handleButton(e.down, e.button, e.p1);
+            
+            uint8_t m = bitOf(e.p1, e.button);
+            if (m) {
+                if (e.down) s.injectedHeld |= m;
+                else s.injectedHeld &= ~m;
+            }
         }
 
         s.injecting = false;
     }
 
-    // ---------- сохранение / загрузка (одним блоком) ----------
+    // ---------- сохранение / загрузка ----------
 
     inline std::filesystem::path macroPath() {
         return Mod::get()->getSaveDir() / "macros" / (state().levelKey + ".gdbm");
@@ -221,13 +246,23 @@ namespace bot {
             p += 6;
         }
 
-        std::ofstream f(macroPath(), std::ios::binary | std::ios::trunc);
+        auto path = macroPath();
+        auto tmpPath = path.string() + ".tmp";
+
+        std::ofstream f(tmpPath, std::ios::binary | std::ios::trunc);
         if (!f) {
-            log::error("GDBot: can't open macro file for writing");
+            log::error("GDBot: can't open temp macro file for writing");
             return;
         }
         f.write(buf.data(), static_cast<std::streamsize>(buf.size()));
-        log::info("GDBot: saved {} inputs", count);
+        f.close();
+
+        std::filesystem::rename(tmpPath, path, ec);
+        if (ec) {
+            log::error("GDBot: failed to rename temp macro file");
+        } else {
+            log::info("GDBot: saved {} inputs", count);
+        }
     }
 
     inline void load() {
@@ -240,6 +275,12 @@ namespace bot {
         if (!std::filesystem::exists(path, ec)) return;
         auto size = std::filesystem::file_size(path, ec);
         if (ec || size < 12) return;
+
+        constexpr uint32_t MAX_MACRO_INPUTS = 10'000'000;
+        if (size > 12 + static_cast<uint64_t>(MAX_MACRO_INPUTS) * 6) {
+            log::warn("GDBot: macro file too large, ignoring");
+            return;
+        }
 
         std::ifstream f(path, std::ios::binary);
         if (!f) return;
@@ -256,14 +297,28 @@ namespace bot {
 
         s.macro.reserve(count + 1024);
         char const* p = buf.data() + 12;
+        uint32_t lastFrame = 0;
+        size_t loadedCount = 0;
+
         for (uint32_t i = 0; i < count; ++i, p += 6) {
             uint32_t frame;
             std::memcpy(&frame, p, 4);
+            
+            if (frame < lastFrame) {
+                log::warn("GDBot: macro file is not sorted by frame, stopping load");
+                break;
+            }
+            lastFrame = frame;
+
             uint8_t button = static_cast<uint8_t>(p[4]);
+            if (button > 3) continue; // Игнорируем невалидные кнопки для предотвращения лагов
+
             uint8_t flags = static_cast<uint8_t>(p[5]);
-            push(frame, button, flags & 1, (flags & 2) != 0);
+            if (push(frame, button, flags & 1, (flags & 2) != 0)) {
+                loadedCount++;
+            }
         }
-        log::info("GDBot: loaded {} inputs", s.macro.size());
+        log::info("GDBot: loaded {} inputs (from {} records)", loadedCount, count);
     }
 
     inline void onEnterLevel(GJGameLevel* level) {
@@ -273,12 +328,18 @@ namespace bot {
         s.playIdx = 0;
         s.syncHeld = false;
         s.injecting = false;
+        s.loadedFromCheckpoint = false;
+        s.inResetLevel = false;
+        s.cpLoadDepth = 0;
+        s.cpLoadedInReset = false;
         s.panelOpen = false;
         s.finger = 0;
+        s.injectedHeld = 0;
+        s.isFrozen = false;
         s.cpFrames.clear();
         clearGrace();
 
-        int id = level->m_levelID.value();
+        int id = level->m_levelID.value_or(0);
         if (id > 0) {
             s.levelKey = std::to_string(id);
         } else {
@@ -308,14 +369,18 @@ class $modify(BotBaseLayer, GJBaseGameLayer) {
     void update(float dt) {
         auto& s = bot::state();
 
-        // заморозка после возрождения (только при записи), реальное время — не зависит от скорости игры
-        if (s.freezeLeft > 0.f && bot::isPlayLayer(this)) {
+        // Заморозка на 0.15 с РЕАЛЬНОГО времени, независимо от скорости игры
+        if (s.isFrozen && bot::isPlayLayer(this)) {
             if (s.mode != bot::Mode::Record) {
+                s.isFrozen = false;
                 bot::clearGrace();
             } else {
-                s.freezeLeft -= dt;
-                if (s.freezeLeft <= 0.f) bot::endGrace(this);
-                return;
+                if (std::chrono::steady_clock::now() >= s.freezeEndTime) {
+                    s.isFrozen = false;
+                    bot::endGrace(this);
+                } else {
+                    return; // Игра заморожена, пропускаем update
+                }
             }
         }
 
@@ -326,7 +391,6 @@ class $modify(BotBaseLayer, GJBaseGameLayer) {
         auto& s = bot::state();
         bool inPlay = bot::isPlayLayer(this);
 
-        // быстрый путь: вызываем inject только если есть что вводить
         if (inPlay && s.mode == bot::Mode::Play &&
             (s.syncHeld || (s.playIdx < s.macro.size() && s.macro[s.playIdx].frame <= s.frame))) {
             bot::inject(this);
@@ -339,18 +403,21 @@ class $modify(BotBaseLayer, GJBaseGameLayer) {
 
     void handleButton(bool down, int button, bool isPlayer1) {
         auto& s = bot::state();
-        if (!s.injecting && bot::isPlayLayer(this)) {
-            // воспроизведение: реальный ввод блокируем, пока в макросе остались события;
-            // когда макрос закончился — управление у игрока
-            if (s.mode == bot::Mode::Play && s.playIdx < s.macro.size()) return;
+        const bool gameButton = (button >= 0 && button <= 3);
+        const bool paused = (PauseLayer::get() != nullptr);
 
-            if (s.mode == bot::Mode::Record) {
-                // запоминаем реальное состояние пальца
+        if (!s.injecting && bot::isPlayLayer(this)) {
+            // Блокируем запись/воспроизведение только для игровых кнопок, 
+            // чтобы кнопка паузы и системные клавиши продолжали работать.
+            if (s.mode == bot::Mode::Play && gameButton && (s.playIdx < s.macro.size() || s.syncHeld)) {
+                return; 
+            }
+
+            if (s.mode == bot::Mode::Record && gameButton) {
                 uint8_t m = bot::bitOf(isPlayer1, button);
                 if (down) s.finger |= m; else s.finger &= ~m;
 
-                // во время заморозки после возрождения ввод не проходит ни в игру, ни в макрос
-                if (s.freezeLeft > 0.f) return;
+                if (s.isFrozen) return; // Во время реальной заморозки ввод игнорируется
 
                 bot::push(s.frame, static_cast<uint8_t>(button), down, isPlayer1);
             }
@@ -372,13 +439,29 @@ class $modify(BotPlayLayer, PlayLayer) {
 
     void resetLevel() {
         auto& s = bot::state();
-        s.loadedFromCheckpoint = false;
-        PlayLayer::resetLevel();
-        // если чекпоинт не загружался — это рестарт с начала
-        if (!s.loadedFromCheckpoint) bot::resetToStart();
+        
+        // Защита от реентерабельности: если мы уже внутри сброса или загрузки чекпоинта, 
+        // просто вызываем базовый метод, не обнуляя макрос.
+        if (s.inResetLevel || s.cpLoadDepth > 0) {
+            PlayLayer::resetLevel();
+            return;
+        }
 
-        // при записи: короткая заморозка после возрождения
-        if (s.mode == bot::Mode::Record) s.freezeLeft = bot::RESPAWN_FREEZE;
+        s.inResetLevel = true;
+        s.cpLoadedInReset = false;
+
+        PlayLayer::resetLevel();
+
+        if (!s.cpLoadedInReset) {
+            bot::resetToStart();
+            s.cpFrames.clear();
+            if (s.mode == bot::Mode::Record) {
+                s.isFrozen = true;
+                s.freezeEndTime = std::chrono::steady_clock::now() + std::chrono::milliseconds(150);
+            }
+        }
+
+        s.inResetLevel = false;
     }
 
     void resetLevelFromStart() {
@@ -393,23 +476,33 @@ class $modify(BotPlayLayer, PlayLayer) {
     }
 
     void loadFromCheckpoint(CheckpointObject* cp) {
+        auto& s = bot::state();
+        ++s.cpLoadDepth;
+        s.cpLoadedInReset = true;
+
         PlayLayer::loadFromCheckpoint(cp);
 
-        auto& s = bot::state();
-        s.loadedFromCheckpoint = true;
+        --s.cpLoadDepth;
 
         auto it = s.cpFrames.find(cp);
         if (it == s.cpFrames.end()) {
             log::warn("GDBot: unknown checkpoint, restarting macro from the beginning");
             bot::resetToStart();
+            s.cpFrames.clear();
+            if (s.mode == bot::Mode::Record) {
+                s.isFrozen = true;
+                s.freezeEndTime = std::chrono::steady_clock::now() + std::chrono::milliseconds(150);
+            }
             return;
         }
 
         uint32_t f = it->second;
         bot::seek(f);
         if (s.mode == bot::Mode::Record) {
-            bot::truncateFrom(f);               // всё после чекпоинта перезаписывается
-            s.graceMask = bot::heldNow();       // что макрос держит зажатым на чекпоинте
+            bot::truncateFrom(f);
+            s.graceMask = bot::heldNow();
+            s.isFrozen = true;
+            s.freezeEndTime = std::chrono::steady_clock::now() + std::chrono::milliseconds(150);
         }
     }
 
@@ -433,13 +526,13 @@ class $modify(BotPlayLayer, PlayLayer) {
 };
 
 // =====================================================================
-//  Меню паузы: кнопка "Bot" слева -> раскрывает Record / Off / Play
+//  Меню паузы
 // =====================================================================
 
 class $modify(BotPauseLayer, PauseLayer) {
     struct Fields {
-        CCMenu* menu = nullptr;     // кнопка-переключатель (всегда видна)
-        CCMenu* panel = nullptr;    // кнопки режимов (раскрываются)
+        CCMenu* menu = nullptr;
+        CCMenu* panel = nullptr;
         CCLabelBMFont* label = nullptr;
     };
 
@@ -447,8 +540,6 @@ class $modify(BotPauseLayer, PauseLayer) {
         PauseLayer::customSetup();
 
         auto win = CCDirector::get()->getWinSize();
-
-        // позиции подобраны под пустую область слева (справа — ползунки, снизу — клавиши)
         float const x = 95.f;
         float const topY = win.height * 0.62f;
 
@@ -527,7 +618,6 @@ class $modify(BotPauseLayer, PauseLayer) {
 
     void onResume(CCObject* sender) {
         PauseLayer::onResume(sender);
-        // при выходе из паузы восстанавливаем кнопки, которые бот держал зажатыми
         auto& s = bot::state();
         if (s.mode == bot::Mode::Play) s.syncHeld = true;
     }
@@ -552,19 +642,21 @@ class $modify(BotPauseLayer, PauseLayer) {
 
         s.mode = mode;
         bot::clearGrace();
+        s.finger = 0;
+        s.injectedHeld = 0;
 
         if (mode == bot::Mode::Off) {
             this->rebuildBotMenu();
             return;
         }
 
-        // Record / Play: перезапускаем уровень с начала, чтобы счётчик шагов совпадал с макросом.
-        // (Практические чекпоинты при этом сбрасываются.)
         if (mode == bot::Mode::Record) {
             s.macro.clear();
             s.macro.reserve(1 << 14);
         }
+        
         pl->resetLevelFromStart();
-        this->onResume(nullptr);
+        // Вызов onResume с тем же sender для штатного закрытия паузы
+        this->onResume(sender);
     }
 };
